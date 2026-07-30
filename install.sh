@@ -2841,6 +2841,272 @@ EOF2
 }
 
 # ------------------------------------------------------------
+# 快捷新建自定义入站节点并绑定指定出站 (例如新建 Hy2 入站)
+# ------------------------------------------------------------
+add_custom_inbound() {
+    if [[ ! -f /etc/s-box/sb.json ]]; then
+        echo "错误：配置文件 /etc/s-box/sb.json 不存在！"
+        return 1
+    fi
+
+    echo "=================================================="
+    echo "       新建自定义入站节点并绑定指定出站"
+    echo "=================================================="
+    echo "请选择要新建的入站协议："
+    echo "1. Hysteria2 (Hy2)"
+    echo "2. VLESS-Reality"
+    echo "3. VMess-WS"
+    echo "4. Trojan-WS-TLS"
+    echo "5. TUIC v5"
+    echo "6. AnyTLS"
+    echo "0. 取消"
+    echo "=================================================="
+    read -p "请选择协议 [0-6]: " proto_sel
+
+    local proto="" tag_prefix=""
+    case "$proto_sel" in
+        1) proto="hysteria2"; tag_prefix="hy2-custom-in" ;;
+        2) proto="vless"; tag_prefix="vless-custom-in" ;;
+        3) proto="vmess"; tag_prefix="vmess-custom-in" ;;
+        4) proto="trojan"; tag_prefix="trojan-custom-in" ;;
+        5) proto="tuic"; tag_prefix="tuic-custom-in" ;;
+        6) proto="anytls"; tag_prefix="anytls-custom-in" ;;
+        0|*) return 0 ;;
+    esac
+
+    read -p "请输入新建入站节点的 Tag 名称 [默认 ${tag_prefix}]: " in_tag
+    [[ -z "$in_tag" ]] && in_tag="${tag_prefix}-$(date +%s)"
+
+    if command jq -e --arg tag "$in_tag" '.inbounds[]? | select(.tag==$tag)' /etc/s-box/sb.json >/dev/null 2>&1; then
+        echo "错误：入站 Tag [$in_tag] 已存在！"
+        read -p "按回车键继续..." temp
+        return 1
+    fi
+
+    # 询问监听端口 (NAT VPS 手动输入)
+    local listen_port=""
+    while true; do
+        read -p "请输入该入站节点的监听端口 (NAT VPS 请手动指定可用放行端口): " listen_port
+        if [[ "$listen_port" =~ ^[0-9]+$ ]] && [ "$listen_port" -ge 1 ] && [ "$listen_port" -le 65535 ]; then
+            if ss -tunlp | grep -q ":$listen_port "; then
+                echo "错误：端口 $listen_port 已被系统其他进程占用，请重新输入！"
+            else
+                break
+            fi
+        else
+            echo "输入无效，请输入 1-65535 之间的数字！"
+        fi
+    done
+
+    # 密码/UUID 逻辑
+    local uuid_val=""
+    read -p "请输入 通用密码/UUID (留空自动生成): " uuid_val
+    if [[ -z "$uuid_val" ]]; then
+        uuid_val=$(/etc/s-box/sing-box generate uuid 2>/dev/null || openssl rand -hex 16)
+    fi
+
+    # 选择绑定的出站
+    echo ""
+    echo "请选择该新建入站绑定的目标出站 (Outbound)："
+    local out_tags=("direct")
+    echo "  1. direct (默认直连)"
+    local out_idx=2
+    while read -r tag; do
+        [[ -n "$tag" ]] || continue
+        out_tags+=("$tag")
+        echo "  ${out_idx}. ${tag}"
+        ((out_idx++))
+    done < <(command jq -r '.outbounds[] | select(.tag != "direct" and .tag != "block" and .tag != "dns") | .tag' /etc/s-box/sb.json 2>/dev/null)
+
+    read -p "请选择目标出站编号 [1-${#out_tags[@]}]: " sel_out_idx
+    if ! [[ "$sel_out_idx" =~ ^[0-9]+$ ]] || [ "$sel_out_idx" -lt 1 ] || [ "$sel_out_idx" -gt "${#out_tags[@]}" ]; then
+        echo "输入无效！"
+        return 1
+    fi
+    local target_outbound="${out_tags[$((sel_out_idx-1))]}"
+
+    # 获取服务器公网 IP
+    local ip=$(curl -s4m5 icanhazip.com || curl -s4m5 api.ipify.org || curl -s6m5 icanhazip.com)
+    local public_key=""
+    [[ -f /etc/s-box/public.key ]] && public_key=$(cat /etc/s-box/public.key | tr -d '\r\n')
+    local short_id=$(command jq -r '.inbounds[]? | select(.tag=="vless-in") | .tls.reality.short_id[0] // empty' /etc/s-box/sb.json 2>/dev/null)
+    [[ -z "$short_id" ]] && short_id=$(openssl rand -hex 8)
+
+    local inbound_json="" share_link=""
+    case "$proto" in
+        hysteria2)
+            inbound_json=$(cat <<EOF2
+{
+  "type": "hysteria2",
+  "tag": "${in_tag}",
+  "listen": "0.0.0.0",
+  "listen_port": ${listen_port},
+  "users": [{"password": "${uuid_val}"}],
+  "tls": {
+    "enabled": true,
+    "alpn": ["h3"],
+    "certificate_path": "/etc/s-box/cert.pem",
+    "key_path": "/etc/s-box/private.key"
+  }
+}
+EOF2
+)
+            share_link="hysteria2://${uuid_val}@${ip}:${listen_port}?insecure=1&sni=www.bing.com#${in_tag}"
+            ;;
+        vless)
+            local private_key=$(command jq -r '[.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key][0]' /etc/s-box/sb.json 2>/dev/null)
+            if [[ -z "$private_key" || "$private_key" == "null" ]]; then
+                local reality_keys=$(/etc/s-box/sing-box generate reality-keypair 2>/dev/null)
+                private_key=$(echo "$reality_keys" | awk '/PrivateKey/{print $2}')
+                public_key=$(echo "$reality_keys" | awk '/PublicKey/{print $2}')
+            fi
+            inbound_json=$(cat <<EOF2
+{
+  "type": "vless",
+  "tag": "${in_tag}",
+  "listen": "0.0.0.0",
+  "listen_port": ${listen_port},
+  "users": [{"uuid": "${uuid_val}", "flow": "xtls-rprx-vision"}],
+  "tls": {
+    "enabled": true,
+    "server_name": "apple.com",
+    "reality": {
+      "enabled": true,
+      "handshake": {"server": "apple.com", "server_port": 443},
+      "private_key": "${private_key}",
+      "short_id": ["${short_id}"]
+    }
+  }
+}
+EOF2
+)
+            share_link="vless://${uuid_val}@${ip}:${listen_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=apple.com&fp=chrome&pbk=${public_key}&sid=${short_id}#${in_tag}"
+            ;;
+        vmess)
+            inbound_json=$(cat <<EOF2
+{
+  "type": "vmess",
+  "tag": "${in_tag}",
+  "listen": "0.0.0.0",
+  "listen_port": ${listen_port},
+  "users": [{"uuid": "${uuid_val}", "alterId": 0}],
+  "transport": {"type": "ws", "path": "/${uuid_val}-custom-vm"}
+}
+EOF2
+)
+            local vmess_json=$(cat <<EOF2
+{
+  "v": "2",
+  "ps": "${in_tag}",
+  "add": "${ip}",
+  "port": "${listen_port}",
+  "id": "${uuid_val}",
+  "aid": "0",
+  "scy": "auto",
+  "net": "ws",
+  "type": "none",
+  "host": "",
+  "path": "/${uuid_val}-custom-vm",
+  "tls": "none"
+}
+EOF2
+)
+            share_link=$(make_vmess_link "$vmess_json")
+            ;;
+        trojan)
+            inbound_json=$(cat <<EOF2
+{
+  "type": "trojan",
+  "tag": "${in_tag}",
+  "listen": "0.0.0.0",
+  "listen_port": ${listen_port},
+  "users": [{"password": "${uuid_val}"}],
+  "tls": {
+    "enabled": true,
+    "server_name": "www.bing.com",
+    "certificate_path": "/etc/s-box/cert.pem",
+    "key_path": "/etc/s-box/private.key"
+  },
+  "transport": {"type": "ws", "path": "/${uuid_val}-custom-tr"}
+}
+EOF2
+)
+            local path_enc=$(url_encode "/${uuid_val}-custom-tr")
+            share_link="trojan://${uuid_val}@${ip}:${listen_port}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=${path_enc}#${in_tag}"
+            ;;
+        tuic)
+            inbound_json=$(cat <<EOF2
+{
+  "type": "tuic",
+  "tag": "${in_tag}",
+  "listen": "0.0.0.0",
+  "listen_port": ${listen_port},
+  "users": [{"uuid": "${uuid_val}", "password": "${uuid_val}"}],
+  "congestion_control": "bbr",
+  "tls": {
+    "enabled": true,
+    "alpn": ["h3"],
+    "certificate_path": "/etc/s-box/cert.pem",
+    "key_path": "/etc/s-box/private.key"
+  }
+}
+EOF2
+)
+            share_link="tuic://${uuid_val}:${uuid_val}@${ip}:${listen_port}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#${in_tag}"
+            ;;
+        anytls)
+            inbound_json=$(cat <<EOF2
+{
+  "type": "anytls",
+  "tag": "${in_tag}",
+  "listen": "0.0.0.0",
+  "listen_port": ${listen_port},
+  "users": [{"password": "${uuid_val}"}],
+  "tls": {
+    "enabled": true,
+    "server_name": "www.bing.com",
+    "certificate_path": "/etc/s-box/cert.pem",
+    "key_path": "/etc/s-box/private.key"
+  }
+}
+EOF2
+)
+            share_link="anytls://${uuid_val}@${ip}:${listen_port}?security=tls&sni=www.bing.com&allowInsecure=1#${in_tag}"
+            ;;
+    esac
+
+    # 写入 sb.json
+    local temp_json=$(mktemp)
+    echo "$inbound_json" > /tmp/inbound_add.json
+    command jq --slurpfile ib /tmp/inbound_add.json '.inbounds += $ib' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
+    rm -f /tmp/inbound_add.json
+
+    # 添加路由规则
+    if [[ "$target_outbound" != "direct" ]]; then
+        command jq --arg in_tag "$in_tag" --arg out_tag "$target_outbound" '
+            if .route.rules then
+                .route.rules += [{"inbound": [$in_tag], "outbound": $out_tag}]
+            else
+                .route.rules = [{"inbound": [$in_tag], "outbound": $out_tag}]
+            fi
+        ' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
+    fi
+
+    echo ""
+    echo "=================================================="
+    echo "新建入站节点 [$in_tag] 成功！"
+    echo "监听端口: ${listen_port}"
+    echo "绑定出口: ${target_outbound}"
+    echo "--------------------------------------------------"
+    echo "节点分享链接："
+    echo "${share_link}"
+    echo "=================================================="
+
+    apply_changes
+    read -p "按回车键继续..." temp
+}
+
+# ------------------------------------------------------------
 # 13. 自定义代理出站多出口路由管理
 # ------------------------------------------------------------
 manage_custom_outbounds() {
@@ -2859,10 +3125,11 @@ manage_custom_outbounds() {
         echo "1. 添加外部代理出站节点 (支持粘贴链接或手动配置)"
         echo "2. 查看已添加的外部代理出站节点"
         echo "3. 删除指定的外部代理出站节点"
-        echo "4. 自定义多出口路由分流管理 (入站 绑定 到选定出站)"
+        echo "4. 快捷新建本地入站节点 (支持 Hy2/VLESS/VMess 等) 并绑定出口"
+        echo "5. 自定义多出口路由分流管理 (将已有入站 绑定 至选定出站)"
         echo "0. 返回主菜单"
         echo "=================================================="
-        read -p "请选择操作 [0-4]: " out_choice
+        read -p "请选择操作 [0-5]: " out_choice
 
         case "$out_choice" in
             1)
@@ -3059,6 +3326,9 @@ EOF2
                 read -p "按回车键继续..." temp
                 ;;
             4)
+                add_custom_inbound
+                ;;
+            5)
                 echo "========== 多出口路由绑定分流管理 =========="
                 echo "可用入站 (Inbounds):"
                 local in_tags=()
