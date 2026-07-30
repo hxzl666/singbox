@@ -3107,6 +3107,62 @@ EOF2
 }
 
 # ------------------------------------------------------------
+# 查看与删除指定的本地入站节点 (Inbound)
+# ------------------------------------------------------------
+delete_custom_inbound() {
+    if [[ ! -f /etc/s-box/sb.json ]]; then
+        echo "错误：配置文件 /etc/s-box/sb.json 不存在！"
+        return 1
+    fi
+
+    echo "=================================================="
+    echo "          查看/删除指定的本地入站节点"
+    echo "=================================================="
+    local in_tags=()
+    local idx=1
+    while read -r line; do
+        [[ -n "$line" ]] || continue
+        local tag proto port
+        tag=$(echo "$line" | awk -F'|' '{print $1}')
+        proto=$(echo "$line" | awk -F'|' '{print $2}')
+        port=$(echo "$line" | awk -F'|' '{print $3}')
+        in_tags+=("$tag")
+        echo "${idx}. Tag: ${tag} | 协议: ${proto} | 监听端口: ${port:-N/A}"
+        ((idx++))
+    done < <(command jq -r '.inbounds[]? | .tag + "|" + .type + "|" + ((.listen_port // "") | tostring)' /etc/s-box/sb.json 2>/dev/null)
+
+    if [[ ${#in_tags[@]} -eq 0 ]]; then
+        echo "当前没有配置任何本地入站节点。"
+        read -p "按回车键继续..." temp
+        return 0
+    fi
+
+    echo "--------------------------------------------------"
+    read -p "请选择要删除的入站节点编号 [1-${#in_tags[@]}, 输入0返回]: " del_idx
+    if [[ "$del_idx" == "0" || -z "$del_idx" ]]; then
+        return 0
+    fi
+
+    if [[ "$del_idx" =~ ^[0-9]+$ ]] && [ "$del_idx" -ge 1 ] && [ "$del_idx" -le "${#in_tags[@]}" ]; then
+        local target_tag="${in_tags[$((del_idx-1))]}"
+        local temp_json=$(mktemp)
+        # 从 inbounds 数组中删除该 tag 的对象，并清理关联的 route.rules
+        command jq --arg tag "$target_tag" '
+            del(.inbounds[]? | select(.tag==$tag)) |
+            if .route.rules then
+                .route.rules |= map(select(.inbound != [$tag]))
+            else . end
+        ' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
+
+        echo "入站节点 [$target_tag] 已成功删除，并已自动清理关联的路由绑定！"
+        apply_changes
+    else
+        echo "输入无效！"
+    fi
+    read -p "按回车键继续..." temp
+}
+
+# ------------------------------------------------------------
 # 13. 自定义代理出站多出口路由管理
 # ------------------------------------------------------------
 manage_custom_outbounds() {
@@ -3124,12 +3180,13 @@ manage_custom_outbounds() {
         echo "--------------------------------------------------"
         echo "1. 添加外部代理出站节点 (支持粘贴链接或手动配置)"
         echo "2. 查看已添加的外部代理出站节点"
-        echo "3. 删除指定的外部代理出站节点"
+        echo "3. 删除指定的外部代理出站节点 (Outbound)"
         echo "4. 快捷新建本地入站节点 (支持 Hy2/VLESS/VMess 等) 并绑定出口"
-        echo "5. 自定义多出口路由分流管理 (将已有入站 绑定 至选定出站)"
+        echo "5. 查看/删除指定的本地入站节点 (Inbound)"
+        echo "6. 自定义多出口路由分流管理 (将已有入站 绑定 至选定出站)"
         echo "0. 返回主菜单"
         echo "=================================================="
-        read -p "请选择操作 [0-5]: " out_choice
+        read -p "请选择操作 [0-6]: " out_choice
 
         case "$out_choice" in
             1)
@@ -3329,6 +3386,9 @@ EOF2
                 add_custom_inbound
                 ;;
             5)
+                delete_custom_inbound
+                ;;
+            6)
                 echo "========== 多出口路由绑定分流管理 =========="
                 echo "可用入站 (Inbounds):"
                 local in_tags=()
