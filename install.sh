@@ -2586,13 +2586,18 @@ EOF2
             transport_block=", \"transport\": {\"type\": \"ws\", \"path\": \"${path:-/}\"}"
         fi
 
+        local flow_line=""
+        if [[ -n "$flow" ]]; then
+            flow_line=", \"flow\": \"${flow}\""
+        fi
+
         json=$(cat <<EOF2
 {
   "type": "vless",
   "tag": "${tag}",
   "server": "${server}",
   "server_port": ${port},
-  "uuid": "${uuid}"${flow:+", \"flow\": \"${flow}\"}${transport_block},
+  "uuid": "${uuid}"${flow_line}${transport_block},
   "tls": ${tls_block}
 }
 EOF2
@@ -2618,6 +2623,11 @@ EOF2
                 tls_block="{\"enabled\": true, \"server_name\": \"${host:-$add}\"}"
             fi
 
+            local host_line=""
+            if [[ -n "$host" ]]; then
+                host_line=", \"headers\": {\"Host\": \"${host}\"}"
+            fi
+
             json=$(cat <<EOF2
 {
   "type": "vmess",
@@ -2628,7 +2638,7 @@ EOF2
   "security": "${scy}",
   "transport": {
     "type": "${net}",
-    "path": "${path}"${host:+", \"headers\": {\"Host\": \"${host}\"}"}
+    "path": "${path}"${host_line}
   },
   "tls": ${tls_block}
 }
@@ -3192,7 +3202,7 @@ batch_test_node_latency() {
     echo ""
     echo "正在开始并发测试节点延迟，请稍候..."
     echo "----------------------------------------------------------------------------------"
-    printf "%-5s | %-18s | %-10s | %-25s | %-12s\n" "序号" "节点Tag" "协议类型" "目标地址:端口" "TCP握手延迟"
+    printf "%-5s | %-18s | %-10s | %-25s | %-14s\n" "序号" "节点Tag" "协议类型" "目标地址:端口" "连接/握手延迟"
     echo "----------------------------------------------------------------------------------"
 
     local results_file=$(mktemp)
@@ -3212,14 +3222,22 @@ batch_test_node_latency() {
                 exit 0
             fi
 
-            # 测量 TCP 握手 latency (以毫秒为单位)
+            # 测量网络 latency (以毫秒为单位)
             local start_time end_time cost_ms="超时" cost_num=999999
             start_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
 
-            if timeout 2 bash -c "</dev/tcp/${server}/${port}" >/dev/null 2>&1; then
-                end_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
-                cost_num=$((end_time - start_time))
-                cost_ms="${cost_num} ms"
+            if [[ "$type" == "hysteria2" || "$type" == "hy2" || "$type" == "tuic" ]]; then
+                if timeout 2 bash -c "</dev/udp/${server}/${port}" >/dev/null 2>&1 || timeout 2 nc -z -u -w 2 "${server}" "${port}" >/dev/null 2>&1; then
+                    end_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+                    cost_num=$((end_time - start_time))
+                    cost_ms="${cost_num} ms (UDP)"
+                fi
+            else
+                if timeout 2 bash -c "</dev/tcp/${server}/${port}" >/dev/null 2>&1; then
+                    end_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+                    cost_num=$((end_time - start_time))
+                    cost_ms="${cost_num} ms"
+                fi
             fi
 
             echo "${cost_num}:${tag}:${type}:${server}:${port}:${cost_ms}" >> "$results_file"
@@ -3239,7 +3257,7 @@ batch_test_node_latency() {
         elif [[ "$cost_num" -gt 300 ]]; then
             status_color="\033[0;33m"
         fi
-        printf "%-5s | %-18s | %-10s | %-25s | ${status_color}%-12s\033[0m\n" "${row_idx}" "${tag}" "${type}" "${server}:${port}" "${cost_ms}"
+        printf "%-5s | %-18s | %-10s | %-25s | ${status_color}%-14s\033[0m\n" "${row_idx}" "${tag}" "${type}" "${server}:${port}" "${cost_ms}"
         ((row_idx++))
     done
 
