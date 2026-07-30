@@ -2505,6 +2505,750 @@ view_logs() {
     done
 }
 
+# ------------------------------------------------------------
+# 解析多协议节点链接并生成 Sing-box 规范的 Outbound JSON
+# ------------------------------------------------------------
+parse_proxy_link() {
+    local link="$1"
+    local tag="$2"
+    local json=""
+
+    # 过滤与去除两头空白
+    link=$(echo "$link" | awk '{$1=$1;print}')
+    [[ -z "$link" ]] && return 1
+
+    if [[ "$link" =~ ^vless:// ]]; then
+        local main_part="${link#vless://}"
+        local remark=""
+        if [[ "$main_part" =~ \# ]]; then
+            remark="${main_part#*#}"
+            main_part="${main_part%%#*}"
+        fi
+        local user_host="${main_part%%\?*}"
+        local query=""
+        if [[ "$main_part" =~ \? ]]; then
+            query="${main_part#*\?}"
+        fi
+
+        local uuid="${user_host%%@*}"
+        local host_port="${user_host#*@}"
+        local server="" port=443
+        if [[ "$host_port" =~ ^\[(.*)\]:(.*)$ ]]; then
+            server="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[2]}"
+        elif [[ "$host_port" =~ : ]]; then
+            server="${host_port%%:*}"
+            port="${host_port##*:}"
+        else
+            server="$host_port"
+        fi
+
+        local sni="" pbk="" sid="" flow="" security="" type="tcp" path=""
+        local IFS='&'
+        for param in $query; do
+            case "$param" in
+                sni=*) sni="${param#sni=}" ;;
+                pbk=*) pbk="${param#pbk=}" ;;
+                sid=*) sid="${param#sid=}" ;;
+                flow=*) flow="${param#flow=}" ;;
+                security=*) security="${param#security=}" ;;
+                type=*) type="${param#type=}" ;;
+                path=*) path="${param#path=}" ;;
+            esac
+        done
+
+        local tls_block='{"enabled": false}'
+        if [[ "$security" == "reality" ]]; then
+            tls_block=$(cat <<EOF2
+{
+  "enabled": true,
+  "server_name": "${sni:-apple.com}",
+  "reality": {
+    "enabled": true,
+    "public_key": "${pbk}",
+    "short_id": "${sid}"
+  }
+}
+EOF2
+)
+        elif [[ "$security" == "tls" ]]; then
+            tls_block=$(cat <<EOF2
+{
+  "enabled": true,
+  "server_name": "${sni:-${server}}"
+}
+EOF2
+)
+        fi
+
+        local transport_block=""
+        if [[ "$type" == "ws" ]]; then
+            transport_block=", \"transport\": {\"type\": \"ws\", \"path\": \"${path:-/}\"}"
+        fi
+
+        json=$(cat <<EOF2
+{
+  "type": "vless",
+  "tag": "${tag}",
+  "server": "${server}",
+  "server_port": ${port},
+  "uuid": "${uuid}"${flow:+", \"flow\": \"${flow}\"}${transport_block},
+  "tls": ${tls_block}
+}
+EOF2
+)
+    elif [[ "$link" =~ ^vmess:// ]]; then
+        local b64="${link#vmess://}"
+        b64="${b64%%#*}"
+        local decoded
+        decoded=$(echo "$b64" | base64 -d 2>/dev/null || echo "$b64" | base64 --decode 2>/dev/null)
+        if [[ -n "$decoded" ]] && printf '%s' "$decoded" | command jq -e . >/dev/null 2>&1; then
+            local add port id net path host tls scy
+            add=$(echo "$decoded" | command jq -r '.add // empty')
+            port=$(echo "$decoded" | command jq -r '.port // 443')
+            id=$(echo "$decoded" | command jq -r '.id // empty')
+            net=$(echo "$decoded" | command jq -r '.net // "ws"')
+            path=$(echo "$decoded" | command jq -r '.path // "/"')
+            host=$(echo "$decoded" | command jq -r '.host // ""')
+            tls=$(echo "$decoded" | command jq -r '.tls // "none"')
+            scy=$(echo "$decoded" | command jq -r '.scy // "auto"')
+
+            local tls_block='{"enabled": false}'
+            if [[ "$tls" == "tls" ]]; then
+                tls_block="{\"enabled\": true, \"server_name\": \"${host:-$add}\"}"
+            fi
+
+            json=$(cat <<EOF2
+{
+  "type": "vmess",
+  "tag": "${tag}",
+  "server": "${add}",
+  "server_port": ${port},
+  "uuid": "${id}",
+  "security": "${scy}",
+  "transport": {
+    "type": "${net}",
+    "path": "${path}"${host:+", \"headers\": {\"Host\": \"${host}\"}"}
+  },
+  "tls": ${tls_block}
+}
+EOF2
+)
+        fi
+    elif [[ "$link" =~ ^trojan:// ]]; then
+        local main_part="${link#trojan://}"
+        main_part="${main_part%%#*}"
+        local pass_host="${main_part%%\?*}"
+        local query=""
+        if [[ "$main_part" =~ \? ]]; then
+            query="${main_part#*\?}"
+        fi
+
+        local pass="${pass_host%%@*}"
+        local host_port="${pass_host#*@}"
+        local server="" port=443
+        if [[ "$host_port" =~ : ]]; then
+            server="${host_port%%:*}"
+            port="${host_port##*:}"
+        else
+            server="$host_port"
+        fi
+
+        local sni="" type="ws" path="/"
+        local IFS='&'
+        for param in $query; do
+            case "$param" in
+                sni=*) sni="${param#sni=}" ;;
+                type=*) type="${param#type=}" ;;
+                path=*) path="${param#path=}" ;;
+            esac
+        done
+
+        json=$(cat <<EOF2
+{
+  "type": "trojan",
+  "tag": "${tag}",
+  "server": "${server}",
+  "server_port": ${port},
+  "password": "${pass}",
+  "tls": {
+    "enabled": true,
+    "server_name": "${sni:-$server}",
+    "insecure": true
+  },
+  "transport": {
+    "type": "${type}",
+    "path": "${path}"
+  }
+}
+EOF2
+)
+    elif [[ "$link" =~ ^(hysteria2|hy2):// ]]; then
+        local main_part=""
+        if [[ "$link" =~ ^hysteria2:// ]]; then
+            main_part="${link#hysteria2://}"
+        else
+            main_part="${link#hy2://}"
+        fi
+        main_part="${main_part%%#*}"
+        local pass_host="${main_part%%\?*}"
+        local query=""
+        if [[ "$main_part" =~ \? ]]; then
+            query="${main_part#*\?}"
+        fi
+
+        local pass="${pass_host%%@*}"
+        local host_port="${pass_host#*@}"
+        local server="" port=443
+        if [[ "$host_port" =~ : ]]; then
+            server="${host_port%%:*}"
+            port="${host_port##*:}"
+        else
+            server="$host_port"
+        fi
+
+        local sni="" insecure=true
+        local IFS='&'
+        for param in $query; do
+            case "$param" in
+                sni=*) sni="${param#sni=}" ;;
+                insecure=*) [[ "${param#insecure=}" == "0" ]] && insecure=false ;;
+            esac
+        done
+
+        json=$(cat <<EOF2
+{
+  "type": "hysteria2",
+  "tag": "${tag}",
+  "server": "${server}",
+  "server_port": ${port},
+  "password": "${pass}",
+  "tls": {
+    "enabled": true,
+    "server_name": "${sni:-bing.com}",
+    "insecure": ${insecure}
+  }
+}
+EOF2
+)
+    elif [[ "$link" =~ ^tuic:// ]]; then
+        local main_part="${link#tuic://}"
+        main_part="${main_part%%#*}"
+        local user_host="${main_part%%\?*}"
+        local query=""
+        if [[ "$main_part" =~ \? ]]; then
+            query="${main_part#*\?}"
+        fi
+
+        local creds="${user_host%%@*}"
+        local host_port="${user_host#*@}"
+        local uuid="${creds%%:*}"
+        local pass="${creds#*:}"
+        local server="" port=8443
+        if [[ "$host_port" =~ : ]]; then
+            server="${host_port%%:*}"
+            port="${host_port##*:}"
+        else
+            server="$host_port"
+        fi
+
+        local sni="" congestion="bbr"
+        local IFS='&'
+        for param in $query; do
+            case "$param" in
+                sni=*) sni="${param#sni=}" ;;
+                congestion_control=*) congestion="${param#congestion_control=}" ;;
+            esac
+        done
+
+        json=$(cat <<EOF2
+{
+  "type": "tuic",
+  "tag": "${tag}",
+  "server": "${server}",
+  "server_port": ${port},
+  "uuid": "${uuid}",
+  "password": "${pass}",
+  "congestion_control": "${congestion}",
+  "tls": {
+    "enabled": true,
+    "server_name": "${sni:-bing.com}",
+    "insecure": true
+  }
+}
+EOF2
+)
+    elif [[ "$link" =~ ^ss:// ]]; then
+        local main_part="${link#ss://}"
+        main_part="${main_part%%#*}"
+        local method="" pass="" server="" port=8388
+
+        if [[ "$main_part" =~ @ ]]; then
+            local b64_user="${main_part%%@*}"
+            local host_port="${main_part#*@}"
+            if [[ "$host_port" =~ : ]]; then
+                server="${host_port%%:*}"
+                port="${host_port##*:}"
+            fi
+            local user_dec
+            user_dec=$(echo "$b64_user" | base64 -d 2>/dev/null || echo "$b64_user" | base64 --decode 2>/dev/null)
+            if [[ "$user_dec" =~ : ]]; then
+                method="${user_dec%%:*}"
+                pass="${user_dec#*:}"
+            fi
+        else
+            local dec
+            dec=$(echo "$main_part" | base64 -d 2>/dev/null || echo "$main_part" | base64 --decode 2>/dev/null)
+            if [[ "$dec" =~ (.*):(.*)@(.*):([0-9]+) ]]; then
+                method="${BASH_REMATCH[1]}"
+                pass="${BASH_REMATCH[2]}"
+                server="${BASH_REMATCH[3]}"
+                port="${BASH_REMATCH[4]}"
+            fi
+        fi
+
+        if [[ -n "$server" && -n "$method" && -n "$pass" ]]; then
+            json=$(cat <<EOF2
+{
+  "type": "shadowsocks",
+  "tag": "${tag}",
+  "server": "${server}",
+  "server_port": ${port},
+  "method": "${method}",
+  "password": "${pass}"
+}
+EOF2
+)
+        fi
+    fi
+
+    if [[ -n "$json" ]]; then
+        printf '%s' "$json"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# ------------------------------------------------------------
+# 13. 自定义代理出站多出口路由管理
+# ------------------------------------------------------------
+manage_custom_outbounds() {
+    if [[ ! -f /etc/s-box/sb.json ]]; then
+        echo "错误：配置文件 /etc/s-box/sb.json 不存在！"
+        read -p "按回车键继续..." temp
+        return 1
+    fi
+
+    while true; do
+        echo "=================================================="
+        echo "       自定义代理出站多出口路由管理"
+        echo "=================================================="
+        echo "提示：普通 NAT VPS 端口由您自主管理，无须向面板申请！"
+        echo "--------------------------------------------------"
+        echo "1. 添加外部代理出站节点 (支持粘贴链接或手动配置)"
+        echo "2. 查看已添加的外部代理出站节点"
+        echo "3. 删除指定的外部代理出站节点"
+        echo "4. 自定义多出口路由分流管理 (入站 绑定 到选定出站)"
+        echo "0. 返回主菜单"
+        echo "=================================================="
+        read -p "请选择操作 [0-4]: " out_choice
+
+        case "$out_choice" in
+            1)
+                echo "--------------------------------------------------"
+                echo "请选择添加方式："
+                echo "1. 复制粘贴节点链接 (支持 vless/vmess/trojan/hy2/tuic/ss)"
+                echo "2. 手动配置外部代理节点参数"
+                echo "--------------------------------------------------"
+                read -p "请选择 [1-2, 默认1]: " add_type
+                [[ -z "$add_type" ]] && add_type="1"
+
+                if [[ "$add_type" == "1" ]]; then
+                    read -p "请输入节点自定义标签/名称 (例如 outbound-us-01): " node_tag
+                    if [[ -z "$node_tag" ]]; then
+                        node_tag="outbound-$(date +%s)"
+                    fi
+
+                    # 防重名校验
+                    if command jq -e --arg tag "$node_tag" '.outbounds[] | select(.tag==$tag)' /etc/s-box/sb.json >/dev/null 2>&1; then
+                        echo "错误：标签 $node_tag 已存在！"
+                        read -p "按回车键继续..." temp
+                        continue
+                    fi
+
+                    read -p "请粘贴节点链接 (vless/vmess/trojan/hy2/tuic/ss): " raw_link
+                    local out_json
+                    out_json=$(parse_proxy_link "$raw_link" "$node_tag")
+                    if [[ -z "$out_json" ]]; then
+                        echo "错误：节点链接解析失败，请检查链接格式是否规范！"
+                        read -p "按回车键继续..." temp
+                        continue
+                    fi
+
+                    local temp_json=$(mktemp)
+                    echo "$out_json" > /tmp/outbound_add.json
+                    if command jq --slurpfile ob /tmp/outbound_add.json '.outbounds += $ob' /etc/s-box/sb.json > "$temp_json"; then
+                        mv "$temp_json" /etc/s-box/sb.json
+                        rm -f /tmp/outbound_add.json
+                        echo "外部代理节点 [$node_tag] 添加成功！"
+                        apply_changes
+                    else
+                        rm -f "$temp_json" /tmp/outbound_add.json
+                        echo "写入配置失败！"
+                    fi
+                else
+                    read -p "请输入节点标签 (例如 outbound-us): " node_tag
+                    [[ -z "$node_tag" ]] && node_tag="outbound-$(date +%s)"
+                    read -p "请输入协议类型 (vless/vmess/trojan/hysteria2/shadowsocks): " proto_type
+                    read -p "请输入目标服务器 IP/域名: " server_addr
+                    read -p "请输入目标服务器 端口: " server_port
+                    read -p "请输入 密码/UUID: " node_pass
+
+                    if [[ -z "$proto_type" || -z "$server_addr" || -z "$server_port" || -z "$node_pass" ]]; then
+                        echo "错误：关键字段不能为空！"
+                        read -p "按回车键继续..." temp
+                        continue
+                    fi
+
+                    local out_json=""
+                    case "$proto_type" in
+                        vless)
+                            out_json=$(cat <<EOF2
+{
+  "type": "vless",
+  "tag": "${node_tag}",
+  "server": "${server_addr}",
+  "server_port": ${server_port},
+  "uuid": "${node_pass}",
+  "tls": {"enabled": false}
+}
+EOF2
+)
+                            ;;
+                        vmess)
+                            out_json=$(cat <<EOF2
+{
+  "type": "vmess",
+  "tag": "${node_tag}",
+  "server": "${server_addr}",
+  "server_port": ${server_port},
+  "uuid": "${node_pass}",
+  "security": "auto",
+  "transport": {"type": "ws", "path": "/"},
+  "tls": {"enabled": false}
+}
+EOF2
+)
+                            ;;
+                        trojan)
+                            out_json=$(cat <<EOF2
+{
+  "type": "trojan",
+  "tag": "${node_tag}",
+  "server": "${server_addr}",
+  "server_port": ${server_port},
+  "password": "${node_pass}",
+  "tls": {"enabled": true, "insecure": true}
+}
+EOF2
+)
+                            ;;
+                        hysteria2|hy2)
+                            out_json=$(cat <<EOF2
+{
+  "type": "hysteria2",
+  "tag": "${node_tag}",
+  "server": "${server_addr}",
+  "server_port": ${server_port},
+  "password": "${node_pass}",
+  "tls": {"enabled": true, "insecure": true}
+}
+EOF2
+)
+                            ;;
+                        shadowsocks|ss)
+                            read -p "请输入 加密方式 (默认 aes-128-gcm): " ss_method
+                            [[ -z "$ss_method" ]] && ss_method="aes-128-gcm"
+                            out_json=$(cat <<EOF2
+{
+  "type": "shadowsocks",
+  "tag": "${node_tag}",
+  "server": "${server_addr}",
+  "server_port": ${server_port},
+  "method": "${ss_method}",
+  "password": "${node_pass}"
+}
+EOF2
+)
+                            ;;
+                        *)
+                            echo "暂不支持的协议类型！"
+                            read -p "按回车键继续..." temp
+                            continue
+                            ;;
+                    esac
+
+                    local temp_json=$(mktemp)
+                    echo "$out_json" > /tmp/outbound_add.json
+                    if command jq --slurpfile ob /tmp/outbound_add.json '.outbounds += $ob' /etc/s-box/sb.json > "$temp_json"; then
+                        mv "$temp_json" /etc/s-box/sb.json
+                        rm -f /tmp/outbound_add.json
+                        echo "外部代理节点 [$node_tag] 添加成功！"
+                        apply_changes
+                    else
+                        rm -f "$temp_json" /tmp/outbound_add.json
+                        echo "写入配置失败！"
+                    fi
+                fi
+                read -p "按回车键继续..." temp
+                ;;
+            2)
+                echo "========== 当前外部代理出站节点列表 =========="
+                command jq -r '
+                    .outbounds[]
+                    | select(.tag != "direct" and .tag != "warp-out" and .tag != "block" and .tag != "dns")
+                    | "标签: " + .tag + " | 协议: " + .type + " | 服务器: " + (.server // "N/A") + ":" + ((.server_port // "") | tostring)
+                ' /etc/s-box/sb.json 2>/dev/null
+                echo "================================================="
+                read -p "按回车键继续..." temp
+                ;;
+            3)
+                echo "========== 当前可删除的外部代理出站 =========="
+                local custom_tags=()
+                local idx=1
+                while read -r tag; do
+                    [[ -n "$tag" ]] || continue
+                    custom_tags+=("$tag")
+                    echo "${idx}. ${tag}"
+                    ((idx++))
+                done < <(command jq -r '.outbounds[] | select(.tag != "direct" and .tag != "warp-out" and .tag != "block" and .tag != "dns") | .tag' /etc/s-box/sb.json 2>/dev/null)
+
+                if [[ ${#custom_tags[@]} -eq 0 ]]; then
+                    echo "暂无任何自定义外部代理出站节点。"
+                    read -p "按回车键继续..." temp
+                    continue
+                fi
+
+                read -p "请选择要删除的节点编号 [1-${#custom_tags[@]}]: " del_idx
+                if [[ "$del_idx" =~ ^[0-9]+$ ]] && [ "$del_idx" -ge 1 ] && [ "$del_idx" -le "${#custom_tags[@]}" ]; then
+                    local target_tag="${custom_tags[$((del_idx-1))]}"
+                    local temp_json=$(mktemp)
+                    # 删除 outbound 并删除 route 规则中依赖该 outbound 的规则
+                    command jq --arg tag "$target_tag" '
+                        del(.outbounds[] | select(.tag==$tag)) |
+                        if .route.rules then
+                            .route.rules |= map(select(.outbound != $tag))
+                        else . end
+                    ' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
+                    echo "节点 [$target_tag] 已成功删除并清理关联路由！"
+                    apply_changes
+                else
+                    echo "输入无效！"
+                fi
+                read -p "按回车键继续..." temp
+                ;;
+            4)
+                echo "========== 多出口路由绑定分流管理 =========="
+                echo "可用入站 (Inbounds):"
+                local in_tags=()
+                local in_idx=1
+                while read -r tag; do
+                    [[ -n "$tag" ]] || continue
+                    in_tags+=("$tag")
+                    echo "  ${in_idx}. ${tag}"
+                    ((in_idx++))
+                done < <(command jq -r '.inbounds[]?.tag' /etc/s-box/sb.json 2>/dev/null)
+
+                if [[ ${#in_tags[@]} -eq 0 ]]; then
+                    echo "当前没有配置任何入站节点。"
+                    read -p "按回车键继续..." temp
+                    continue
+                fi
+
+                read -p "请选择需要绑定出口的入站编号 [1-${#in_tags[@]}]: " sel_in_idx
+                if ! [[ "$sel_in_idx" =~ ^[0-9]+$ ]] || [ "$sel_in_idx" -lt 1 ] || [ "$sel_in_idx" -gt "${#in_tags[@]}" ]; then
+                    echo "输入无效！"
+                    read -p "按回车键继续..." temp
+                    continue
+                fi
+                local target_inbound="${in_tags[$((sel_in_idx-1))]}"
+
+                echo ""
+                echo "可用出站出口 (Outbounds):"
+                local out_tags=("direct")
+                echo "  1. direct (默认直连)"
+                local out_idx=2
+                while read -r tag; do
+                    [[ -n "$tag" ]] || continue
+                    out_tags+=("$tag")
+                    echo "  ${out_idx}. ${tag}"
+                    ((out_idx++))
+                done < <(command jq -r '.outbounds[] | select(.tag != "direct" and .tag != "block" and .tag != "dns") | .tag' /etc/s-box/sb.json 2>/dev/null)
+
+                read -p "请选择 [$target_inbound] 指定路由的出口编号 [1-${#out_tags[@]}]: " sel_out_idx
+                if ! [[ "$sel_out_idx" =~ ^[0-9]+$ ]] || [ "$sel_out_idx" -lt 1 ] || [ "$sel_out_idx" -gt "${#out_tags[@]}" ]; then
+                    echo "输入无效！"
+                    read -p "按回车键继续..." temp
+                    continue
+                fi
+                local target_outbound="${out_tags[$((sel_out_idx-1))]}"
+
+                local temp_json=$(mktemp)
+                cp /etc/s-box/sb.json "$temp_json"
+
+                # 确保 route.rules 结构存在
+                if ! command jq -e '.route.rules' "$temp_json" >/dev/null 2>&1; then
+                    command jq '.route |= (. + {"rules": []})' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
+                fi
+
+                # 先清除该 inbound 原本的单独规则
+                command jq --arg in_tag "$target_inbound" '
+                    .route.rules |= map(select(.inbound != [$in_tag]))
+                ' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
+
+                # 如果选择的不是 direct，添加绑定规则
+                if [[ "$target_outbound" != "direct" ]]; then
+                    command jq --arg in_tag "$target_inbound" --arg out_tag "$target_outbound" '
+                        .route.rules += [{"inbound": [$in_tag], "outbound": $out_tag}]
+                    ' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
+                    echo "路由规则已设置: 入站 [$target_inbound] → 出站 [$target_outbound]"
+                else
+                    echo "已恢复: 入站 [$target_inbound] 恢复默认直连路由！"
+                fi
+
+                mv "$temp_json" /etc/s-box/sb.json
+                apply_changes
+                read -p "按回车键继续..." temp
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo "无效选项！"
+                ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------
+# 14. 批量测试外部代理节点延迟
+# ------------------------------------------------------------
+batch_test_node_latency() {
+    echo "=================================================="
+    echo "          批量测试外部代理节点延迟"
+    echo "=================================================="
+    echo "1. 测试当前配置文件中保存的所有外部代理节点"
+    echo "2. 临时粘贴节点链接进行一次性批量延迟测速"
+    echo "0. 返回主菜单"
+    echo "=================================================="
+    read -p "请选择操作 [0-2]: " test_choice
+
+    local nodes_json=""
+    case "$test_choice" in
+        1)
+            if [[ ! -f /etc/s-box/sb.json ]]; then
+                echo "错误：未找到配置文件 /etc/s-box/sb.json"
+                read -p "按回车键继续..." temp
+                return 1
+            fi
+            nodes_json=$(command jq -c '.outbounds[] | select(.tag != "direct" and .tag != "warp-out" and .tag != "block" and .tag != "dns")' /etc/s-box/sb.json 2>/dev/null)
+            ;;
+        2)
+            echo "请连续粘贴节点链接 (每行一条，按回车+Ctrl+D 结束输入)："
+            local raw_links=""
+            raw_links=$(cat)
+            if [[ -z "$raw_links" ]]; then
+                echo "取消输入。"
+                read -p "按回车键继续..." temp
+                return 0
+            fi
+
+            local idx=1
+            local tmp_arr="[]"
+            while read -r line; do
+                [[ -n "$line" ]] || continue
+                local parsed
+                parsed=$(parse_proxy_link "$line" "temp-node-${idx}")
+                if [[ -n "$parsed" ]]; then
+                    tmp_arr=$(echo "$tmp_arr" | command jq --argjson item "$parsed" '. += [$item]')
+                    ((idx++))
+                fi
+            done <<< "$raw_links"
+
+            nodes_json=$(echo "$tmp_arr" | command jq -c '.[]')
+            ;;
+        0|*)
+            return 0
+            ;;
+    esac
+
+    if [[ -z "$nodes_json" ]]; then
+        echo "未找到可测速的外部代理节点。"
+        read -p "按回车键继续..." temp
+        return 0
+    fi
+
+    echo ""
+    echo "正在开始并发测试节点延迟，请稍候..."
+    echo "----------------------------------------------------------------------------------"
+    printf "%-5s | %-18s | %-10s | %-25s | %-12s\n" "序号" "节点Tag" "协议类型" "目标地址:端口" "TCP握手延迟"
+    echo "----------------------------------------------------------------------------------"
+
+    local results_file=$(mktemp)
+    local idx=1
+
+    while read -r node; do
+        [[ -n "$node" ]] || continue
+        (
+            local tag type server port
+            tag=$(echo "$node" | command jq -r '.tag // "N/A"')
+            type=$(echo "$node" | command jq -r '.type // "N/A"')
+            server=$(echo "$node" | command jq -r '.server // ""')
+            port=$(echo "$node" | command jq -r '.server_port // ""')
+
+            if [[ -z "$server" || -z "$port" ]]; then
+                echo "999999:${tag}:${type}:${server}:${port}:超时/失败" >> "$results_file"
+                exit 0
+            fi
+
+            # 测量 TCP 握手 latency (以毫秒为单位)
+            local start_time end_time cost_ms="超时" cost_num=999999
+            start_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+
+            if timeout 2 bash -c "</dev/tcp/${server}/${port}" >/dev/null 2>&1; then
+                end_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
+                cost_num=$((end_time - start_time))
+                cost_ms="${cost_num} ms"
+            fi
+
+            echo "${cost_num}:${tag}:${type}:${server}:${port}:${cost_ms}" >> "$results_file"
+        ) &
+        ((idx++))
+    done <<< "$nodes_json"
+
+    wait
+
+    # 按延迟时间从低到高排序输出
+    local row_idx=1
+    sort -n -t: -k1 "$results_file" | while IFS=':' read -r cost_num tag type server port cost_ms; do
+        [[ -n "$tag" ]] || continue
+        local status_color="\033[0;32m"
+        if [[ "$cost_num" -eq 999999 ]]; then
+            status_color="\033[0;31m"
+        elif [[ "$cost_num" -gt 300 ]]; then
+            status_color="\033[0;33m"
+        fi
+        printf "%-5s | %-18s | %-10s | %-25s | ${status_color}%-12s\033[0m\n" "${row_idx}" "${tag}" "${type}" "${server}:${port}" "${cost_ms}"
+        ((row_idx++))
+    done
+
+    rm -f "$results_file"
+    echo "----------------------------------------------------------------------------------"
+    echo "测试完成。"
+    read -p "按回车键继续..." temp
+}
+
 if [[ "$1" == "repair" ]]; then
     repair_runtime_config
     exit $?
@@ -2583,9 +3327,11 @@ while true; do
     echo "10. 诊断并修复监听/Argo 同步"
     echo "11. 追加 WARP 出站节点（不影响已有直连节点）"
     echo "12. 重新配置协议组合 (可添加/删除直连或 WARP 节点)"
+    echo "13. 自定义代理出站多出口路由管理"
+    echo "14. 批量测试外部代理节点延迟"
     echo "0. 退出"
     echo "=================================================="
-    read -p "请输入选项 [0-12]: " menu_choice
+    read -p "请输入选项 [0-14]: " menu_choice
     case $menu_choice in
         1)
             if [[ -f /etc/s-box/info.log ]]; then
@@ -2721,6 +3467,12 @@ while true; do
                 curl -sL https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh -o /tmp/install.sh && bash /tmp/install.sh reconfig
             fi
             exit 0
+            ;;
+        13)
+            manage_custom_outbounds
+            ;;
+        14)
+            batch_test_node_latency
             ;;
         0)
             exit 0
