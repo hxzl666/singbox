@@ -51,6 +51,13 @@ PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
 PSI_INSTANCES_DIR="${WORKDIR}/psiphon_instances"
 SCRIPT_VERSION="2.0.0"
 
+# 智能检测 IPv6 支持（自适应双栈 / 纯 IPv4 / LXD / Docker 容器环境）
+if [[ -f /proc/net/if_inet6 ]] && [[ -s /proc/net/if_inet6 ]]; then
+    LISTEN_ADDR="::"
+else
+    LISTEN_ADDR="0.0.0.0"
+fi
+
 # 基础编码与辅助函数
 b64_no_wrap() {
     printf '%s' "$1" | base64 -w 0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
@@ -389,6 +396,53 @@ read_valid_port() {
         eval "$out_var=$p"
         return 0
     done
+}
+
+open_port_firewall() {
+    local port=$1
+    local proto=${2:-both} # tcp, udp, both
+    [[ -z "$port" || "$port" == "0" ]] && return 0
+
+    # UFW
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+            ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+        fi
+        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+            ufw allow "${port}/udp" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # Firewalld
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+            firewall-cmd --zone=public --add-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
+        fi
+        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+            firewall-cmd --zone=public --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
+        fi
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+
+    # iptables
+    if command -v iptables >/dev/null 2>&1; then
+        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+            iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        fi
+        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+            iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        fi
+    fi
+
+    # ip6tables
+    if command -v ip6tables >/dev/null 2>&1; then
+        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+            ip6tables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        fi
+        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+            ip6tables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        fi
+    fi
 }
 
 # ==================== WARP 模块 ====================
@@ -761,7 +815,16 @@ cleanup_orphan_secondary_nodes() {
     local tmp_clean=$(mktemp)
     if jq --argjson valids "$(printf '%s\n' "${valid_tags[@]}" | jq -R . | jq -s .)" '
       .outbounds = [.outbounds[] | select(.tag as $t | ($valids | index($t)) != null)] |
-      .route.rules = [.route.rules[] | select(.outbound as $o | ($valids | index($o)) != null)]
+      .route.rules = [.route.rules[] | select(.outbound as $o | ($valids | index($o)) != null)] |
+      .dns = {
+        "servers": [
+          {"type": "local", "tag": "dns-direct"},
+          {"type": "local", "tag": "local"},
+          {"type": "udp", "tag": "dns-remote", "server": "8.8.8.8"},
+          {"type": "udp", "tag": "remote-dns", "server": "8.8.8.8"}
+        ],
+        "final": "dns-direct"
+      }
     ' "$cfg" > "$tmp_clean" 2>/dev/null && jq -e . "$tmp_clean" >/dev/null 2>&1; then
         mv -f "$tmp_clean" "$cfg"
     else
@@ -1108,6 +1171,7 @@ sync_proxy_group_to_singbox() {
       --arg uuid "$uuid" \
       --arg reality_pvk "$reality_pvk" \
       --arg reym "$reym" \
+      --arg listen_addr "${LISTEN_ADDR:-"::"}" \
       '
       .outbounds = ([.outbounds[] | select(.tag != $out_tag)]) + [($ob_file[0] + {"tag": $out_tag})] |
 
@@ -1122,7 +1186,7 @@ sync_proxy_group_to_singbox() {
         if $hy2_port > 0 then . + [{
           "type": "hysteria2",
           "tag": ("hy2-" + $group_tag + "-in"),
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $hy2_port,
           "users": [{"password": $uuid}],
           "masquerade": "https://www.bing.com",
@@ -1132,7 +1196,7 @@ sync_proxy_group_to_singbox() {
         if $tuic_port > 0 then . + [{
           "type": "tuic",
           "tag": ("tuic-" + $group_tag + "-in"),
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $tuic_port,
           "users": [{"uuid": $uuid, "password": $uuid}],
           "congestion_control": "bbr",
@@ -1141,7 +1205,7 @@ sync_proxy_group_to_singbox() {
         if $vless_port > 0 then . + [{
           "type": "vless",
           "tag": ("vless-" + $group_tag + "-in"),
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $vless_port,
           "users": [{"uuid": $uuid, "flow": "xtls-rprx-vision"}],
           "tls": {
@@ -1161,6 +1225,9 @@ sync_proxy_group_to_singbox() {
       else . end
       ' "$cfg" > "$tmp_json" 2>/dev/null && jq -e . "$tmp_json" >/dev/null 2>&1; then
         mv -f "$tmp_json" "$cfg"
+        [[ "${hy2_port:-0}" -gt 0 ]] && open_port_firewall "$hy2_port" udp
+        [[ "${tuic_port:-0}" -gt 0 ]] && open_port_firewall "$tuic_port" udp
+        [[ "${vless_port:-0}" -gt 0 ]] && open_port_firewall "$vless_port" tcp
         return 0
     else
         rm -f "$tmp_json"
@@ -1192,7 +1259,7 @@ sync_psiphon_instance_to_singbox() {
     local tmp_json
     tmp_json=$(mktemp)
 
-    jq \
+    if jq \
       --arg cc "$cc_lower" \
       --arg out_tag "$out_tag" \
       --argjson socks_port "${socks_port:-0}" \
@@ -1202,6 +1269,7 @@ sync_psiphon_instance_to_singbox() {
       --arg uuid "$uuid" \
       --arg reality_pvk "$reality_pvk" \
       --arg reym "$reym" \
+      --arg listen_addr "${LISTEN_ADDR:-"::"}" \
       '
       .outbounds = [.outbounds[] | select(.tag != $out_tag)] |
       if $socks_port > 0 then
@@ -1226,7 +1294,7 @@ sync_psiphon_instance_to_singbox() {
         if $hy2_port > 0 then . + [{
           "type": "hysteria2",
           "tag": ("hy2-psi-" + $cc + "-in"),
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $hy2_port,
           "users": [{"password": $uuid}],
           "masquerade": "https://www.bing.com",
@@ -1236,7 +1304,7 @@ sync_psiphon_instance_to_singbox() {
         if $tuic_port > 0 then . + [{
           "type": "tuic",
           "tag": ("tuic-psi-" + $cc + "-in"),
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $tuic_port,
           "users": [{"uuid": $uuid, "password": $uuid}],
           "congestion_control": "bbr",
@@ -1245,7 +1313,7 @@ sync_psiphon_instance_to_singbox() {
         if $vless_port > 0 then . + [{
           "type": "vless",
           "tag": ("vless-psi-" + $cc + "-in"),
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $vless_port,
           "users": [{"uuid": $uuid, "flow": "xtls-rprx-vision"}],
           "tls": {
@@ -1263,8 +1331,16 @@ sync_psiphon_instance_to_singbox() {
       if ($inbound_tags | length) > 0 and $socks_port > 0 then
         .route.rules = ([{"inbound": $inbound_tags, "outbound": $out_tag}] + .route.rules)
       else . end
-      ' "$cfg" > "$tmp_json" && mv -f "$tmp_json" "$cfg"
-    return $?
+      ' "$cfg" > "$tmp_json" 2>/dev/null && jq -e . "$tmp_json" >/dev/null 2>&1; then
+        mv -f "$tmp_json" "$cfg"
+        [[ "${hy2_port:-0}" -gt 0 ]] && open_port_firewall "$hy2_port" udp
+        [[ "${tuic_port:-0}" -gt 0 ]] && open_port_firewall "$tuic_port" udp
+        [[ "${vless_port:-0}" -gt 0 ]] && open_port_firewall "$vless_port" tcp
+        return 0
+    else
+        rm -f "$tmp_json"
+        return 1
+    fi
 }
 
 # ==================== 副节点全面自动同步函数 ====================
@@ -1557,6 +1633,7 @@ build_and_apply_main_inbounds() {
       --argjson ptu "${p_tuic:-0}" \
       --argjson pan "${p_anytls:-0}" \
       --argjson ploop "${p_loop:-20080}" \
+      --arg listen_addr "${LISTEN_ADDR:-"::"}" \
       '
       # 保留所有副节点入站 (包含 custom / proxy / psi 的入站)
       .inbounds = [.inbounds[]? | select(.tag | contains("proxy") or contains("psi") or contains("custom"))] |
@@ -1566,7 +1643,7 @@ build_and_apply_main_inbounds() {
         if $pv > 0 then . + [{
           "tag": "vless-reality-in",
           "type": "vless",
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $pv,
           "users": [{"uuid": $uuid, "flow": "xtls-rprx-vision"}],
           "tls": {
@@ -1583,7 +1660,7 @@ build_and_apply_main_inbounds() {
         if $pvm > 0 then . + [{
           "tag": "vmess-ws-in",
           "type": "vmess",
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $pvm,
           "users": [{"uuid": $uuid}],
           "transport": {"type": "ws", "path": ("/" + $uuid + "-vm")}
@@ -1591,7 +1668,7 @@ build_and_apply_main_inbounds() {
         if $ptr > 0 then . + [{
           "tag": "trojan-ws-in",
           "type": "trojan",
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $ptr,
           "users": [{"password": $uuid}],
           "transport": {"type": "ws", "path": ("/" + $uuid + "-tr")},
@@ -1600,7 +1677,7 @@ build_and_apply_main_inbounds() {
         if $phy > 0 then . + [{
           "tag": "hy2-in",
           "type": "hysteria2",
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $phy,
           "users": [{"password": $uuid}],
           "masquerade": "https://www.bing.com",
@@ -1610,7 +1687,7 @@ build_and_apply_main_inbounds() {
         if $ptu > 0 then . + [{
           "tag": "tuic-in",
           "type": "tuic",
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $ptu,
           "users": [{"uuid": $uuid, "password": $uuid}],
           "congestion_control": "bbr",
@@ -1619,7 +1696,7 @@ build_and_apply_main_inbounds() {
         if $pan > 0 then . + [{
           "tag": "anytls-in",
           "type": "anytls",
-          "listen": "::",
+          "listen": $listen_addr,
           "listen_port": $pan,
           "users": [{"password": $uuid}],
           "tls": {"enabled": true, "server_name": "www.bing.com", "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}
@@ -1871,7 +1948,7 @@ generate_proxy_group_links() {
     blue "  【副节点-代理出站】: $remark (标识: $tag)"
     blue "============================================================"
     if [[ "$hy2_p" -gt 0 ]]; then
-        local hy2_link="hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&sni=www.bing.com#${remark}-Hy2"
+        local hy2_link="hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&allowInsecure=1&sni=www.bing.com#${remark}-Hy2"
         green "1. Hysteria2 节点链接:"
         echo "   $hy2_link"
     fi
@@ -2922,20 +2999,31 @@ install_singbox_main() {
   "dns": {
     "servers": [
       {
-        "address": "8.8.8.8",
-        "address_resolver": "local"
+        "type": "local",
+        "tag": "dns-direct"
       },
       {
-        "tag": "local",
-        "address": "local"
+        "type": "local",
+        "tag": "local"
+      },
+      {
+        "type": "udp",
+        "tag": "dns-remote",
+        "server": "8.8.8.8"
+      },
+      {
+        "type": "udp",
+        "tag": "remote-dns",
+        "server": "8.8.8.8"
       }
-    ]
+    ],
+    "final": "dns-direct"
   },
   "inbounds": [
     {
       "tag": "vless-reality-in",
       "type": "vless",
-      "listen": "::",
+      "listen": "${LISTEN_ADDR}",
       "listen_port": ${PORT_VLESS},
       "users": [{"uuid": "${UUID}", "flow": "xtls-rprx-vision"}],
       "tls": {
@@ -2952,7 +3040,7 @@ install_singbox_main() {
     {
       "tag": "vmess-ws-in",
       "type": "vmess",
-      "listen": "::",
+      "listen": "${LISTEN_ADDR}",
       "listen_port": ${PORT_VMESS},
       "users": [{"uuid": "${UUID}"}],
       "transport": {
@@ -2963,7 +3051,7 @@ install_singbox_main() {
     {
       "tag": "trojan-ws-in",
       "type": "trojan",
-      "listen": "::",
+      "listen": "${LISTEN_ADDR}",
       "listen_port": ${PORT_TROJAN_TLS},
       "users": [{"password": "${UUID}"}],
       "transport": {
@@ -2979,7 +3067,7 @@ install_singbox_main() {
     {
       "tag": "hy2-in",
       "type": "hysteria2",
-      "listen": "::",
+      "listen": "${LISTEN_ADDR}",
       "listen_port": ${PORT_HY2},
       "users": [{"password": "${UUID}"}],
       "masquerade": "https://www.bing.com",
@@ -2994,7 +3082,7 @@ install_singbox_main() {
     {
       "tag": "tuic-in",
       "type": "tuic",
-      "listen": "::",
+      "listen": "${LISTEN_ADDR}",
       "listen_port": ${PORT_TUIC},
       "users": [{"uuid": "${UUID}", "password": "${UUID}"}],
       "congestion_control": "bbr",
@@ -3008,7 +3096,7 @@ install_singbox_main() {
     {
       "tag": "anytls-in",
       "type": "anytls",
-      "listen": "::",
+      "listen": "${LISTEN_ADDR}",
       "listen_port": ${PORT_ANYTLS},
       "users": [{"password": "${UUID}"}],
       "tls": {
