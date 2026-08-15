@@ -638,12 +638,18 @@ get_all_psiphon_instances() {
     fi
 }
 
-# 自动发现并迁移之前旧版本中的自定义出口节点与副节点
+# 自动发现并迁移之前旧版本中的自定义出口节点与副节点（单次幂等迁移）
 auto_migrate_legacy_nodes() {
     local cfg="$WORKDIR/sb.json"
     [[ -f "$cfg" ]] || return 0
     init_proxy_groups_dir
     init_psiphon_instances_dir
+
+    # 若已迁移完成，则直接执行孤儿清理并返回
+    if [[ -f "$WORKDIR/.legacy_migrated_v2" ]]; then
+        cleanup_orphan_secondary_nodes
+        return 0
+    fi
 
     local custom_outbound_tags
     mapfile -t custom_outbound_tags < <(jq -r '.outbounds[]? | select(.tag != "direct" and .tag != "block" and .tag != "warp-out" and .tag != "psiphon-main-out") | .tag' "$cfg" 2>/dev/null)
@@ -675,14 +681,11 @@ auto_migrate_legacy_nodes() {
             continue
         fi
 
-        # 自定义外部代理副节点 (如 outbound-us, proxy-1, UA, JP 等)
+        # 自定义外部代理副节点 (如 outbound-us, proxy-1 等)
         local gtag="$otag"
         [[ "$gtag" == *-out ]] && gtag="${gtag%-out}"
+        [[ "$gtag" == outbound-* ]] && gtag="${gtag#outbound-}"
         local gdir="${PROXY_GROUPS_DIR}/${gtag}"
-        mkdir -p "$gdir"
-
-        jq --arg t "$otag" '.outbounds[]? | select(.tag==$t)' "$cfg" > "$gdir/outbound.json" 2>/dev/null
-        [[ ! -f "$gdir/remark.txt" ]] && echo "$gtag" > "$gdir/remark.txt"
 
         local matched_inbounds
         mapfile -t matched_inbounds < <(jq -r --arg t "$otag" '.route.rules[]? | select(.outbound==$t) | .inbound[]?' "$cfg" 2>/dev/null)
@@ -710,35 +713,59 @@ auto_migrate_legacy_nodes() {
         [[ "$tp" == "0" || -z "$tp" ]] && tp="$saved_tp"
         [[ "$vp" == "0" || -z "$vp" ]] && vp="$saved_vp"
 
-        if [[ "$hp" == "0" || -z "$hp" ]]; then
-            hp=$(jq -r --arg t "$gtag" '.inbounds[]? | select(.tag | (contains($t) and contains("hy2"))) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-        fi
-        if [[ "$tp" == "0" || -z "$tp" ]]; then
-            tp=$(jq -r --arg t "$gtag" '.inbounds[]? | select(.tag | (contains($t) and contains("tuic"))) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-        fi
-        if [[ "$vp" == "0" || -z "$vp" ]]; then
-            vp=$(jq -r --arg t "$gtag" '.inbounds[]? | select(.tag | (contains($t) and contains("vless"))) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-        fi
-
-        if [[ "${hp:-0}" == "0" && "${tp:-0}" == "0" && "${vp:-0}" == "0" ]]; then
-            hp=$(get_free_port)
-        fi
-
-        echo "${hp:-0}" > "$gdir/hy2_port.txt"
-        echo "${tp:-0}" > "$gdir/tuic_port.txt"
-        echo "${vp:-0}" > "$gdir/vless_port.txt"
-
-        if ! grep -qx "$gtag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
-            echo "$gtag" >> "$PROXY_GROUPS_DIR/groups.txt"
+        # 只有在确实有入站端口关联时才视为真实副节点进行迁移，孤儿出站不自动分配端口
+        if [[ "${hp:-0}" -gt 0 || "${tp:-0}" -gt 0 || "${vp:-0}" -gt 0 ]]; then
+            mkdir -p "$gdir"
+            jq --arg t "$otag" '.outbounds[]? | select(.tag==$t)' "$cfg" > "$gdir/outbound.json" 2>/dev/null
+            [[ ! -f "$gdir/remark.txt" ]] && echo "$gtag" > "$gdir/remark.txt"
+            echo "${hp:-0}" > "$gdir/hy2_port.txt"
+            echo "${tp:-0}" > "$gdir/tuic_port.txt"
+            echo "${vp:-0}" > "$gdir/vless_port.txt"
+            if ! grep -qx "$gtag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
+                echo "$gtag" >> "$PROXY_GROUPS_DIR/groups.txt"
+            fi
         fi
     done
 
-    # 清除旧的重复入站标签，防止端口重复绑定
+    # 清除旧的重复入站标签
     if [[ ${#legacy_inbounds_to_remove[@]} -gt 0 ]]; then
         local tmp_cl=$(mktemp)
         jq --argjson tags "$(printf '%s\n' "${legacy_inbounds_to_remove[@]}" | jq -R . | jq -s .)" '
         .inbounds = [.inbounds[] | select(.tag as $t | ($tags | index($t) | not))]
         ' "$cfg" > "$tmp_cl" && mv -f "$tmp_cl" "$cfg"
+    fi
+
+    touch "$WORKDIR/.legacy_migrated_v2"
+    cleanup_orphan_secondary_nodes
+}
+
+# 清理未在任何合法副节点清单中注册的孤儿出站与残留路由
+cleanup_orphan_secondary_nodes() {
+    local cfg="$WORKDIR/sb.json"
+    [[ -f "$cfg" ]] || return 0
+
+    local valid_tags=("direct" "block" "warp-out" "psiphon-main-out")
+
+    local psi_insts
+    mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
+    for cc in "${psi_insts[@]}"; do
+        [[ -n "$cc" ]] && valid_tags+=("psiphon-${cc,,}")
+    done
+
+    local proxy_tags
+    mapfile -t proxy_tags < <(get_all_proxy_groups 2>/dev/null)
+    for tag in "${proxy_tags[@]}"; do
+        [[ -n "$tag" ]] && valid_tags+=("${tag}-out")
+    done
+
+    local tmp_clean=$(mktemp)
+    if jq --argjson valids "$(printf '%s\n' "${valid_tags[@]}" | jq -R . | jq -s .)" '
+      .outbounds = [.outbounds[] | select(.tag as $t | ($valids | index($t)) != null)] |
+      .route.rules = [.route.rules[] | select(.outbound as $o | ($valids | index($o)) != null)]
+    ' "$cfg" > "$tmp_clean" 2>/dev/null && jq -e . "$tmp_clean" >/dev/null 2>&1; then
+        mv -f "$tmp_clean" "$cfg"
+    else
+        rm -f "$tmp_clean"
     fi
 }
 
@@ -1257,6 +1284,8 @@ sync_all_secondary_nodes() {
     for tag in "${proxy_tags[@]}"; do
         [[ -n "$tag" ]] && sync_proxy_group_to_singbox "$tag" >/dev/null 2>&1 || true
     done
+
+    cleanup_orphan_secondary_nodes
 }
 
 # ==================== 主节点多协议配置与出站应用 ====================
@@ -1942,17 +1971,35 @@ proxy_egress_menu() {
                     yellow "暂无代理节点组"
                 else
                     reading "请输入要删除的 tag (如 proxy-1): " del_tag
-                    if proxy_group_exists "$del_tag"; then
+                    if proxy_group_exists "$del_tag" || [[ -d "${PROXY_GROUPS_DIR}/$del_tag" ]] || grep -qx "$del_tag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
                         rm -rf "${PROXY_GROUPS_DIR:?}/$del_tag"
                         sed -i "/^${del_tag}$/d" "$PROXY_GROUPS_DIR/groups.txt"
                         local tmp_j=$(mktemp)
                         jq --arg dt "$del_tag" '
-                        .outbounds = [.outbounds[] | select(.tag != ($dt + "-out"))] |
-                        .inbounds = [.inbounds[] | select(.tag | contains($dt) | not)] |
-                        .route.rules = [.route.rules[] | select(.outbound != ($dt + "-out"))]
-                        ' "$WORKDIR/sb.json" > "$tmp_j" && mv -f "$tmp_j" "$WORKDIR/sb.json"
+                        .outbounds = [.outbounds[] | select(
+                          .tag != $dt and
+                          .tag != ($dt + "-out") and
+                          .tag != ("outbound-" + $dt) and
+                          .tag != ($dt + "_out")
+                        )] |
+                        .inbounds = [.inbounds[] | select(
+                          .tag != ("hy2-" + $dt + "-in") and
+                          .tag != ("tuic-" + $dt + "-in") and
+                          .tag != ("vless-" + $dt + "-in") and
+                          (.tag | contains($dt) | not)
+                        )] |
+                        .route.rules = [.route.rules[] | select(
+                          .outbound != $dt and
+                          .outbound != ($dt + "-out") and
+                          .outbound != ("outbound-" + $dt) and
+                          .outbound != ($dt + "_out")
+                        )]
+                        ' "$WORKDIR/sb.json" > "$tmp_j" 2>/dev/null && jq -e . "$tmp_j" >/dev/null 2>&1 && mv -f "$tmp_j" "$WORKDIR/sb.json"
+                        cleanup_orphan_secondary_nodes
                         apply_changes
-                        green "已删除代理节点组: $del_tag"
+                        green "已彻底删除代理节点组: $del_tag"
+                    else
+                        red "未找到代理节点组: $del_tag"
                     fi
                 fi
                 ;;
@@ -2296,19 +2343,38 @@ psiphon_multigroup_menu() {
                 else
                     reading "请输入要删除的国家码 (如 US): " del_cc
                     del_cc="${del_cc^^}"
-                    if [[ -d "${PSI_INSTANCES_DIR}/$del_cc" ]]; then
+                    if [[ -d "${PSI_INSTANCES_DIR}/$del_cc" ]] || grep -qix "$del_cc" "$PSI_INSTANCES_DIR/instances.txt" 2>/dev/null; then
                         local pid=$(cat "${PSI_INSTANCES_DIR}/$del_cc/psiphon.pid" 2>/dev/null)
                         [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
                         rm -rf "${PSI_INSTANCES_DIR:?}/$del_cc"
-                        sed -i "/^${del_cc}$/d" "$PSI_INSTANCES_DIR/instances.txt"
+                        sed -i "/^${del_cc}$/Id" "$PSI_INSTANCES_DIR/instances.txt"
                         local tmp_j=$(mktemp)
-                        jq --arg cc "${del_cc,,}" '
-                        .outbounds = [.outbounds[] | select(.tag != ("psiphon-" + $cc))] |
-                        .inbounds = [.inbounds[] | select(.tag | contains($cc) | not)] |
-                        .route.rules = [.route.rules[] | select(.outbound != ("psiphon-" + $cc))]
-                        ' "$WORKDIR/sb.json" > "$tmp_j" && mv -f "$tmp_j" "$WORKDIR/sb.json"
+                        jq --arg cc "${del_cc,,}" --arg ccu "$del_cc" '
+                        .outbounds = [.outbounds[] | select(
+                          .tag != ("psiphon-" + $cc) and
+                          .tag != ("psiphon-" + $cc + "-out") and
+                          .tag != ("psiphon-" + $ccu) and
+                          .tag != $cc and
+                          .tag != $ccu
+                        )] |
+                        .inbounds = [.inbounds[] | select(
+                          (.tag | contains("psi-" + $cc)) or
+                          (.tag | contains("psi-" + $ccu)) or
+                          (.tag | contains("psiphon-" + $cc)) | not
+                        )] |
+                        .route.rules = [.route.rules[] | select(
+                          .outbound != ("psiphon-" + $cc) and
+                          .outbound != ("psiphon-" + $cc + "-out") and
+                          .outbound != ("psiphon-" + $ccu) and
+                          .outbound != $cc and
+                          .outbound != $ccu
+                        )]
+                        ' "$WORKDIR/sb.json" > "$tmp_j" 2>/dev/null && jq -e . "$tmp_j" >/dev/null 2>&1 && mv -f "$tmp_j" "$WORKDIR/sb.json"
+                        cleanup_orphan_secondary_nodes
                         apply_changes
-                        green "已删除赛风出口组: $del_cc"
+                        green "已彻底删除赛风出口组: $del_cc"
+                    else
+                        red "未找到赛风出口组: $del_cc"
                     fi
                 fi
                 ;;
