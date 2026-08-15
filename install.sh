@@ -182,26 +182,50 @@ service_is_active() {
 
 # ==================== 依赖与核心自动安装 ====================
 install_system_dependencies() {
-    if ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y curl wget tar jq openssl git net-tools cron ca-certificates >/dev/null 2>&1
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y curl wget tar jq openssl git net-tools cronie ca-certificates >/dev/null 2>&1
-        elif command -v apk >/dev/null 2>&1; then
-            apk update >/dev/null 2>&1
-            apk add curl wget tar jq openssl git net-tools ca-certificates >/dev/null 2>&1
-        elif command -v pacman >/dev/null 2>&1; then
-            pacman -Sy --noconfirm curl wget tar jq openssl net-tools cronie ca-certificates >/dev/null 2>&1
+    log_info "正在检测系统基础依赖..."
+    export DEBIAN_FRONTEND=noninteractive
+
+    local need_install=0
+    for cmd in curl wget jq openssl tar git net-tools; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            need_install=1
+            break
         fi
+    done
+
+    if [[ $need_install -eq 1 ]]; then
+        yellow "[*] 正在安装系统基础依赖 (curl, wget, jq, openssl, git, net-tools, ca-certificates)..."
+        if command -v apt-get >/dev/null 2>&1; then
+            echo -e "${blue}--> 正在更新 APT 软件包列表...${re}"
+            apt-get update -y || yellow "[!] APT 源更新存在部分失败，尝试继续安装依赖..."
+            echo -e "${blue}--> 正在安装基础依赖软件包...${re}"
+            apt-get install -y --no-install-recommends curl wget tar jq openssl git net-tools cron ca-certificates
+        elif command -v yum >/dev/null 2>&1; then
+            echo -e "${blue}--> 正在安装 YUM 基础依赖包...${re}"
+            yum install -y curl wget tar jq openssl git net-tools cronie ca-certificates
+        elif command -v apk >/dev/null 2>&1; then
+            echo -e "${blue}--> 正在更新 APK 软件源并安装依赖...${re}"
+            apk update
+            apk add curl wget tar jq openssl git net-tools ca-certificates
+        elif command -v pacman >/dev/null 2>&1; then
+            echo -e "${blue}--> 正在安装 Pacman 基础依赖包...${re}"
+            pacman -Sy --noconfirm curl wget tar jq openssl net-tools cronie ca-certificates
+        fi
+        green "[+] 系统依赖包安装完成"
+    else
+        green "[+] 系统基础依赖已就绪"
     fi
 
     if ! command -v jq >/dev/null 2>&1; then
         local arch=$(detect_arch)
         mkdir -p /usr/local/bin
-        curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${arch}" -o /usr/local/bin/jq 2>/dev/null || \
-        curl -fsSL "https://ghproxy.net/https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${arch}" -o /usr/local/bin/jq 2>/dev/null
+        yellow "[*] 正在补充下载 jq 工具 (Linux-${arch})..."
+        curl -# -fSL --connect-timeout 10 --max-time 60 "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${arch}" -o /usr/local/bin/jq || \
+        curl -# -fSL --connect-timeout 10 --max-time 60 "https://ghproxy.net/https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${arch}" -o /usr/local/bin/jq 2>/dev/null
         chmod +x /usr/local/bin/jq 2>/dev/null
+        if command -v jq >/dev/null 2>&1; then
+            green "[+] jq 工具下载安装成功: /usr/local/bin/jq"
+        fi
     fi
 }
 
@@ -209,8 +233,8 @@ download_singbox_core() {
     local arch=$(detect_arch)
     mkdir -p "$WORKDIR"
     if [[ ! -x "$WORKDIR/sing-box" ]]; then
-        yellow "[*] 正在下载 Sing-box 核心 (Linux-${arch})..."
         local sb_ver="1.11.4"
+        yellow "[*] 正在下载 Sing-box 核心 (版本: v${sb_ver}, 架构: Linux-${arch})..."
         local sb_urls=(
             "https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${arch}.tar.gz"
             "https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${arch}.tar.gz"
@@ -219,8 +243,10 @@ download_singbox_core() {
         local tmp_d="/tmp/sb_bin_tmp"
         mkdir -p "$tmp_d"
         for url in "${sb_urls[@]}"; do
-            if curl -fsSL "$url" -o "$tmp_d/sb_pkg" 2>/dev/null; then
+            echo -e "${blue}--> 尝试下载源: ${url}${re}"
+            if curl -# -fSL --connect-timeout 10 --max-time 120 "$url" -o "$tmp_d/sb_pkg"; then
                 if [[ "$url" == *.tar.gz ]]; then
+                    echo -e "${blue}--> 正在解压核心文件...${re}"
                     tar -xzf "$tmp_d/sb_pkg" -C "$tmp_d" 2>/dev/null
                     local bpath=$(find "$tmp_d" -type f -name "sing-box" | head -n 1)
                     [[ -n "$bpath" ]] && cp -f "$bpath" "$WORKDIR/sing-box"
@@ -228,6 +254,8 @@ download_singbox_core() {
                     cp -f "$tmp_d/sb_pkg" "$WORKDIR/sing-box"
                 fi
                 [[ -f "$WORKDIR/sing-box" ]] && break
+            else
+                yellow "[!] 当前源下载失败，尝试备用下载源..."
             fi
         done
         rm -rf "$tmp_d"
@@ -238,6 +266,7 @@ download_singbox_core() {
         red "[!] Sing-box 核心程序下载失败，请检查 VPS 网络！"
         return 1
     fi
+    green "[+] Sing-box 核心就绪: $WORKDIR/sing-box"
     return 0
 }
 
@@ -253,11 +282,17 @@ download_cloudflared_core() {
             "https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"
         )
         for url in "${cf_urls[@]}"; do
-            if curl -fsSL "$url" -o "/usr/local/bin/cloudflared" 2>/dev/null; then
+            echo -e "${blue}--> 尝试下载源: ${url}${re}"
+            if curl -# -fSL --connect-timeout 10 --max-time 120 "$url" -o "/usr/local/bin/cloudflared"; then
                 chmod +x "/usr/local/bin/cloudflared"
+                green "[+] Cloudflared 核心安装完成: /usr/local/bin/cloudflared"
                 break
+            else
+                yellow "[!] 当前源下载失败，尝试备用源..."
             fi
         done
+    else
+        green "[+] Cloudflared 核心已就绪"
     fi
 }
 
@@ -267,6 +302,7 @@ download_psiphon_core() {
     [[ "$arch" == "armv7" ]] && psi_arch="arm"
     mkdir -p "$WORKDIR"
     if [[ -x "$WORKDIR/psiphon-tunnel-core" ]]; then
+        green "[+] Psiphon 核心已就绪"
         return 0
     fi
 
@@ -281,8 +317,10 @@ download_psiphon_core() {
     local tmp_psi="/tmp/psi_download_tmp"
     mkdir -p "$tmp_psi"
     for url in "${psi_urls[@]}"; do
-        if curl -fsSL "$url" -o "$tmp_psi/psi_pkg" 2>/dev/null; then
+        echo -e "${blue}--> 尝试下载源: ${url}${re}"
+        if curl -# -fSL --connect-timeout 10 --max-time 120 "$url" -o "$tmp_psi/psi_pkg"; then
             if [[ "$url" == *.tar.gz ]]; then
+                echo -e "${blue}--> 正在解压 Psiphon 核心...${re}"
                 tar -xzf "$tmp_psi/psi_pkg" -C "$tmp_psi" 2>/dev/null
                 local ext_f=$(find "$tmp_psi" -type f -name 'psiphon-tunnel-core*' ! -name '*.tar.gz' | head -n1)
                 [[ -n "$ext_f" ]] && cp -f "$ext_f" "$WORKDIR/psiphon-tunnel-core"
@@ -290,25 +328,29 @@ download_psiphon_core() {
                 cp -f "$tmp_psi/psi_pkg" "$WORKDIR/psiphon-tunnel-core"
             fi
             [[ -f "$WORKDIR/psiphon-tunnel-core" ]] && break
+        else
+            yellow "[!] 当前源下载失败，尝试备用源..."
         fi
     done
     rm -rf "$tmp_psi"
     chmod +x "$WORKDIR/psiphon-tunnel-core" 2>/dev/null
 
     if [[ ! -x "$WORKDIR/psiphon-tunnel-core" ]]; then
-        yellow "未下载到 Psiphon 核心，请检查 VPS 对 GitHub 的网络连通性。"
+        yellow "[!] 未下载到 Psiphon 核心，请检查 VPS 对 GitHub 的网络连通性。"
         return 1
     fi
 
     # 预载 Psiphon 种子服务器列表
     if [[ ! -f "$WORKDIR/server_list_compressed" ]]; then
+        yellow "[*] 正在预载 Psiphon 种子服务器列表..."
         local s_urls=(
             "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed"
             "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
             "https://ghproxy.net/https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
         )
         for surl in "${s_urls[@]}"; do
-            curl -fsSL "$surl" -o "$WORKDIR/server_list_compressed" 2>/dev/null && break
+            echo -e "${blue}--> 尝试下载节点列表: ${surl}${re}"
+            curl -# -fSL --connect-timeout 10 --max-time 60 "$surl" -o "$WORKDIR/server_list_compressed" && break
         done
     fi
 
@@ -3070,15 +3112,24 @@ menu() {
 
 # ==================== 初次安装 / 部署主流程 ====================
 install_singbox_main() {
-    log_info "开始安装/更新 Sing-box 环境与依赖..."
+    clear 2>/dev/null || true
+    echo -e "${purple}======================================================${re}"
+    echo -e "${purple}     Sing-box Linux 多协议一键部署与管理脚本          ${re}"
+    echo -e "${purple}======================================================${re}"
+    echo
 
+    log_info "【步骤 1/5】检测并安装系统基础依赖..."
     install_system_dependencies
     mkdir -p "$WORKDIR" "$PROXY_GROUPS_DIR" "$PSI_INSTANCES_DIR"
 
-    download_singbox_core || { red "Sing-box 核心下载失败"; exit 1; }
+    log_info "【步骤 2/5】下载并配置 Sing-box 核心程序..."
+    download_singbox_core || { red "[!] Sing-box 核心下载失败，安装终止"; exit 1; }
+
+    log_info "【步骤 3/5】下载附加核心组件 (Cloudflared / Psiphon)..."
     download_cloudflared_core
     download_psiphon_core
 
+    log_info "【步骤 4/5】初始化配置、证书与 Reality 密钥..."
     local UUID
     UUID=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
     [[ -z "$UUID" || "$UUID" == "null" ]] && UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "a3b8c2d1-e5f6-4a7b-8c9d-0e1f2a3b4c5d")
@@ -3102,6 +3153,7 @@ install_singbox_main() {
 
     get_all_ips >/dev/null 2>&1
 
+    log_info "【步骤 5/5】生成服务端协议配置与系统服务..."
     # 如果没有现有 sb.json，才重新生成默认 6 大协议端口
     if [[ ! -f "$WORKDIR/sb.json" ]]; then
         local PORT_VLESS=$(get_free_port)
