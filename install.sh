@@ -1614,10 +1614,11 @@ apply_main_node_outbound() {
       
       .outbounds = [.outbounds[] | select(.tag != "warp-out" and .tag != "psiphon-main-out")] |
       
+      # 彻底清理历史的 socks-loopback 规则以及旧的 WARP/赛风 出站分流规则
       .route.rules = [(.route.rules // [])[] | select(
-        if .outbound == "warp-out" or .outbound == "psiphon-main-out" then
-          if .inbound == ["socks-loopback"] or .geosite != null or .domain_suffix != null then false else true end
-        else true end
+        (.inbound != ["socks-loopback"]) and
+        (.outbound != "warp-out") and
+        (.outbound != "psiphon-main-out")
       )] |
       
       if $warp_en == "true" and $warp_mode == "all" then
@@ -1659,8 +1660,7 @@ apply_main_node_outbound() {
           "tag": "psiphon-main-out",
           "server": "127.0.0.1",
           "server_port": $psi_port,
-          "version": "5",
-          "network": "tcp"
+          "version": "5"
         }] |
         .route.rules += [{"inbound": ["socks-loopback"], "outbound": "psiphon-main-out"}] |
         .route.final = "psiphon-main-out"
