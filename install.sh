@@ -754,6 +754,10 @@ parse_proxy_url_to_json() {
         vmess)
             local raw="${url#vmess://}"
             raw="${raw%%#*}"
+            # 补齐 base64 padding
+            local mod=$(( ${#raw} % 4 ))
+            [[ $mod -eq 2 ]] && raw="${raw}=="
+            [[ $mod -eq 3 ]] && raw="${raw}="
             local decoded_json
             decoded_json=$(printf '%s' "$raw" | base64 -d 2>/dev/null || printf '%s' "$raw" | base64 -d -i 2>/dev/null)
             if ! echo "$decoded_json" | jq -e . >/dev/null 2>&1; then
@@ -779,12 +783,17 @@ parse_proxy_url_to_json() {
             ;;
         vless|trojan|hy2|hysteria2|tuic|ss)
             local rest="${url#*://}"
-            local fragment="${rest#*#}"
-            [[ "$rest" == *"#"* ]] || fragment=""
-            rest="${rest%%#*}"
-            local query="${rest#*\?}"
-            [[ "$rest" == *"\?"* ]] || query=""
-            local hostpart="${rest%%\?*}"
+            local fragment=""
+            if [[ "$rest" == *"#"* ]]; then
+                fragment="${rest#*#}"
+                rest="${rest%%#*}"
+            fi
+            local query=""
+            local hostpart="$rest"
+            if [[ "$rest" == *"?"* ]]; then
+                query="${rest#*?}"
+                hostpart="${rest%%\?*}"
+            fi
 
             local userinfo="" host="" port=""
             if [[ "$hostpart" == *"@"* ]]; then
@@ -795,13 +804,21 @@ parse_proxy_url_to_json() {
             if [[ "$hostpart" =~ ^\[([a-fA-F0-9:]+)\]:([0-9]+)$ ]]; then
                 host="${BASH_REMATCH[1]}"
                 port="${BASH_REMATCH[2]}"
-            elif [[ "$hostpart" =~ ^([a-zA-Z0-9.-]+):([0-9]+)$ ]]; then
+            elif [[ "$hostpart" =~ ^([-a-zA-Z0-9.]+):([0-9]+)$ ]]; then
                 host="${BASH_REMATCH[1]}"
                 port="${BASH_REMATCH[2]}"
-            else
-                host="$hostpart"
+            elif [[ "$hostpart" =~ ^\[([a-fA-F0-9:]+)\]$ ]]; then
+                host="${BASH_REMATCH[1]}"
                 port="443"
+            elif [[ "$hostpart" =~ ^([-a-zA-Z0-9.]+)$ ]]; then
+                host="${BASH_REMATCH[1]}"
+                port="443"
+            else
+                host="${hostpart%:*}"
+                port="${hostpart##*:}"
+                [[ "$host" == "$port" ]] && port="443"
             fi
+            [[ "$port" =~ ^[0-9]+$ ]] || port="443"
 
             local q_sni="" q_security="" q_flow="" q_pbk="" q_sid="" q_fp="" q_insecure="0" q_type="tcp" q_path="/" q_host="" q_serviceName="" q_alpn="" q_obfs="" q_obfs_pass=""
             if [[ -n "$query" ]]; then
@@ -811,7 +828,7 @@ parse_proxy_url_to_json() {
                     local k="${param%%=*}"
                     local v="${param#*=}"
                     case "$k" in
-                        sni) q_sni="$v" ;;
+                        sni|peer) q_sni="$v" ;;
                         security) q_security="$v" ;;
                         flow) q_flow="$v" ;;
                         pbk) q_pbk="$v" ;;
@@ -834,6 +851,8 @@ parse_proxy_url_to_json() {
 
             case "$proto" in
                 vless)
+                    local insec_bool="false"
+                    [[ "$q_insecure" == "1" || "$q_insecure" == "true" ]] && insec_bool="true"
                     jq -n \
                       --arg tag "$tag" \
                       --arg server "$host" \
@@ -848,6 +867,7 @@ parse_proxy_url_to_json() {
                       --arg net "$q_type" \
                       --arg path "$q_path" \
                       --arg hosthdr "$q_host" \
+                      --argjson insec "$insec_bool" \
                       '
                       {
                         "type": "vless",
@@ -864,11 +884,13 @@ parse_proxy_url_to_json() {
                       (if $sec == "reality" then {
                         "tls": {"enabled": true, "server_name": $sni, "utls": {"enabled": true, "fingerprint": (if $fp != "" then $fp else "chrome" end)}, "reality": {"enabled": true, "public_key": $pbk, "short_id": $sid}}
                       } elif $sec == "tls" then {
-                        "tls": {"enabled": true, "server_name": $sni, "utls": {"enabled": true, "fingerprint": (if $fp != "" then $fp else "chrome" end)}}
+                        "tls": {"enabled": true, "server_name": $sni, "insecure": $insec, "utls": {"enabled": true, "fingerprint": (if $fp != "" then $fp else "chrome" end)}}
                       } else {} end)
                       '
                     ;;
                 trojan)
+                    local insec_bool="false"
+                    [[ "$q_insecure" == "1" || "$q_insecure" == "true" ]] && insec_bool="true"
                     jq -n \
                       --arg tag "$tag" \
                       --arg server "$host" \
@@ -878,6 +900,7 @@ parse_proxy_url_to_json() {
                       --arg net "$q_type" \
                       --arg path "$q_path" \
                       --arg hosthdr "$q_host" \
+                      --argjson insec "$insec_bool" \
                       '
                       {
                         "type": "trojan",
@@ -885,7 +908,7 @@ parse_proxy_url_to_json() {
                         "server": $server,
                         "server_port": $port,
                         "password": $pass,
-                        "tls": {"enabled": true, "server_name": $sni}
+                        "tls": {"enabled": true, "server_name": $sni, "insecure": $insec}
                       } +
                       (if $net == "ws" then {"transport": {"type": "ws", "path": $path, "headers": (if $hosthdr != "" then {"Host": $hosthdr} else {} end)}}
                        elif $net == "grpc" then {"transport": {"type": "grpc", "service_name": $path}}
@@ -994,7 +1017,11 @@ validate_and_parse_proxy_url() {
         red "[!] 链接解析失败: $(echo "$result" | grep '^ERROR:' | head -1 | sed 's/^ERROR: //')"
         return 1
     fi
-    echo "$result"
+    if ! echo "$result" | jq -e . >/dev/null 2>&1; then
+        red "[!] 链接解析结果不是合法的 JSON 出站对象"
+        return 1
+    fi
+    echo "$result" | jq -c .
     return 0
 }
 
@@ -1006,7 +1033,31 @@ sync_proxy_group_to_singbox() {
 
     [[ -f "$cfg" ]] || return 1
     [[ -d "$group_dir" ]] || return 1
+    local out_tag="${group_tag}-out"
+
+    # 自动检测并修复/自愈损坏的 outbound.json
+    if [[ ! -f "$group_dir/outbound.json" ]] || ! jq -e . "$group_dir/outbound.json" >/dev/null 2>&1; then
+        local candidate_url=""
+        if [[ -f "$group_dir/raw_url.txt" ]]; then
+            candidate_url=$(head -n 1 "$group_dir/raw_url.txt" | tr -d '\r\n ')
+        elif [[ -f "$group_dir/outbound.json" ]]; then
+            candidate_url=$(head -n 1 "$group_dir/outbound.json" | tr -d '\r\n ')
+        fi
+        if [[ -n "$candidate_url" && "$candidate_url" == *"://"* ]]; then
+            local fixed_json
+            fixed_json=$(parse_proxy_url_to_json "$candidate_url" "$out_tag" 2>/dev/null)
+            if [[ -n "$fixed_json" ]] && echo "$fixed_json" | jq -e . >/dev/null 2>&1; then
+                echo "$fixed_json" | jq -c . > "$group_dir/outbound.json"
+                echo "$candidate_url" > "$group_dir/raw_url.txt"
+            fi
+        fi
+    fi
+
     [[ -f "$group_dir/outbound.json" ]] || return 1
+    if ! jq -e . "$group_dir/outbound.json" >/dev/null 2>&1; then
+        red "[!] 代理组 $group_tag 的出站配置无效，跳过同步"
+        return 1
+    fi
 
     local hy2_port tuic_port vless_port uuid reality_pvk reym
     hy2_port=$(cat "$group_dir/hy2_port.txt" 2>/dev/null || echo "0")
@@ -1016,12 +1067,11 @@ sync_proxy_group_to_singbox() {
     [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$cfg" 2>/dev/null | head -n1)
     reality_pvk=$(cat "$WORKDIR/private_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key' "$cfg" 2>/dev/null | head -n1)
     reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
-    local out_tag="${group_tag}-out"
 
     local tmp_json
     tmp_json=$(mktemp)
 
-    jq \
+    if jq \
       --slurpfile ob_file "$group_dir/outbound.json" \
       --arg group_tag "$group_tag" \
       --arg out_tag "$out_tag" \
@@ -1082,8 +1132,13 @@ sync_proxy_group_to_singbox() {
       if ($inbound_tags | length) > 0 then
         .route.rules = ([{"inbound": $inbound_tags, "outbound": $out_tag}] + .route.rules)
       else . end
-      ' "$cfg" > "$tmp_json" && mv -f "$tmp_json" "$cfg"
-    return $?
+      ' "$cfg" > "$tmp_json" 2>/dev/null && jq -e . "$tmp_json" >/dev/null 2>&1; then
+        mv -f "$tmp_json" "$cfg"
+        return 0
+    else
+        rm -f "$tmp_json"
+        return 1
+    fi
 }
 
 # ==================== 同步赛风副节点到 sing-box (纯 jq) ====================
@@ -1750,13 +1805,18 @@ add_proxy_egress_group() {
     echo "$hy2_p" > "$gdir/hy2_port.txt"
     echo "$tuic_p" > "$gdir/tuic_port.txt"
     echo "$vless_p" > "$gdir/vless_port.txt"
-    echo "$group_tag" >> "$PROXY_GROUPS_DIR/groups.txt"
-
-    sync_proxy_group_to_singbox "$group_tag"
-    apply_changes
-
-    green "[✓] 代理节点组 [$remark] 添加成功！"
-    generate_proxy_group_links "$group_tag"
+    if sync_proxy_group_to_singbox "$group_tag"; then
+        if ! grep -qx "$group_tag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
+            echo "$group_tag" >> "$PROXY_GROUPS_DIR/groups.txt"
+        fi
+        apply_changes
+        green "[✓] 代理节点组 [$remark] 添加成功！"
+        generate_proxy_group_links "$group_tag"
+    else
+        rm -rf "$gdir"
+        sed -i "/^${group_tag}$/d" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null || true
+        red "[!] 代理节点组 [$remark] 同步配置失败，请检查链接格式或系统环境！"
+    fi
 }
 
 generate_proxy_group_links() {
@@ -1866,9 +1926,12 @@ proxy_egress_menu() {
                             if [[ $? -eq 0 && -n "$out_json" ]]; then
                                 echo "$new_url" > "${PROXY_GROUPS_DIR}/$edit_tag/raw_url.txt"
                                 echo "$out_json" > "${PROXY_GROUPS_DIR}/$edit_tag/outbound.json"
-                                sync_proxy_group_to_singbox "$edit_tag"
-                                apply_changes
-                                green "代理链接已更新并生效！"
+                                if sync_proxy_group_to_singbox "$edit_tag"; then
+                                    apply_changes
+                                    green "代理链接已更新并生效！"
+                                else
+                                    red "[!] 代理链接同步更新失败，请检查链接有效性！"
+                                fi
                             fi
                         fi
                     fi
