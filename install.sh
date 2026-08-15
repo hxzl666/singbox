@@ -1,4 +1,21 @@
 #!/bin/bash
+# ============================================================================
+# Sing-box Linux 多协议一键部署与多出口管理脚本
+# ============================================================================
+# 支持协议:
+#   - Argo Tunnel (Cloudflare Tunnel)
+#   - VLESS-Reality
+#   - VMess-WS (支持TLS与CDN)
+#   - Trojan-WS-TLS
+#   - Hysteria2
+#   - TUIC v5
+#   - AnyTLS
+#   - Shadowsocks-2022
+# ============================================================================
+# 架构层级:
+#   【主节点】: 直连出站 / WARP全局出站 / WARP分流出站 / 赛风出站 / Argo穿透
+#   【副节点】: 自定义代理出站多出口管理 / 赛风出站多出口管理 (平行独立，互不干扰)
+# ============================================================================
 
 # 确保以 root 权限运行
 if [[ $EUID -ne 0 ]]; then
@@ -8,6 +25,28 @@ fi
 
 # 设置语言环境
 export LANG=en_US.UTF-8
+export LC_ALL=C
+
+# ==================== 颜色与输出函数 ====================
+re="\033[0m"
+red="\033[1;91m"
+green="\e[1;32m"
+yellow="\e[1;33m"
+purple="\e[1;35m"
+blue="\e[1;36m"
+white="\e[1;37m"
+
+red() { echo -e "\e[1;91m$1\033[0m"; }
+green() { echo -e "\e[1;32m$1\033[0m"; }
+yellow() { echo -e "\e[1;33m$1\033[0m"; }
+purple() { echo -e "\e[1;35m$1\033[0m"; }
+blue() { echo -e "\e[1;36m$1\033[0m"; }
+white() { echo -e "\e[1;37m$1\033[0m"; }
+reading() { read -p "$(yellow "$1")" "$2"; }
+
+log_info() { echo -e "${green}[信息] $1${re}"; }
+log_warn() { echo -e "${yellow}[警告] $1${re}"; }
+log_err() { echo -e "${red}[错误] $1${re}"; }
 
 # 覆写 jq 确保所有提取出来的 JSON 字段都不带 Windows 的 \r 回车符
 jq() {
@@ -21,7 +60,7 @@ b64_no_wrap() {
 
 url_encode() {
     local encoded
-    encoded=$(printf '%s' "$1" | command jq -sRr @uri) || return $?
+    encoded=$(printf '%s' "$1" | command jq -sRr @uri 2>/dev/null) || return $?
     printf '%s' "$encoded" | tr -d '\r\n'
 }
 
@@ -31,14 +70,395 @@ make_vmess_link() {
     printf 'vmess://%s' "$(b64_no_wrap "$json")"
 }
 
-get_warp_credentials() {
+# ==================== 工作路径与环境判断 ====================
+WORKDIR="/etc/s-box"
+PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
+PSI_INSTANCES_DIR="${WORKDIR}/psiphon_instances"
+SCRIPT_VERSION="2.0.0"
+
+# 自动检测是否为 OpenRC (Alpine 等) 或 Systemd
+IS_OPENRC=false
+IS_DIRECT=false
+if [[ -x "/sbin/openrc-run" || -x "/sbin/runlevels" ]]; then
+    IS_OPENRC=true
+elif ! pidof systemd >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; then
+    IS_DIRECT=true
+fi
+
+# Nginx 配置目录自适应
+NGINX_CONF_DIR="/etc/nginx/conf.d"
+[[ -d "/etc/nginx/http.d" ]] && NGINX_CONF_DIR="/etc/nginx/http.d"
+
+# 服务控制函数
+service_start() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" start >/dev/null 2>&1
+    elif $IS_DIRECT; then
+        service_stop "$name" 2>/dev/null
+        case "$name" in
+            sing-box)
+                nohup /etc/s-box/sing-box run -c /etc/s-box/sb.json >> /var/log/sing-box.log 2>&1 &
+                echo $! > /etc/s-box/sing-box.pid
+                ;;
+            argo-tunnel)
+                local _cf_args
+                _cf_args=$(
+                    local _am="" _at="" _ap="8401"
+                    [[ -f /etc/s-box/argo.conf ]] && source /etc/s-box/argo.conf
+                    _am="${ARGO_MODE:-temp}"; _at="${ARGO_TOKEN}"; _ap="${ARGO_PORT:-8401}"
+                    if [[ "$_am" == "token" && -n "$_at" ]]; then
+                        echo "tunnel --no-autoupdate run --token $_at"
+                    else
+                        echo "tunnel --url http://127.0.0.1:${_ap}"
+                    fi
+                )
+                nohup /usr/local/bin/cloudflared $_cf_args >> /var/log/argo-tunnel.log 2>&1 &
+                echo $! > /etc/s-box/argo-tunnel.pid
+                ;;
+            nginx)
+                nginx >/dev/null 2>&1
+                ;;
+        esac
+    else
+        systemctl start "$name" >/dev/null 2>&1
+    fi
+}
+
+service_stop() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" stop >/dev/null 2>&1
+    elif $IS_DIRECT; then
+        case "$name" in
+            nginx)
+                nginx -s stop >/dev/null 2>&1
+                ;;
+            *)
+                local pidfile="/etc/s-box/${name}.pid"
+                if [[ -f "$pidfile" ]]; then
+                    local pid
+                    pid=$(cat "$pidfile" 2>/dev/null)
+                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                        kill "$pid" 2>/dev/null
+                        local i; for i in {1..10}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+                        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+                    fi
+                    rm -f "$pidfile"
+                fi
+                ;;
+        esac
+    else
+        systemctl stop "$name" >/dev/null 2>&1
+    fi
+}
+
+service_restart() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" restart >/dev/null 2>&1
+    elif $IS_DIRECT; then
+        service_stop "$name"
+        sleep 1
+        service_start "$name"
+    else
+        systemctl restart "$name" >/dev/null 2>&1
+    fi
+}
+
+service_enable() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-update add "$name" default >/dev/null 2>&1
+    elif $IS_DIRECT; then
+        :
+    else
+        systemctl enable "$name" >/dev/null 2>&1
+    fi
+}
+
+service_disable() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-update del "$name" default >/dev/null 2>&1
+    elif $IS_DIRECT; then
+        :
+    else
+        systemctl disable "$name" >/dev/null 2>&1
+    fi
+}
+
+service_is_active() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" status 2>/dev/null | grep -q "started"
+    elif $IS_DIRECT; then
+        case "$name" in
+            nginx)
+                pgrep -x nginx >/dev/null 2>&1
+                ;;
+            *)
+                local pidfile="/etc/s-box/${name}.pid"
+                if [[ -f "$pidfile" ]]; then
+                    local pid
+                    pid=$(cat "$pidfile" 2>/dev/null)
+                    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+                else
+                    return 1
+                fi
+                ;;
+        esac
+    else
+        systemctl is-active --quiet "$name"
+    fi
+}
+
+# ==================== 快捷管理脚本写入函数 ====================
+create_sb_tool() {
+mkdir -p /usr/local/bin
+cat > /usr/local/bin/sb <<'EOF_SB_TOOL'
+#!/bin/bash
+# ============================================================================
+# Sing-box 快捷管理工具 sb
+# ============================================================================
+
+# 确保以 root 权限运行
+if [[ $EUID -ne 0 ]]; then
+   echo "错误：必须以 root 权限运行此脚本！"
+   exit 1
+fi
+
+export LANG=en_US.UTF-8
+export LC_ALL=C
+
+# ==================== 颜色定义 ====================
+re="\033[0m"
+red="\033[1;91m"
+green="\e[1;32m"
+yellow="\e[1;33m"
+purple="\e[1;35m"
+blue="\e[1;36m"
+white="\e[1;37m"
+
+red() { echo -e "\e[1;91m$1\033[0m"; }
+green() { echo -e "\e[1;32m$1\033[0m"; }
+yellow() { echo -e "\e[1;33m$1\033[0m"; }
+purple() { echo -e "\e[1;35m$1\033[0m"; }
+blue() { echo -e "\e[1;36m$1\033[0m"; }
+white() { echo -e "\e[1;37m$1\033[0m"; }
+reading() { read -p "$(yellow "$1")" "$2"; }
+
+WORKDIR="/etc/s-box"
+PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
+PSI_INSTANCES_DIR="${WORKDIR}/psiphon_instances"
+SCRIPT_VERSION="2.0.0"
+
+# 覆写 jq 确保所有提取出来的 JSON 字段都不带 Windows 的 \r 回车符
+jq() {
+    command jq "$@" | tr -d '\r'
+    return ${PIPESTATUS[0]}
+}
+
+b64_no_wrap() {
+    printf '%s' "$1" | base64 -w 0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+url_encode() {
+    local encoded
+    encoded=$(printf '%s' "$1" | command jq -sRr @uri 2>/dev/null) || return $?
+    printf '%s' "$encoded" | tr -d '\r\n'
+}
+
+make_vmess_link() {
+    local json="$1"
+    printf '%s' "$json" | command jq -e . >/dev/null 2>&1 || return 1
+    printf 'vmess://%s' "$(b64_no_wrap "$json")"
+}
+
+# 平台与服务自适应
+IS_OPENRC=false
+IS_DIRECT=false
+if [[ -x "/sbin/openrc-run" || -x "/sbin/runlevels" ]]; then
+    IS_OPENRC=true
+elif ! pidof systemd >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; then
+    IS_DIRECT=true
+fi
+
+NGINX_CONF_DIR="/etc/nginx/conf.d"
+[[ -d "/etc/nginx/http.d" ]] && NGINX_CONF_DIR="/etc/nginx/http.d"
+
+# 服务控制
+service_start() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" start >/dev/null 2>&1
+    elif $IS_DIRECT; then
+        service_stop "$name" 2>/dev/null
+        case "$name" in
+            sing-box)
+                nohup /etc/s-box/sing-box run -c /etc/s-box/sb.json >> /var/log/sing-box.log 2>&1 &
+                echo $! > /etc/s-box/sing-box.pid
+                ;;
+            argo-tunnel)
+                local _cf_args
+                _cf_args=$(
+                    local _am="" _at="" _ap="8401"
+                    [[ -f /etc/s-box/argo.conf ]] && source /etc/s-box/argo.conf
+                    _am="${ARGO_MODE:-temp}"; _at="${ARGO_TOKEN}"; _ap="${ARGO_PORT:-8401}"
+                    if [[ "$_am" == "token" && -n "$_at" ]]; then
+                        echo "tunnel --no-autoupdate run --token $_at"
+                    else
+                        echo "tunnel --url http://127.0.0.1:${_ap}"
+                    fi
+                )
+                nohup /usr/local/bin/cloudflared $_cf_args >> /var/log/argo-tunnel.log 2>&1 &
+                echo $! > /etc/s-box/argo-tunnel.pid
+                ;;
+            nginx)
+                nginx >/dev/null 2>&1
+                ;;
+        esac
+    else
+        systemctl start "$name" >/dev/null 2>&1
+    fi
+}
+
+service_stop() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" stop >/dev/null 2>&1
+    elif $IS_DIRECT; then
+        case "$name" in
+            nginx)
+                nginx -s stop >/dev/null 2>&1
+                ;;
+            *)
+                local pidfile="/etc/s-box/${name}.pid"
+                if [[ -f "$pidfile" ]]; then
+                    local pid
+                    pid=$(cat "$pidfile" 2>/dev/null)
+                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                        kill "$pid" 2>/dev/null
+                        local i; for i in {1..10}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+                        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+                    fi
+                    rm -f "$pidfile"
+                fi
+                ;;
+        esac
+    else
+        systemctl stop "$name" >/dev/null 2>&1
+    fi
+}
+
+service_restart() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" restart >/dev/null 2>&1
+    elif $IS_DIRECT; then
+        service_stop "$name"
+        sleep 1
+        service_start "$name"
+    else
+        systemctl restart "$name" >/dev/null 2>&1
+    fi
+}
+
+service_is_active() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" status 2>/dev/null | grep -q "started"
+    elif $IS_DIRECT; then
+        case "$name" in
+            nginx)
+                pgrep -x nginx >/dev/null 2>&1
+                ;;
+            *)
+                local pidfile="/etc/s-box/${name}.pid"
+                if [[ -f "$pidfile" ]]; then
+                    local pid
+                    pid=$(cat "$pidfile" 2>/dev/null)
+                    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+                else
+                    return 1
+                fi
+                ;;
+        esac
+    else
+        systemctl is-active --quiet "$name"
+    fi
+}
+
+# ==================== IP 与系统状态获取 ====================
+ALL_IPS=()
+get_all_ips() {
+    ALL_IPS=()
+    mkdir -p "$WORKDIR"
+    local ipv4_list
+    ipv4_list=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')
+    if [[ -z "$ipv4_list" ]]; then
+        local pub_ip
+        pub_ip=$(curl -s4m3 https://api.ipify.org || curl -s4m3 https://ip.sb)
+        [[ -n "$pub_ip" ]] && ALL_IPS+=("$pub_ip")
+    else
+        while read -r ip; do
+            [[ -n "$ip" ]] && ALL_IPS+=("$ip")
+        done <<< "$ipv4_list"
+    fi
+
+    # 获取公共 IPv6 (若有)
+    local ipv6_list
+    ipv6_list=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-fA-F:]+' | grep -vE '^(fe80|::1|fd)')
+    if [[ -n "$ipv6_list" ]]; then
+        while read -r ip6; do
+            [[ -n "$ip6" ]] && ALL_IPS+=("$ip6")
+        done <<< "$ipv6_list"
+    fi
+
+    [[ ${#ALL_IPS[@]} -eq 0 ]] && ALL_IPS=("$(hostname -I 2>/dev/null | awk '{print $1}')")
+    [[ ${#ALL_IPS[@]} -eq 0 || -z "${ALL_IPS[0]}" ]] && ALL_IPS=("127.0.0.1")
+
+    # 缓存
+    printf "%s\n" "${ALL_IPS[@]}" > "$WORKDIR/all_ips.txt"
+}
+
+display_ip_list() {
+    mkdir -p "$WORKDIR"
+    for ip in "${ALL_IPS[@]}"; do
+        [[ -z "$ip" ]] && continue
+        # 探测可用性并缓存
+        local status_file="$WORKDIR/ip_status_${ip}.txt"
+        if [ ! -f "$status_file" ]; then
+            echo "Available" > "$status_file"
+        fi
+    done
+}
+
+# ==================== 端口管理与冲突修复 ====================
+get_free_port() {
+    local port=$(( (RANDOM % 40000) + 10000 ))
+    while ss -tulpn 2>/dev/null | grep -q ":${port} " || netstat -tulpn 2>/dev/null | grep -q ":${port} "; do
+        port=$(( (RANDOM % 40000) + 10000 ))
+    done
+    echo "$port"
+}
+
+get_free_loopback_port() {
+    local port=$(( (RANDOM % 30000) + 20000 ))
+    while ss -tulpn 2>/dev/null | grep -q "127.0.0.1:${port} " || netstat -tulpn 2>/dev/null | grep -q "127.0.0.1:${port} "; do
+        port=$(( (RANDOM % 30000) + 20000 ))
+    done
+    echo "$port"
+}
+
+# ==================== WARP 模块 ====================
+init_warp_config() {
     local warpurl
     warpurl=$(curl -sm5 -k https://warp.xijp.eu.org 2>/dev/null || wget -qO- --timeout=5 https://warp.xijp.eu.org 2>/dev/null)
     
-    # 默认值
-    WARP_PVK="52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A="
-    WARP_IPV6="2606:4700:110:8d8d:1845:c39f:2dd5:a03a"
-    WARP_RES="[215, 69, 233]"
+    local WARP_PVK="52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A="
+    local WARP_IPV6="2606:4700:110:8d8d:1845:c39f:2dd5:a03a"
+    local WARP_RES="[215, 69, 233]"
     
     if [[ -n "$warpurl" ]] && ! printf '%s' "$warpurl" | grep -q -i "html"; then
         local tmp_pvk tmp_ipv6 tmp_res
@@ -56,5510 +476,2049 @@ get_warp_credentials() {
             fi
         fi
     fi
+
+    echo "$WARP_PVK" > "$WORKDIR/warp_private_key.txt"
+    echo "$WARP_IPV6" > "$WORKDIR/warp_ipv6.txt"
+    echo "$WARP_RES" > "$WORKDIR/warp_reserved.txt"
+    return 0
 }
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;36m'
-PLAIN='\033[0m'
+get_warp_endpoint() {
+    if [ -f "$WORKDIR/warp_best_endpoint.txt" ]; then
+        cat "$WORKDIR/warp_best_endpoint.txt" 2>/dev/null
+        return
+    fi
+    echo "162.159.192.1"
+}
 
-log_info() { echo -e "${GREEN}[信息] $1${PLAIN}"; }
-log_warn() { echo -e "${YELLOW}[警告] $1${PLAIN}"; }
-log_err() { echo -e "${RED}[错误] $1${PLAIN}"; }
+warp_egress_test() {
+    echo
+    purple "正在检测主节点出口 IP (经由当前出站路由)..."
+    local loop_port
+    loop_port=$(jq -r '.inbounds[] | select(.tag=="socks-loopback") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
+    if [[ -z "$loop_port" || "$loop_port" == "null" ]]; then
+        # 临时直接探测系统出口
+        local res
+        res=$(curl -s4m5 https://ip.sb 2>/dev/null || curl -s4m5 https://api.ipify.org 2>/dev/null)
+        green "当前直连出口 IP: ${res:-未知}"
+        return
+    fi
 
-# 自动检测是否为 OpenRC (Alpine 等)
-IS_OPENRC=false
-IS_DIRECT=false
-if [[ -x "/sbin/openrc-run" || -x "/sbin/runlevels" ]]; then
-    IS_OPENRC=true
-elif ! pidof systemd >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; then
-    # 非 OpenRC 也非 systemd 环境（如 WSL1、Docker、Ubuntu Desktop 无 systemd 等），使用直接进程管理
-    IS_DIRECT=true
-fi
-
-# Nginx 配置目录自适应
-NGINX_CONF_DIR="/etc/nginx/conf.d"
-[[ -d "/etc/nginx/http.d" ]] && NGINX_CONF_DIR="/etc/nginx/http.d"
-
-# 服务控制函数
-service_start() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" start >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        service_stop "$name" 2>/dev/null
-        case "$name" in
-            sing-box)
-                nohup /etc/s-box/sing-box run -c /etc/s-box/sb.json >> /var/log/sing-box.log 2>&1 &
-                echo $! > /etc/s-box/sing-box.pid
-                ;;
-            argo-tunnel)
-                local _cf_args
-                _cf_args=$(
-                    local _am="" _at="" _ap="8401"
-                    [[ -f /etc/s-box/argo.conf ]] && source /etc/s-box/argo.conf
-                    _am="${ARGO_MODE:-temp}"; _at="${ARGO_TOKEN}"; _ap="${ARGO_PORT:-8401}"
-                    if [[ "$_am" == "token" && -n "$_at" ]]; then
-                        echo "tunnel --no-autoupdate run --token $_at"
-                    else
-                        echo "tunnel --url http://127.0.0.1:${_ap}"
-                    fi
-                )
-                nohup /usr/local/bin/cloudflared $_cf_args >> /var/log/argo-tunnel.log 2>&1 &
-                echo $! > /etc/s-box/argo-tunnel.pid
-                ;;
-            nginx)
-                nginx >/dev/null 2>&1
-                ;;
-        esac
+    local ip info
+    ip=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m5 https://ip.sb 2>/dev/null || curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m5 https://api.ipify.org 2>/dev/null)
+    if [[ -n "$ip" ]]; then
+        green "主节点出口 IP: $ip"
+        info=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m5 "https://api.ip.sb/geoip/${ip}" 2>/dev/null)
+        if [[ -n "$info" ]]; then
+            local isp country
+            isp=$(echo "$info" | jq -r '.isp // empty' 2>/dev/null)
+            country=$(echo "$info" | jq -r '.country // empty' 2>/dev/null)
+            blue "归属地区: ${country} | 运营商: ${isp}"
+        fi
     else
-        systemctl start "$name" >/dev/null 2>&1
+        yellow "测试超时，请检查 sing-box 服务与出站状态。"
     fi
 }
 
-service_stop() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" stop >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        case "$name" in
-            nginx)
-                nginx -s stop >/dev/null 2>&1
-                ;;
-            *)
-                local pidfile="/etc/s-box/${name}.pid"
-                if [[ -f "$pidfile" ]]; then
-                    local pid
-                    pid=$(cat "$pidfile" 2>/dev/null)
-                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                        kill "$pid" 2>/dev/null
-                        local i; for i in {1..10}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-                        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-                    fi
-                    rm -f "$pidfile"
-                fi
-                ;;
-        esac
-    else
-        systemctl stop "$name" >/dev/null 2>&1
+# ==================== 赛风 Psiphon 模块 ====================
+get_country_name() {
+    local code="${1^^}"
+    case "$code" in
+        US) echo "美国 (United States)" ;;
+        JP) echo "日本 (Japan)" ;;
+        SG) echo "新加坡 (Singapore)" ;;
+        HK) echo "中国香港 (Hong Kong)" ;;
+        GB) echo "英国 (United Kingdom)" ;;
+        DE) echo "德国 (Germany)" ;;
+        CA) echo "加拿大 (Canada)" ;;
+        NL) echo "荷兰 (Netherlands)" ;;
+        FR) echo "法国 (France)" ;;
+        IN) echo "印度 (India)" ;;
+        AU) echo "澳大利亚 (Australia)" ;;
+        KR) echo "韩国 (South Korea)" ;;
+        TW) echo "中国台湾 (Taiwan)" ;;
+        AUTO|"") echo "智能自动选择" ;;
+        *) echo "$code" ;;
+    esac
+}
+
+show_supported_psiphon_codes() {
+    yellow "支持的常用 Psiphon 出口国家代码:"
+    echo "  US - 美国      JP - 日本      SG - 新加坡    HK - 中国香港"
+    echo "  GB - 英国      DE - 德国      CA - 加拿大    NL - 荷兰"
+    echo "  FR - 法国      IN - 印度      AU - 澳大利亚  AUTO - 自动"
+}
+
+detect_arch_slim() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l|armv7) echo "arm" ;;
+        i386|i686) echo "386" ;;
+        *) echo "amd64" ;;
+    esac
+}
+
+install_psiphon_core() {
+    if [[ -x "$WORKDIR/psiphon-tunnel-core" ]]; then
+        return 0
+    fi
+    mkdir -p "$WORKDIR"
+    local arch
+    arch=$(detect_arch_slim)
+    yellow "[*] 正在下载 Psiphon 核心程序 (Linux-${arch})..."
+    local url="https://github.com/Psiphon-Labs/psiphon-tunnel-core/releases/download/v2.0.28/psiphon-tunnel-core-linux-${arch}"
+    if ! curl -fsSL "$url" -o "$WORKDIR/psiphon-tunnel-core" 2>/dev/null; then
+        # 备用下载地址
+        curl -fsSL "https://raw.githubusercontent.com/hxzl666/singbox/main/psiphon-tunnel-core-linux-${arch}" -o "$WORKDIR/psiphon-tunnel-core" 2>/dev/null || true
+    fi
+    chmod +x "$WORKDIR/psiphon-tunnel-core" 2>/dev/null
+    if [[ ! -x "$WORKDIR/psiphon-tunnel-core" ]]; then
+        log_warn "未下载到原生 psiphon-tunnel-core，请确保网络通畅。"
+        return 1
+    fi
+    green "[+] Psiphon 核心已安装: $WORKDIR/psiphon-tunnel-core"
+    return 0
+}
+
+write_psiphon_config() {
+    local socks_port="$1"
+    local region="$2"
+    local cfg_file="$3"
+    local data_dir="$4"
+
+    mkdir -p "$data_dir" 2>/dev/null
+    [[ "${region^^}" == "AUTO" ]] && region=""
+
+    cat > "$cfg_file" <<EOF_PSI
+{
+  "DataRootDirectory": "${data_dir}",
+  "EmitDiagnosticNotices": true,
+  "EmitDiagnosticNetworkParameters": true,
+  "EmitServerAlerts": true,
+  "LocalSocksProxyPort": ${socks_port:-0},
+  "DisableLocalHTTPProxy": true,
+  "LocalHttpProxyPort": 0,
+  "EgressRegion": "${region}",
+  "PropagationChannelId": "FFFFFFFFFFFFFFFF",
+  "SponsorId": "FFFFFFFFFFFFFFFF",
+  "UseIndistinguishableTLS": true
+}
+EOF_PSI
+}
+
+start_main_psiphon() {
+    install_psiphon_core || return 1
+    local psi_pid_file="$WORKDIR/psiphon.pid"
+    if [[ -f "$psi_pid_file" ]] && kill -0 "$(cat "$psi_pid_file" 2>/dev/null)" 2>/dev/null; then
+        return 0
+    fi
+    local region
+    region=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
+    local socks_port
+    socks_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
+    write_psiphon_config "$socks_port" "$region" "$WORKDIR/psiphon.config" "$WORKDIR/psiphon-data"
+
+    nohup "$WORKDIR/psiphon-tunnel-core" --config "$WORKDIR/psiphon.config" >> "$WORKDIR/psiphon.log" 2>&1 &
+    echo $! > "$psi_pid_file"
+    sleep 2
+    return 0
+}
+
+stop_main_psiphon() {
+    local psi_pid_file="$WORKDIR/psiphon.pid"
+    if [[ -f "$psi_pid_file" ]]; then
+        local pid
+        pid=$(cat "$psi_pid_file" 2>/dev/null)
+        [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
+        rm -f "$psi_pid_file"
+    fi
+    pkill -9 -f "psiphon.config" 2>/dev/null || true
+}
+
+# ==================== 副节点目录初始化与同步 ====================
+init_proxy_groups_dir() {
+    mkdir -p "$PROXY_GROUPS_DIR"
+    [[ -f "$PROXY_GROUPS_DIR/groups.txt" ]] || touch "$PROXY_GROUPS_DIR/groups.txt"
+}
+
+get_all_proxy_groups() {
+    init_proxy_groups_dir
+    if [[ -f "$PROXY_GROUPS_DIR/groups.txt" ]]; then
+        grep -v '^$' "$PROXY_GROUPS_DIR/groups.txt" | sort -u
     fi
 }
 
-service_restart() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" restart >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        service_stop "$name"
-        sleep 1
-        service_start "$name"
-    else
-        systemctl restart "$name" >/dev/null 2>&1
+proxy_group_exists() {
+    local tag="$1"
+    init_proxy_groups_dir
+    grep -qx "$tag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null
+}
+
+init_psiphon_instances_dir() {
+    mkdir -p "$PSI_INSTANCES_DIR"
+    [[ -f "$PSI_INSTANCES_DIR/instances.txt" ]] || touch "$PSI_INSTANCES_DIR/instances.txt"
+}
+
+get_all_psiphon_instances() {
+    init_psiphon_instances_dir
+    if [[ -f "$PSI_INSTANCES_DIR/instances.txt" ]]; then
+        grep -v '^$' "$PSI_INSTANCES_DIR/instances.txt" | sort -u
     fi
 }
 
-service_enable() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-update add "$name" default >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        : # 直接进程模式无开机自启功能
-    else
-        systemctl enable "$name" >/dev/null 2>&1
+# 代理链接解析为 sing-box Outbound JSON (支持 6 种协议)
+parse_proxy_url_to_json() {
+    local url="$1"
+    local tag="$2"
+    PROXY_URL="$url" PROXY_TAG="$tag" python3 - <<'PY_PARSER'
+import json, sys, base64, os
+from urllib.parse import urlparse, parse_qs, unquote
+
+url = os.environ.get('PROXY_URL', '').strip()
+tag = os.environ.get('PROXY_TAG', 'proxy-out')
+
+def b64d(s):
+    s = s.replace('-', '+').replace('_', '/')
+    s += '=' * (4 - len(s) % 4)
+    return base64.b64decode(s).decode('utf-8', errors='replace')
+
+def make_tls(params, host, default_sec='tls'):
+    sec   = (params.get('security', [default_sec])[0] or default_sec).lower()
+    sni   = params.get('sni', [host])[0] or host
+    fp    = params.get('fp',  [''])[0]
+    pbk   = params.get('pbk', [''])[0]
+    sid   = params.get('sid', [''])[0]
+    alpn  = [a for a in params.get('alpn', [''])[0].split(',') if a]
+    insec = params.get('insecure', ['0'])[0] == '1' or params.get('allowInsecure', ['0'])[0] == '1'
+    if sec in ('none', ''):
+        return None
+    tls = {'enabled': True, 'server_name': sni}
+    if alpn:  tls['alpn'] = alpn
+    if insec: tls['insecure'] = True
+    if fp:    tls['utls'] = {'enabled': True, 'fingerprint': fp}
+    if sec == 'reality':
+        tls['reality'] = {'enabled': True, 'public_key': pbk, 'short_id': sid}
+    return tls
+
+def make_transport(params):
+    net  = params.get('type', ['tcp'])[0].lower()
+    path = params.get('path', ['/'])[0]
+    hdr  = params.get('host', [''])[0]
+    svc  = params.get('serviceName', [''])[0]
+    if net == 'ws':
+        t = {'type': 'ws', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        return t
+    if net == 'grpc':
+        return {'type': 'grpc', 'service_name': svc or path.lstrip('/')}
+    if net in ('httpupgrade', 'h1'):
+        t = {'type': 'httpupgrade', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        return t
+    if net == 'h2':
+        t = {'type': 'http', 'path': path}
+        if hdr: t['host'] = [hdr]
+        return t
+    return None
+
+def parse_vless(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    out = {'type': 'vless', 'tag': tag, 'server': host, 'server_port': p.port or 443,
+           'uuid': unquote(p.username or '')}
+    flow = params.get('flow', [''])[0]
+    if flow: out['flow'] = flow
+    t = make_transport(params)
+    if t: out['transport'] = t
+    tls = make_tls(params, host)
+    if tls: out['tls'] = tls
+    return out
+
+def parse_vmess(url, tag):
+    raw = url[8:]
+    try:    data = json.loads(b64d(raw))
+    except Exception as e: raise ValueError(f'VMess base64 解码失败: {e}')
+    host = data.get('add',''); port = int(data.get('port', 443))
+    net  = data.get('net','tcp'); tls_s = data.get('tls','')
+    sni  = data.get('sni','') or data.get('host','') or host
+    path = data.get('path','/'); hdr = data.get('host',''); fp = data.get('fp','')
+    out  = {'type': 'vmess', 'tag': tag, 'server': host, 'server_port': port,
+            'uuid': data.get('id',''), 'alter_id': int(data.get('aid',0)),
+            'security': data.get('scy','auto')}
+    if net == 'ws':
+        t = {'type': 'ws', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        out['transport'] = t
+    elif net == 'grpc':
+        out['transport'] = {'type': 'grpc', 'service_name': data.get('serviceName', path.lstrip('/'))}
+    elif net in ('httpupgrade', 'h1'):
+        t = {'type': 'httpupgrade', 'path': path}
+        if hdr: t['headers'] = {'Host': hdr}
+        out['transport'] = t
+    if tls_s == 'tls':
+        tls = {'enabled': True, 'server_name': sni}
+        if fp: tls['utls'] = {'enabled': True, 'fingerprint': fp}
+        out['tls'] = tls
+    return out
+
+def parse_trojan(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    out = {'type': 'trojan', 'tag': tag, 'server': host, 'server_port': p.port or 443,
+           'password': unquote(p.username or '')}
+    t = make_transport(params)
+    if t: out['transport'] = t
+    tls = make_tls(params, host) or {'enabled': True, 'server_name': host}
+    out['tls'] = tls
+    return out
+
+def parse_hy2(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    pw = unquote(p.username or '') or unquote(p.password or '')
+    sni = params.get('sni', [host])[0] or host
+    insec = params.get('insecure', ['0'])[0] == '1'
+    obfs_t = params.get('obfs', [''])[0]; obfs_p = params.get('obfs-password', [''])[0]
+    out = {'type': 'hysteria2', 'tag': tag, 'server': host, 'server_port': p.port or 443,
+           'password': pw, 'tls': {'enabled': True, 'server_name': sni, 'insecure': insec}}
+    if obfs_t: out['obfs'] = {'type': obfs_t, 'password': obfs_p}
+    return out
+
+def parse_tuic(url, tag):
+    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
+    alpn = [a for a in params.get('alpn', ['h3'])[0].split(',') if a] or ['h3']
+    sni  = params.get('sni', [host])[0] or host
+    insec = params.get('allow_insecure', ['0'])[0] == '1'
+    cc   = params.get('congestion_control', ['bbr'])[0]
+    return {'type': 'tuic', 'tag': tag, 'server': host, 'server_port': p.port or 443,
+            'uuid': unquote(p.username or ''), 'password': unquote(p.password or ''),
+            'congestion_control': cc,
+            'tls': {'enabled': True, 'server_name': sni, 'alpn': alpn, 'insecure': insec}}
+
+def parse_ss(url, tag):
+    p = urlparse(url); host = p.hostname; port = p.port or 8388
+    if p.username and p.password:
+        method = unquote(p.username); password = unquote(p.password)
+    else:
+        userinfo = unquote(p.username or '')
+        try:    method, password = b64d(userinfo).split(':', 1)
+        except: method = 'aes-256-gcm'; password = userinfo
+    return {'type': 'shadowsocks', 'tag': tag, 'server': host, 'server_port': port,
+            'method': method, 'password': password}
+
+try:
+    if   url.startswith('vless://'):                   r = parse_vless(url, tag)
+    elif url.startswith('vmess://'):                   r = parse_vmess(url, tag)
+    elif url.startswith('trojan://'):                  r = parse_trojan(url, tag)
+    elif url.startswith(('hy2://', 'hysteria2://')):   r = parse_hy2(url, tag)
+    elif url.startswith('tuic://'):                    r = parse_tuic(url, tag)
+    elif url.startswith('ss://'):                      r = parse_ss(url, tag)
+    else:
+        print('ERROR: 不支持的协议，支持: vless/vmess/trojan/hy2/tuic/ss')
+        sys.exit(1)
+    print(json.dumps(r, ensure_ascii=False, indent=2))
+except Exception as e:
+    print(f'ERROR: {e}')
+    sys.exit(1)
+PY_PARSER
+}
+
+validate_and_parse_proxy_url() {
+    local url="$1" tag="${2:-proxy-out}" result rc
+    result=$(parse_proxy_url_to_json "$url" "$tag" 2>&1); rc=$?
+    if [[ $rc -ne 0 ]] || echo "$result" | grep -q '^ERROR:'; then
+        red "[!] 链接解析失败: $(echo "$result" | grep '^ERROR:' | head -1 | sed 's/^ERROR: //')"
+        return 1
     fi
+    echo "$result"
+    return 0
 }
 
-service_disable() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-update del "$name" default >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        : # 直接进程模式无开机自启功能
-    else
-        systemctl disable "$name" >/dev/null 2>&1
-    fi
-}
+# ==================== 同步自定义代理副节点到 sing-box ====================
+sync_proxy_group_to_singbox() {
+    local group_tag="$1"
+    local group_dir="${PROXY_GROUPS_DIR}/${group_tag}"
+    local cfg="$WORKDIR/sb.json"
 
-service_is_active() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" status | grep -q "started"
-    elif $IS_DIRECT; then
-        case "$name" in
-            nginx)
-                pgrep -x nginx >/dev/null 2>&1
-                ;;
-            *)
-                local pidfile="/etc/s-box/${name}.pid"
-                if [[ -f "$pidfile" ]]; then
-                    local pid
-                    pid=$(cat "$pidfile" 2>/dev/null)
-                    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
-                else
-                    return 1
-                fi
-                ;;
-        esac
-    else
-        systemctl is-active --quiet "$name"
-    fi
-}
+    [[ -f "$cfg" ]] || return 1
+    [[ -d "$group_dir" ]] || return 1
+    [[ -f "$group_dir/outbound.json" ]] || return 1
 
-log_info "开始安装 Sing-box 多协议一键部署脚本..."
+    local hy2_port tuic_port vless_port uuid
+    hy2_port=$(cat "$group_dir/hy2_port.txt" 2>/dev/null || echo "0")
+    tuic_port=$(cat "$group_dir/tuic_port.txt" 2>/dev/null || echo "0")
+    vless_port=$(cat "$group_dir/vless_port.txt" 2>/dev/null || echo "0")
+    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat "$WORKDIR/uuid.txt" 2>/dev/null)
+    local out_tag="${group_tag}-out"
 
-create_sb_tool() {
-cat > /usr/local/bin/sb <<'EOF'
-#!/bin/bash
-# Sing-box 极简快捷管理工具
+    python3 - \
+        "$cfg" \
+        "$group_tag" \
+        "$out_tag" \
+        "${hy2_port:-0}" \
+        "${tuic_port:-0}" \
+        "${vless_port:-0}" \
+        "$uuid" \
+        "$WORKDIR" \
+        "$group_dir/outbound.json" <<'PY_SYNC_PROXY'
+import json, sys
 
-# 覆写 jq 确保所有提取出来的 JSON 字段都不带 Windows 的 \r 回车符
-jq() {
-    command jq "$@" | tr -d '\r'
-    return ${PIPESTATUS[0]}
-}
+cfg_path    = sys.argv[1]
+group_tag   = sys.argv[2]
+out_tag     = sys.argv[3]
+hy2_port    = int(sys.argv[4]) if sys.argv[4] else 0
+tuic_port   = int(sys.argv[5]) if sys.argv[5] else 0
+vless_port  = int(sys.argv[6]) if sys.argv[6] else 0
+uuid        = sys.argv[7]
+workdir     = sys.argv[8]
+outbound_f  = sys.argv[9]
 
-b64_no_wrap() {
-    printf '%s' "$1" | base64 -w 0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
-}
+try:
+    with open(outbound_f, 'r', encoding='utf-8') as f:
+        outbound_obj = json.load(f)
+    outbound_obj['tag'] = out_tag
+except Exception as e:
+    sys.exit(1)
 
-url_encode() {
-    local encoded
-    encoded=$(printf '%s' "$1" | command jq -sRr @uri) || return $?
-    printf '%s' "$encoded" | tr -d '\r\n'
-}
+try:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+except Exception as e:
+    sys.exit(1)
 
-make_vmess_link() {
-    local json="$1"
-    printf '%s' "$json" | command jq -e . >/dev/null 2>&1 || return 1
-    printf 'vmess://%s' "$(b64_no_wrap "$json")"
-}
+inbounds  = data.setdefault('inbounds',  [])
+outbounds = data.setdefault('outbounds', [])
+route     = data.setdefault('route',     {})
+rules     = route.setdefault('rules',    [])
 
-if [[ $EUID -ne 0 ]]; then
-   echo "错误：必须以 root 权限运行此脚本！"
-   exit 1
-fi
+# 1. 更新 outbound
+outbounds[:] = [o for o in outbounds if o.get('tag') != out_tag]
+outbounds.append(outbound_obj)
 
-# 自动加载 Argo 配置
-USE_NGINX="y"
-ARGO_PORT=""
-ARGO_TARGET_PROTOCOL=""
-if [[ -f /etc/s-box/argo.conf ]]; then
-    source /etc/s-box/argo.conf
-fi
+# 2. 移除旧的专属 inbound
+def is_mine(ib):
+    t = ib.get('tag', '')
+    return t == f'hy2-{group_tag}-in' or t == f'tuic-{group_tag}-in' or t == f'vless-{group_tag}-in'
 
-# 自动检测是否为 OpenRC (Alpine 等)
-IS_OPENRC=false
-IS_DIRECT=false
-if [[ -x "/sbin/openrc-run" || -x "/sbin/runlevels" ]]; then
-    IS_OPENRC=true
-elif ! pidof systemd >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; then
-    IS_DIRECT=true
-fi
+inbounds[:] = [ib for ib in inbounds if not is_mine(ib)]
 
-# Nginx 配置目录自适应
-NGINX_CONF_DIR="/etc/nginx/conf.d"
-[[ -d "/etc/nginx/http.d" ]] && NGINX_CONF_DIR="/etc/nginx/http.d"
+cert = f'{workdir}/cert.pem'
+key  = f'{workdir}/private.key'
+inbound_tags = []
 
-# 服务控制函数
-service_start() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" start >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        service_stop "$name" 2>/dev/null
-        case "$name" in
-            sing-box)
-                nohup /etc/s-box/sing-box run -c /etc/s-box/sb.json >> /var/log/sing-box.log 2>&1 &
-                echo $! > /etc/s-box/sing-box.pid
-                ;;
-            argo-tunnel)
-                local _cf_args
-                _cf_args=$(
-                    local _am="" _at="" _ap="8401"
-                    [[ -f /etc/s-box/argo.conf ]] && source /etc/s-box/argo.conf
-                    _am="${ARGO_MODE:-temp}"; _at="${ARGO_TOKEN}"; _ap="${ARGO_PORT:-8401}"
-                    if [[ "$_am" == "token" && -n "$_at" ]]; then
-                        echo "tunnel --no-autoupdate run --token $_at"
-                    else
-                        echo "tunnel --url http://127.0.0.1:${_ap}"
-                    fi
-                )
-                nohup /usr/local/bin/cloudflared $_cf_args >> /var/log/argo-tunnel.log 2>&1 &
-                echo $! > /etc/s-box/argo-tunnel.pid
-                ;;
-            nginx)
-                nginx >/dev/null 2>&1
-                ;;
-        esac
-    else
-        systemctl start "$name" >/dev/null 2>&1
-    fi
-}
+if hy2_port > 0:
+    t = f'hy2-{group_tag}-in'
+    inbound_tags.append(t)
+    inbounds.append({
+        'type': 'hysteria2', 'tag': t,
+        'listen': '::', 'listen_port': hy2_port,
+        'users': [{'password': uuid}],
+        'masquerade': 'https://www.bing.com',
+        'ignore_client_bandwidth': False,
+        'tls': {'enabled': True, 'alpn': ['h3'], 'certificate_path': cert, 'key_path': key}
+    })
 
-service_stop() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" stop >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        case "$name" in
-            nginx)
-                nginx -s stop >/dev/null 2>&1
-                ;;
-            *)
-                local pidfile="/etc/s-box/${name}.pid"
-                if [[ -f "$pidfile" ]]; then
-                    local pid
-                    pid=$(cat "$pidfile" 2>/dev/null)
-                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                        kill "$pid" 2>/dev/null
-                        local i; for i in {1..10}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-                        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-                    fi
-                    rm -f "$pidfile"
-                fi
-                ;;
-        esac
-    else
-        systemctl stop "$name" >/dev/null 2>&1
-    fi
-}
+if tuic_port > 0:
+    t = f'tuic-{group_tag}-in'
+    inbound_tags.append(t)
+    inbounds.append({
+        'type': 'tuic', 'tag': t,
+        'listen': '::', 'listen_port': tuic_port,
+        'users': [{'uuid': uuid, 'password': uuid}],
+        'congestion_control': 'bbr',
+        'tls': {'enabled': True, 'alpn': ['h3'], 'certificate_path': cert, 'key_path': key}
+    })
 
-service_restart() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" restart >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        service_stop "$name"
-        sleep 1
-        service_start "$name"
-    else
-        systemctl restart "$name" >/dev/null 2>&1
-    fi
-}
-
-service_is_active() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" status | grep -q "started"
-    elif $IS_DIRECT; then
-        case "$name" in
-            nginx)
-                pgrep -x nginx >/dev/null 2>&1
-                ;;
-            *)
-                local pidfile="/etc/s-box/${name}.pid"
-                if [[ -f "$pidfile" ]]; then
-                    local pid
-                    pid=$(cat "$pidfile" 2>/dev/null)
-                    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
-                else
-                    return 1
-                fi
-                ;;
-        esac
-    else
-        systemctl is-active --quiet "$name"
-    fi
-}
-
-service_enable() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-update add "$name" default >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        : # 直接进程模式无开机自启功能
-    else
-        systemctl enable "$name" >/dev/null 2>&1
-    fi
-}
-
-service_disable() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-update del "$name" default >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        : # 直接进程模式无开机自启功能
-    else
-        systemctl disable "$name" >/dev/null 2>&1
-    fi
-}
-
-# 统一判断，空值或 y/yes 都视为启用
-is_enabled() {
-    [[ "$1" == "y" || "$1" == "yes" || -z "$1" ]] && return 0 || return 1
-}
-
-get_argo_recent_logs() {
-    if $IS_OPENRC || $IS_DIRECT; then
-        cat /var/log/argo-tunnel.log /var/log/argo-tunnel.err 2>/dev/null
-    else
-        journalctl -u argo-tunnel -n 200 --no-pager 2>/dev/null
-    fi
-}
-
-extract_cloudflared_config_json() {
-    local escaped_config
-    escaped_config=$(get_argo_recent_logs | awk '
-        match($0, /config="/) {
-            line = substr($0, RSTART + 8)
-            sub(/" version=.*/, "", line)
-            print line
+if vless_port > 0:
+    t = f'vless-{group_tag}-in'
+    inbound_tags.append(t)
+    reality_pvk = ""
+    reym = "apple.com"
+    try:
+        with open(f'{workdir}/private_key.txt', 'r') as f: reality_pvk = f.read().strip()
+        with open(f'{workdir}/reym.txt', 'r') as f: reym = f.read().strip()
+    except: pass
+    inbounds.append({
+        'type': 'vless', 'tag': t,
+        'listen': '::', 'listen_port': vless_port,
+        'users': [{'uuid': uuid, 'flow': 'xtls-rprx-vision'}],
+        'tls': {
+            'enabled': True, 'server_name': reym,
+            'reality': {'enabled': True, 'handshake': {'server': reym, 'server_port': 443},
+                        'private_key': reality_pvk, 'short_id': ['']}
         }
-    ' | tail -n 1)
-    [[ -z "$escaped_config" ]] && return 1
-    printf '%s' "${escaped_config//\\\"/\"}"
+    })
+
+# 3. 更新路由规则：在最前插入专属规则，确保副节点无论何时都走自己的外部代理出口
+rules[:] = [r for r in rules if r.get('outbound') != out_tag]
+if inbound_tags:
+    rules.insert(0, {'inbound': inbound_tags, 'outbound': out_tag})
+
+try:
+    with open(cfg_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+except Exception as e:
+    sys.exit(1)
+PY_SYNC_PROXY
+    return $?
 }
 
-sync_argo_domains_from_cloudflared_config() {
-    [[ -f /etc/s-box/argo.conf && -f /etc/s-box/sb.json ]] || return 0
-    source /etc/s-box/argo.conf
-    [[ "$ARGO_MODE" == "token" ]] || return 0
-    is_enabled "$USE_NGINX" && return 0
+# ==================== 同步赛风副节点到 sing-box ====================
+sync_psiphon_instance_to_singbox() {
+    local cc="${1^^}"
+    local inst_dir="${PSI_INSTANCES_DIR}/${cc}"
+    local cfg="$WORKDIR/sb.json"
 
-    local vmess_port trojan_ws_port config_json
-    local cf_vmess_domain="" cf_trojan_domain=""
-    local synced_vmess_domain="$ARGO_VMESS_DOMAIN"
-    local synced_trojan_domain="$ARGO_TROJAN_DOMAIN"
-    local changed=false
+    [[ -f "$cfg" ]] || return 1
+    [[ -d "$inst_dir" ]] || return 1
 
-    vmess_port=$(jq -r '.inbounds[]? | select(.tag=="vmess-in") | .listen_port // empty' /etc/s-box/sb.json 2>/dev/null | head -n 1)
-    trojan_ws_port=$(jq -r '.inbounds[]? | select(.tag=="trojan-ws-in") | .listen_port // empty' /etc/s-box/sb.json 2>/dev/null | head -n 1)
+    local hy2_port tuic_port vless_port socks_port uuid
+    hy2_port=$(cat "$inst_dir/hy2_port.txt" 2>/dev/null || echo "0")
+    tuic_port=$(cat "$inst_dir/tuic_port.txt" 2>/dev/null || echo "0")
+    vless_port=$(cat "$inst_dir/vless_port.txt" 2>/dev/null || echo "0")
+    socks_port=$(cat "$inst_dir/socks_port.txt" 2>/dev/null || echo "0")
+    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat "$WORKDIR/uuid.txt" 2>/dev/null)
+    local out_tag="psiphon-${cc,,}"
 
-    config_json=""
-    for i in {1..5}; do
-        if config_json=$(extract_cloudflared_config_json); then
-            break
-        fi
-        sleep 2
+    python3 - \
+        "$cfg" \
+        "$cc" \
+        "$out_tag" \
+        "${socks_port:-0}" \
+        "${hy2_port:-0}" \
+        "${tuic_port:-0}" \
+        "${vless_port:-0}" \
+        "$uuid" \
+        "$WORKDIR" <<'PY_SYNC_PSI'
+import json, sys
+
+cfg_path    = sys.argv[1]
+cc          = sys.argv[2].lower()
+out_tag     = sys.argv[3]
+socks_port  = int(sys.argv[4]) if sys.argv[4] else 0
+hy2_port    = int(sys.argv[5]) if sys.argv[5] else 0
+tuic_port   = int(sys.argv[6]) if sys.argv[6] else 0
+vless_port  = int(sys.argv[7]) if sys.argv[7] else 0
+uuid        = sys.argv[8]
+workdir     = sys.argv[9]
+
+try:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+except Exception as e:
+    sys.exit(1)
+
+inbounds  = data.setdefault('inbounds',  [])
+outbounds = data.setdefault('outbounds', [])
+route     = data.setdefault('route',     {})
+rules     = route.setdefault('rules',    [])
+
+# 1. 更新 outbound
+outbounds[:] = [o for o in outbounds if o.get('tag') != out_tag]
+if socks_port > 0:
+    outbounds.append({
+        'type': 'socks',
+        'tag': out_tag,
+        'server': '127.0.0.1',
+        'server_port': socks_port,
+        'version': '5',
+        'network': 'tcp'
+    })
+
+# 2. 移除旧专属 inbound
+def is_mine(ib):
+    t = ib.get('tag', '')
+    return t == f'hy2-psi-{cc}-in' or t == f'tuic-psi-{cc}-in' or t == f'vless-psi-{cc}-in'
+
+inbounds[:] = [ib for ib in inbounds if not is_mine(ib)]
+
+cert = f'{workdir}/cert.pem'
+key  = f'{workdir}/private.key'
+inbound_tags = []
+
+if hy2_port > 0:
+    t = f'hy2-psi-{cc}-in'
+    inbound_tags.append(t)
+    inbounds.append({
+        'type': 'hysteria2', 'tag': t,
+        'listen': '::', 'listen_port': hy2_port,
+        'users': [{'password': uuid}],
+        'masquerade': 'https://www.bing.com',
+        'ignore_client_bandwidth': False,
+        'tls': {'enabled': True, 'alpn': ['h3'], 'certificate_path': cert, 'key_path': key}
+    })
+
+if tuic_port > 0:
+    t = f'tuic-psi-{cc}-in'
+    inbound_tags.append(t)
+    inbounds.append({
+        'type': 'tuic', 'tag': t,
+        'listen': '::', 'listen_port': tuic_port,
+        'users': [{'uuid': uuid, 'password': uuid}],
+        'congestion_control': 'bbr',
+        'tls': {'enabled': True, 'alpn': ['h3'], 'certificate_path': cert, 'key_path': key}
+    })
+
+if vless_port > 0:
+    t = f'vless-psi-{cc}-in'
+    inbound_tags.append(t)
+    reality_pvk = ""
+    reym = "apple.com"
+    try:
+        with open(f'{workdir}/private_key.txt', 'r') as f: reality_pvk = f.read().strip()
+        with open(f'{workdir}/reym.txt', 'r') as f: reym = f.read().strip()
+    except: pass
+    inbounds.append({
+        'type': 'vless', 'tag': t,
+        'listen': '::', 'listen_port': vless_port,
+        'users': [{'uuid': uuid, 'flow': 'xtls-rprx-vision'}],
+        'tls': {
+            'enabled': True, 'server_name': reym,
+            'reality': {'enabled': True, 'handshake': {'server': reym, 'server_port': 443},
+                        'private_key': reality_pvk, 'short_id': ['']}
+        }
+    })
+
+# 3. 插入专属路由规则到最前
+rules[:] = [r for r in rules if r.get('outbound') != out_tag]
+if inbound_tags and socks_port > 0:
+    rules.insert(0, {'inbound': inbound_tags, 'outbound': out_tag})
+
+try:
+    with open(cfg_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+except Exception as e:
+    sys.exit(1)
+PY_SYNC_PSI
+    return $?
+}
+
+# ==================== 副节点全面自动同步函数 ====================
+sync_all_secondary_nodes() {
+    local cfg="$WORKDIR/sb.json"
+    [[ -f "$cfg" ]] || return 0
+
+    # 1. 恢复同步所有赛风副节点实例
+    local psi_insts
+    mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
+    for cc in "${psi_insts[@]}"; do
+        [[ -n "$cc" ]] && sync_psiphon_instance_to_singbox "$cc" >/dev/null 2>&1 || true
     done
-    if [[ -z "$config_json" ]]; then
-        echo "警告：未从 cloudflared 日志中找到远端 ingress 配置，跳过域名端口反向同步。"
-        return 0
-    fi
-    if ! printf '%s' "$config_json" | command jq -e '.ingress' >/dev/null 2>&1; then
-        echo "警告：cloudflared ingress 配置解析失败，跳过域名端口反向同步。"
-        return 0
-    fi
 
-    if [[ -n "$vmess_port" && "$vmess_port" != "null" ]]; then
-        cf_vmess_domain=$(printf '%s' "$config_json" | command jq -r --arg port "$vmess_port" '
-            .ingress[]?
-            | select((.hostname? // "") != "" and ((.service? // "") | test("://(127[.]0[.]0[.]1|localhost):" + $port + "($|/)")))
-            | .hostname
-        ' 2>/dev/null | head -n 1 | tr -d '\r')
-    fi
-    if [[ -n "$trojan_ws_port" && "$trojan_ws_port" != "null" ]]; then
-        cf_trojan_domain=$(printf '%s' "$config_json" | command jq -r --arg port "$trojan_ws_port" '
-            .ingress[]?
-            | select((.hostname? // "") != "" and ((.service? // "") | test("://(127[.]0[.]0[.]1|localhost):" + $port + "($|/)")))
-            | .hostname
-        ' 2>/dev/null | head -n 1 | tr -d '\r')
-    fi
-
-    if [[ -n "$cf_vmess_domain" && "$cf_vmess_domain" != "$ARGO_VMESS_DOMAIN" ]]; then
-        synced_vmess_domain="$cf_vmess_domain"
-        changed=true
-        echo "已按 cloudflared 配置同步 VMess 域名: ${synced_vmess_domain} -> 127.0.0.1:${vmess_port}"
-    fi
-    if [[ -n "$cf_trojan_domain" && "$cf_trojan_domain" != "$ARGO_TROJAN_DOMAIN" ]]; then
-        synced_trojan_domain="$cf_trojan_domain"
-        changed=true
-        echo "已按 cloudflared 配置同步 Trojan 域名: ${synced_trojan_domain} -> 127.0.0.1:${trojan_ws_port}"
-    fi
-
-    if ! $changed; then
-        [[ -n "$cf_vmess_domain" || -z "$vmess_port" ]] || echo "警告：未在 cloudflared 配置中找到 VMess 端口 ${vmess_port} 对应域名。"
-        [[ -n "$cf_trojan_domain" || -z "$trojan_ws_port" ]] || echo "警告：未在 cloudflared 配置中找到 Trojan 端口 ${trojan_ws_port} 对应域名。"
-        return 0
-    fi
-
-    ARGO_VMESS_DOMAIN="$synced_vmess_domain"
-    ARGO_TROJAN_DOMAIN="$synced_trojan_domain"
-    cat > /etc/s-box/argo.conf <<EOF_ARGO
-ARGO_MODE="${ARGO_MODE}"
-ARGO_TOKEN="${ARGO_TOKEN}"
-ARGO_DOMAIN="${ARGO_DOMAIN}"
-ARGO_VMESS_DOMAIN="${ARGO_VMESS_DOMAIN}"
-ARGO_TROJAN_DOMAIN="${ARGO_TROJAN_DOMAIN}"
-USE_NGINX="${USE_NGINX}"
-ARGO_PORT="${ARGO_PORT}"
-EOF_ARGO
-    echo "${ARGO_VMESS_DOMAIN:-$ARGO_TROJAN_DOMAIN}" > /etc/s-box/argo.log
-}
-
-# 重新生成 Nginx 配置
-regenerate_nginx_conf() {
-    if ! is_enabled "$USE_NGINX"; then
-        return
-    fi
-    if [[ ! -f ${NGINX_CONF_DIR}/singbox-argo.conf ]]; then
-        return
-    fi
-    
-    local port_nginx=$(grep -oE "listen 127.0.0.1:[0-9]+" ${NGINX_CONF_DIR}/singbox-argo.conf | head -n 1 | awk -F: '{print $2}')
-    [[ -z "$port_nginx" ]] && port_nginx=8401
-    
-    local nginx_locations=""
-    
-    # 检查 VMess WS
-    if jq -e '.inbounds[] | select(.tag=="vmess-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-        local vmess_port=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .listen_port' /etc/s-box/sb.json)
-        local vmess_path=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .transport.path' /etc/s-box/sb.json)
-        nginx_locations="${nginx_locations}
-    location ${vmess_path} {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:${vmess_port};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \"upgrade\";
-        proxy_set_header Host \$http_host;
-    }"
-    fi
-    
-    # 检查 Trojan WS
-    if jq -e '.inbounds[] | select(.tag=="trojan-ws-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-        local trojan_ws_port=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .listen_port' /etc/s-box/sb.json)
-        local trojan_ws_path=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .transport.path' /etc/s-box/sb.json)
-        nginx_locations="${nginx_locations}
-    location ${trojan_ws_path} {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:${trojan_ws_port};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \"upgrade\";
-        proxy_set_header Host \$http_host;
-    }"
-    fi
-    
-    local listen_ipv6=""
-    if [[ -f /proc/sys/net/ipv6/conf/all/disable_ipv6 && $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) -ne 1 ]]; then
-        listen_ipv6="listen [::1]:${port_nginx};"
-    fi
-
-    cat > ${NGINX_CONF_DIR}/singbox-argo.conf <<EOF2
-server {
-    listen 127.0.0.1:${port_nginx};
-    ${listen_ipv6}
-    server_name localhost;
-    ${nginx_locations}
-}
-EOF2
-    service_restart nginx
-}
-
-# 重新生成 info.log 分享链接
-regenerate_info_log() {
-    local ipv4=$(curl -s4m5 icanhazip.com || curl -s4m5 api.ipify.org)
-    local ipv6=$(curl -s6m5 icanhazip.com || curl -s6m5 api6.ipify.org)
-    local ip=${ipv4:-$ipv6}
-    
-    local uuid=$(jq -r '.. | .uuid? // .password? | select(. != null)' /etc/s-box/sb.json | head -n 1)
-    
-    cat > /etc/s-box/info.log <<EOF2
-==================================================
-        Sing-box 多协议一键部署脚本 安装成功
-==================================================
-通用密码/UUID: ${uuid}
-EOF2
-
-    local has_direct=false
-    if jq -e '.inbounds[] | select(.tag | test("^(vless|vmess|trojan-tls|hy2|tuic|anytls)-in$"))' /etc/s-box/sb.json >/dev/null 2>&1; then
-        has_direct=true
-    fi
-    if $has_direct; then
-        echo "" >> /etc/s-box/info.log
-        echo "------------------【直连节点】--------------------" >> /etc/s-box/info.log
-    fi
-
-    local public_key=""
-    if [[ -f /etc/s-box/public.key ]]; then
-        public_key=$(cat /etc/s-box/public.key | tr -d '\r\n')
-    fi
-    local short_id=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.reality.short_id[0] // empty' /etc/s-box/sb.json)
-    
-    local argo_domain=""
-    if [[ -f /etc/s-box/argo.log ]]; then
-        argo_domain=$(cat /etc/s-box/argo.log | tr -d '\r\n')
-    fi
-    
-    local argo_mode="temp"
-    if [[ -f /etc/s-box/argo.conf ]]; then
-        source /etc/s-box/argo.conf
-        argo_mode=$ARGO_MODE
-    fi
-
-
-
-    # 1. VLESS-Reality
-    if jq -e '.inbounds[] | select(.tag=="vless-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-        local port_vless=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .listen_port' /etc/s-box/sb.json)
-        local uuid_vless=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .users[0].uuid' /etc/s-box/sb.json)
-        local sni_vless=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.server_name' /etc/s-box/sb.json)
-        local vless_link="vless://${uuid_vless}@${ip}:${port_vless}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni_vless}&fp=chrome&pbk=${public_key}&sid=${short_id}#SB-VLESS-Reality"
-        echo "1. VLESS-Reality:" >> /etc/s-box/info.log
-        echo "${vless_link}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-
-    # 2. VMess-WS
-    if jq -e '.inbounds[] | select(.tag=="vmess-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-        local port_vmess=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .listen_port' /etc/s-box/sb.json)
-        local uuid_vmess=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .users[0].uuid' /etc/s-box/sb.json)
-        local path_vmess=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .transport.path' /etc/s-box/sb.json)
-        local vmess_json=$(cat <<EOF2
-{
-  "v": "2",
-  "ps": "SB-VMess-WS",
-  "add": "${ip}",
-  "port": "${port_vmess}",
-  "id": "${uuid_vmess}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "",
-  "path": "${path_vmess}",
-  "tls": "none",
-  "sni": ""
-}
-EOF2
-)
-        local vmess_link
-        vmess_link=$(make_vmess_link "$vmess_json")
-        echo "2. VMess-WS (无TLS):" >> /etc/s-box/info.log
-        echo "${vmess_link}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-
-    # 3. Trojan-WS-TLS
-    if jq -e '.inbounds[] | select(.tag=="trojan-tls-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-        local port_trojan=$(jq -r '.inbounds[] | select(.tag=="trojan-tls-in") | .listen_port' /etc/s-box/sb.json)
-        local pass_trojan=$(jq -r '.inbounds[] | select(.tag=="trojan-tls-in") | .users[0].password' /etc/s-box/sb.json)
-        local sni_trojan=$(jq -r '.inbounds[] | select(.tag=="trojan-tls-in") | .tls.server_name' /etc/s-box/sb.json)
-        local path_trojan=$(jq -r '.inbounds[] | select(.tag=="trojan-tls-in") | .transport.path' /etc/s-box/sb.json)
-        local path_trojan_encoded=$(url_encode "$path_trojan")
-        local trojan_link="trojan://${pass_trojan}@${ip}:${port_trojan}?security=tls&sni=${sni_trojan}&allowInsecure=1&type=ws&path=${path_trojan_encoded}#SB-Trojan-WS-TLS"
-        echo "3. Trojan-WS-TLS (自签证书):" >> /etc/s-box/info.log
-        echo "${trojan_link}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-
-    # 4. Hysteria2
-    if jq -e '.inbounds[] | select(.tag=="hy2-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-        local port_hy2=$(jq -r '.inbounds[] | select(.tag=="hy2-in") | .listen_port' /etc/s-box/sb.json)
-        local pass_hy2=$(jq -r '.inbounds[] | select(.tag=="hy2-in") | .users[0].password' /etc/s-box/sb.json)
-        local hy2_link="hysteria2://${pass_hy2}@${ip}:${port_hy2}?insecure=1&sni=www.bing.com#SB-Hysteria2"
-        echo "4. Hysteria2:" >> /etc/s-box/info.log
-        echo "${hy2_link}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-
-    # 5. TUIC v5
-    if jq -e '.inbounds[] | select(.tag=="tuic-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-        local port_tuic=$(jq -r '.inbounds[] | select(.tag=="tuic-in") | .listen_port' /etc/s-box/sb.json)
-        local uuid_tuic=$(jq -r '.inbounds[] | select(.tag=="tuic-in") | .users[0].uuid' /etc/s-box/sb.json)
-        local pass_tuic=$(jq -r '.inbounds[] | select(.tag=="tuic-in") | .users[0].password' /etc/s-box/sb.json)
-        local tuic_link="tuic://${uuid_tuic}:${pass_tuic}@${ip}:${port_tuic}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5"
-        echo "5. TUIC v5:" >> /etc/s-box/info.log
-        echo "${tuic_link}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-
-    # 6. AnyTLS
-    if jq -e '.inbounds[] | select(.tag=="anytls-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-        local port_anytls=$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .listen_port' /etc/s-box/sb.json)
-        local pass_anytls=$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .users[0].password' /etc/s-box/sb.json)
-        local sni_anytls=$(jq -r '.inbounds[] | select(.tag=="anytls-in") | .tls.server_name' /etc/s-box/sb.json)
-        local anytls_link="anytls://${pass_anytls}@${ip}:${port_anytls}?security=tls&sni=${sni_anytls}&allowInsecure=1#SB-AnyTLS"
-        echo "6. AnyTLS:" >> /etc/s-box/info.log
-        echo "${anytls_link}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-
-    # 动态追加 WARP 链接
-    local has_warp=false
-    if jq -e '.inbounds[] | select(.tag | test("-warp-in$"))' /etc/s-box/sb.json >/dev/null 2>&1; then
-        has_warp=true
-    fi
-    if $has_warp; then
-        echo "------------------【WARP出站节点】--------------------" >> /etc/s-box/info.log
-        
-        if jq -e '.inbounds[] | select(.tag=="vless-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-            local port_vless_warp=$(jq -r '.inbounds[] | select(.tag=="vless-warp-in") | .listen_port' /etc/s-box/sb.json)
-            local uuid_vless_warp=$(jq -r '.inbounds[] | select(.tag=="vless-warp-in") | .users[0].uuid' /etc/s-box/sb.json)
-            local sni_vless_warp=$(jq -r '.inbounds[] | select(.tag=="vless-warp-in") | .tls.server_name' /etc/s-box/sb.json)
-            local vless_warp_link="vless://${uuid_vless_warp}@${ip}:${port_vless_warp}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni_vless_warp}&fp=chrome&pbk=${public_key}&sid=${short_id}#SB-VLESS-Reality-WARP"
-            echo "1. VLESS-Reality-WARP:" >> /etc/s-box/info.log
-            echo "${vless_warp_link}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-        fi
-        
-        if jq -e '.inbounds[] | select(.tag=="vmess-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-            local port_vmess_warp=$(jq -r '.inbounds[] | select(.tag=="vmess-warp-in") | .listen_port' /etc/s-box/sb.json)
-            local uuid_vmess_warp=$(jq -r '.inbounds[] | select(.tag=="vmess-warp-in") | .users[0].uuid' /etc/s-box/sb.json)
-            local path_vmess_warp=$(jq -r '.inbounds[] | select(.tag=="vmess-warp-in") | .transport.path' /etc/s-box/sb.json)
-            local vmess_warp_json=$(cat <<EOF2
-{
-  "v": "2",
-  "ps": "SB-VMess-WS-WARP",
-  "add": "${ip}",
-  "port": "${port_vmess_warp}",
-  "id": "${uuid_vmess_warp}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "",
-  "path": "${path_vmess_warp}",
-  "tls": "none",
-  "sni": ""
-}
-EOF2
-)
-            local vmess_warp_link
-            vmess_warp_link=$(make_vmess_link "$vmess_warp_json")
-            echo "2. VMess-WS-WARP (无TLS):" >> /etc/s-box/info.log
-            echo "${vmess_warp_link}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-        fi
-        
-        if jq -e '.inbounds[] | select(.tag=="trojan-tls-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-            local port_trojan_warp=$(jq -r '.inbounds[] | select(.tag=="trojan-tls-warp-in") | .listen_port' /etc/s-box/sb.json)
-            local pass_trojan_warp=$(jq -r '.inbounds[] | select(.tag=="trojan-tls-warp-in") | .users[0].password' /etc/s-box/sb.json)
-            local sni_trojan_warp=$(jq -r '.inbounds[] | select(.tag=="trojan-tls-warp-in") | .tls.server_name' /etc/s-box/sb.json)
-            local path_trojan_warp=$(jq -r '.inbounds[] | select(.tag=="trojan-tls-warp-in") | .transport.path' /etc/s-box/sb.json)
-            local path_trojan_warp_encoded=$(url_encode "$path_trojan_warp")
-            local trojan_warp_link="trojan://${pass_trojan_warp}@${ip}:${port_trojan_warp}?security=tls&sni=${sni_trojan_warp}&allowInsecure=1&type=ws&path=${path_trojan_warp_encoded}#SB-Trojan-WS-TLS-WARP"
-            echo "3. Trojan-WS-TLS-WARP (自签证书):" >> /etc/s-box/info.log
-            echo "${trojan_warp_link}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-        fi
-        
-        if jq -e '.inbounds[] | select(.tag=="hy2-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-            local port_hy2_warp=$(jq -r '.inbounds[] | select(.tag=="hy2-warp-in") | .listen_port' /etc/s-box/sb.json)
-            local pass_hy2_warp=$(jq -r '.inbounds[] | select(.tag=="hy2-warp-in") | .users[0].password' /etc/s-box/sb.json)
-            local hy2_warp_link="hysteria2://${pass_hy2_warp}@${ip}:${port_hy2_warp}?insecure=1&sni=www.bing.com#SB-Hysteria2-WARP"
-            echo "4. Hysteria2-WARP:" >> /etc/s-box/info.log
-            echo "${hy2_warp_link}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-        fi
-        
-        if jq -e '.inbounds[] | select(.tag=="tuic-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-            local port_tuic_warp=$(jq -r '.inbounds[] | select(.tag=="tuic-warp-in") | .listen_port' /etc/s-box/sb.json)
-            local uuid_tuic_warp=$(jq -r '.inbounds[] | select(.tag=="tuic-warp-in") | .users[0].uuid' /etc/s-box/sb.json)
-            local pass_tuic_warp=$(jq -r '.inbounds[] | select(.tag=="tuic-warp-in") | .users[0].password' /etc/s-box/sb.json)
-            local tuic_warp_link="tuic://${uuid_tuic_warp}:${pass_tuic_warp}@${ip}:${port_tuic_warp}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5-WARP"
-            echo "5. TUIC v5-WARP:" >> /etc/s-box/info.log
-            echo "${tuic_warp_link}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-        fi
-        
-        if jq -e '.inbounds[] | select(.tag=="anytls-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-            local port_anytls_warp=$(jq -r '.inbounds[] | select(.tag=="anytls-warp-in") | .listen_port' /etc/s-box/sb.json)
-            local pass_anytls_warp=$(jq -r '.inbounds[] | select(.tag=="anytls-warp-in") | .users[0].password' /etc/s-box/sb.json)
-            local sni_anytls_warp=$(jq -r '.inbounds[] | select(.tag=="anytls-warp-in") | .tls.server_name' /etc/s-box/sb.json)
-            local anytls_warp_link="anytls://${pass_anytls_warp}@${ip}:${port_anytls_warp}?security=tls&sni=${sni_anytls_warp}&allowInsecure=1#SB-AnyTLS-WARP"
-            echo "6. AnyTLS-WARP:" >> /etc/s-box/info.log
-            echo "${anytls_warp_link}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-        fi
-    fi
-
-    # Argo
-    if [[ -n "$argo_domain" ]] || [[ -n "$ARGO_VMESS_DOMAIN" ]] || [[ -n "$ARGO_TROJAN_DOMAIN" ]]; then
-        echo "------------------【Argo穿透】--------------------" >> /etc/s-box/info.log
-        if [[ "$argo_mode" == "token" ]]; then
-            if is_enabled "$USE_NGINX"; then
-                echo "Argo 固定域名: ${argo_domain}" >> /etc/s-box/info.log
-            else
-                [[ -n "$ARGO_VMESS_DOMAIN" ]] && echo "VMess Argo 域名: ${ARGO_VMESS_DOMAIN}" >> /etc/s-box/info.log
-                [[ -n "$ARGO_TROJAN_DOMAIN" ]] && echo "Trojan Argo 域名: ${ARGO_TROJAN_DOMAIN}" >> /etc/s-box/info.log
-            fi
-        else
-            echo "Argo 临时域名: ${argo_domain}" >> /etc/s-box/info.log
-        fi
-        echo "" >> /etc/s-box/info.log
-
-        if is_enabled "$USE_NGINX"; then
-            if jq -e '.inbounds[] | select(.tag=="vmess-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-                local uuid_vmess=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .users[0].uuid' /etc/s-box/sb.json)
-                local path_vmess=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .transport.path' /etc/s-box/sb.json)
-                local vmess_argo_json=$(cat <<EOF2
-{
-  "v": "2",
-  "ps": "SB-VMess-Argo-80",
-  "add": "${argo_domain}",
-  "port": "80",
-  "id": "${uuid_vmess}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "${argo_domain}",
-  "path": "${path_vmess}",
-  "tls": "none",
-  "sni": ""
-}
-EOF2
-)
-                local vmess_argo_80_link
-                vmess_argo_80_link=$(make_vmess_link "$vmess_argo_json")
-
-                local vmess_argo_tls_json=$(cat <<EOF2
-{
-  "v": "2",
-  "ps": "SB-VMess-Argo-443",
-  "add": "${argo_domain}",
-  "port": "443",
-  "id": "${uuid_vmess}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "${argo_domain}",
-  "path": "${path_vmess}",
-  "tls": "tls",
-  "sni": "${argo_domain}"
-}
-EOF2
-)
-                local vmess_argo_443_link
-                vmess_argo_443_link=$(make_vmess_link "$vmess_argo_tls_json")
-
-                echo "1. VMess Argo (80端口):" >> /etc/s-box/info.log
-                echo "${vmess_argo_80_link}" >> /etc/s-box/info.log
-                echo "" >> /etc/s-box/info.log
-                echo "2. VMess Argo (443端口/TLS):" >> /etc/s-box/info.log
-                echo "${vmess_argo_443_link}" >> /etc/s-box/info.log
-                echo "" >> /etc/s-box/info.log
-            fi
-
-            if jq -e '.inbounds[] | select(.tag=="trojan-ws-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-                local pass_trojan=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .users[0].password' /etc/s-box/sb.json)
-                local path_trojan_ws=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .transport.path' /etc/s-box/sb.json)
-                local path_trojan_ws_encoded=$(url_encode "$path_trojan_ws")
-                
-                local trojan_argo_80_link="trojan://${pass_trojan}@${argo_domain}:80?security=none&type=ws&path=${path_trojan_ws_encoded}&host=${argo_domain}#SB-Trojan-Argo-80"
-                local trojan_argo_443_link="trojan://${pass_trojan}@${argo_domain}:443?security=tls&sni=${argo_domain}&type=ws&path=${path_trojan_ws_encoded}&host=${argo_domain}#SB-Trojan-Argo-443"
-
-                echo "3. Trojan Argo (80端口):" >> /etc/s-box/info.log
-                echo "${trojan_argo_80_link}" >> /etc/s-box/info.log
-                echo "" >> /etc/s-box/info.log
-                echo "4. Trojan Argo (443端口/TLS):" >> /etc/s-box/info.log
-                echo "${trojan_argo_443_link}" >> /etc/s-box/info.log
-                echo "" >> /etc/s-box/info.log
-            fi
-        else
-            # 免 Nginx 模式，双子域名分别独立生成
-            local argo_idx=1
-            if jq -e '.inbounds[] | select(.tag=="vmess-in")' /etc/s-box/sb.json >/dev/null 2>&1 && [[ -n "$ARGO_VMESS_DOMAIN" ]]; then
-                local uuid_vmess=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .users[0].uuid' /etc/s-box/sb.json)
-                local path_vmess=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .transport.path' /etc/s-box/sb.json)
-                local vmess_argo_json=$(cat <<EOF2
-{
-  "v": "2",
-  "ps": "SB-VMess-Argo-80",
-  "add": "${ARGO_VMESS_DOMAIN}",
-  "port": "80",
-  "id": "${uuid_vmess}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "${ARGO_VMESS_DOMAIN}",
-  "path": "${path_vmess}",
-  "tls": "none",
-  "sni": ""
-}
-EOF2
-)
-                local vmess_argo_80_link
-                vmess_argo_80_link=$(make_vmess_link "$vmess_argo_json")
-
-                local vmess_argo_tls_json=$(cat <<EOF2
-{
-  "v": "2",
-  "ps": "SB-VMess-Argo-443",
-  "add": "${ARGO_VMESS_DOMAIN}",
-  "port": "443",
-  "id": "${uuid_vmess}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "${ARGO_VMESS_DOMAIN}",
-  "path": "${path_vmess}",
-  "tls": "tls",
-  "sni": "${ARGO_VMESS_DOMAIN}"
-}
-EOF2
-)
-                local vmess_argo_443_link
-                vmess_argo_443_link=$(make_vmess_link "$vmess_argo_tls_json")
-
-                echo "${argo_idx}. VMess Argo (80端口):" >> /etc/s-box/info.log
-                echo "${vmess_argo_80_link}" >> /etc/s-box/info.log
-                echo "" >> /etc/s-box/info.log
-                ((argo_idx++))
-                echo "${argo_idx}. VMess Argo (443端口/TLS):" >> /etc/s-box/info.log
-                echo "${vmess_argo_443_link}" >> /etc/s-box/info.log
-                echo "" >> /etc/s-box/info.log
-                ((argo_idx++))
-            fi
-
-            if jq -e '.inbounds[] | select(.tag=="trojan-ws-in")' /etc/s-box/sb.json >/dev/null 2>&1 && [[ -n "$ARGO_TROJAN_DOMAIN" ]]; then
-                local pass_trojan=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .users[0].password' /etc/s-box/sb.json)
-                local path_trojan_ws=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .transport.path' /etc/s-box/sb.json)
-                local path_trojan_ws_encoded=$(url_encode "$path_trojan_ws")
-                
-                local trojan_argo_80_link="trojan://${pass_trojan}@${ARGO_TROJAN_DOMAIN}:80?security=none&type=ws&path=${path_trojan_ws_encoded}&host=${ARGO_TROJAN_DOMAIN}#SB-Trojan-Argo-80"
-                local trojan_argo_443_link="trojan://${pass_trojan}@${ARGO_TROJAN_DOMAIN}:443?security=tls&sni=${ARGO_TROJAN_DOMAIN}&type=ws&path=${path_trojan_ws_encoded}&host=${ARGO_TROJAN_DOMAIN}#SB-Trojan-Argo-443"
-
-                echo "${argo_idx}. Trojan Argo (80端口):" >> /etc/s-box/info.log
-                echo "${trojan_argo_80_link}" >> /etc/s-box/info.log
-                echo "" >> /etc/s-box/info.log
-                ((argo_idx++))
-                echo "${argo_idx}. Trojan Argo (443端口/TLS):" >> /etc/s-box/info.log
-                echo "${trojan_argo_443_link}" >> /etc/s-box/info.log
-                echo "" >> /etc/s-box/info.log
-                ((argo_idx++))
-            fi
-        fi
-    fi
-
-    echo "==================================================" >> /etc/s-box/info.log
-}
-
-# 重新获取 Argo 临时域名并写入 argo.log
-update_argo_domain() {
-    if [[ ! -f ${NGINX_CONF_DIR}/singbox-argo.conf ]]; then
-        return
-    fi
-    # 如果是 token 模式，不需要自动获取临时域名，直接返回
-    if [[ -f /etc/s-box/argo.conf ]]; then
-        source /etc/s-box/argo.conf
-        if [[ "$ARGO_MODE" == "token" ]]; then
-            return
-        fi
-    else
-        # 兼容性检测，通过检测服务文件
-        if $IS_OPENRC; then
-            if grep -q "\--token" /etc/init.d/argo-tunnel 2>/dev/null; then
-                return
-            fi
-        else
-            if grep -q "\--token" /etc/systemd/system/argo-tunnel.service 2>/dev/null; then
-                return
-            fi
-        fi
-    fi
-    # 清空旧日志，避免提取到旧域名
-    : > /var/log/argo-tunnel.log 2>/dev/null
-    : > /var/log/argo-tunnel.err 2>/dev/null
-    service_restart argo-tunnel
-    echo "正在等待 Argo 隧道上线并获取临时域名..."
-    sleep 8
-    local argo_domain=""
-    for i in {1..10}; do
-        if $IS_OPENRC || $IS_DIRECT; then
-            argo_domain=$(cat /var/log/argo-tunnel.log /var/log/argo-tunnel.err 2>/dev/null | grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' | tail -n 1)
-        else
-            argo_domain=$(journalctl -u argo-tunnel -n 50 --no-pager | grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' | tail -n 1)
-        fi
-        [[ -n "$argo_domain" ]] && break
-        sleep 3
+    # 2. 恢复同步所有自定义代理副节点组
+    local proxy_tags
+    mapfile -t proxy_tags < <(get_all_proxy_groups 2>/dev/null)
+    for tag in "${proxy_tags[@]}"; do
+        [[ -n "$tag" ]] && sync_proxy_group_to_singbox "$tag" >/dev/null 2>&1 || true
     done
-    if [[ -n "$argo_domain" ]]; then
-        echo "$argo_domain" > /etc/s-box/argo.log
-        echo "成功获取 Argo 新域名: $argo_domain"
-    else
-        echo "警告：未获取到 Argo 域名，可能隧道启动较慢，请稍后查看。"
-    fi
 }
 
+# ==================== 主节点出站应用函数 ====================
+apply_main_node_outbound() {
+    local cfg="$WORKDIR/sb.json"
+    [[ -f "$cfg" ]] || return 1
+
+    local warp_enabled warp_mode warp_endpoint warp_port warp_pvk warp_ipv6 warp_res
+    warp_enabled=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null || echo "false")
+    warp_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null || echo "all")
+    warp_endpoint=$(get_warp_endpoint)
+    warp_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null || echo "2408")
+    warp_pvk=$(cat "$WORKDIR/warp_private_key.txt" 2>/dev/null || echo "52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=")
+    warp_ipv6=$(cat "$WORKDIR/warp_ipv6.txt" 2>/dev/null || echo "2606:4700:110:8d8d:1845:c39f:2dd5:a03a")
+    warp_res=$(cat "$WORKDIR/warp_reserved.txt" 2>/dev/null || echo "[215, 69, 233]")
+
+    local psi_main_enabled psi_main_port
+    psi_main_enabled=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null || echo "false")
+    psi_main_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
+
+    python3 - \
+        "$cfg" \
+        "$warp_enabled" \
+        "$warp_mode" \
+        "$warp_endpoint" \
+        "$warp_port" \
+        "$warp_pvk" \
+        "$warp_ipv6" \
+        "$warp_res" \
+        "$psi_main_enabled" \
+        "$psi_main_port" <<'PY_APPLY_MAIN'
+import json, sys
+
+cfg_path         = sys.argv[1]
+warp_enabled     = sys.argv[2].lower() == 'true'
+warp_mode        = sys.argv[3]
+warp_endpoint    = sys.argv[4]
+warp_port        = int(sys.argv[5]) if sys.argv[5] else 2408
+warp_pvk         = sys.argv[6]
+warp_ipv6        = sys.argv[7]
+warp_res_raw     = sys.argv[8]
+psi_main_enabled = sys.argv[9].lower() == 'true'
+psi_main_port    = int(sys.argv[10]) if sys.argv[10] else 20800
+
+try:
+    warp_res = json.loads(warp_res_raw)
+except:
+    warp_res = [215, 69, 233]
+
+try:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+except Exception as e:
+    sys.exit(1)
+
+outbounds = data.setdefault('outbounds', [])
+route     = data.setdefault('route', {})
+rules     = route.setdefault('rules', [])
+
+# 确保 direct 与 block 出站存在
+if not any(o.get('tag') == 'direct' for o in outbounds):
+    outbounds.append({'type': 'direct', 'tag': 'direct'})
+if not any(o.get('tag') == 'block' for o in outbounds):
+    outbounds.append({'type': 'block', 'tag': 'block'})
+
+# 清理旧的主出站对象
+outbounds[:] = [o for o in outbounds if o.get('tag') not in ('warp-out', 'psiphon-main-out')]
+
+# 清理旧的主分流规则 (保留副节点的规则)
+def is_main_rule(r):
+    out = r.get('outbound', '')
+    if out in ('warp-out', 'psiphon-main-out'):
+        # 如果是 loopback 测试规则或 geosite 分流规则
+        inb = r.get('inbound', [])
+        if inb == ['socks-loopback'] or 'geosite' in r or 'domain_suffix' in r:
+            return True
+    return False
+
+rules[:] = [r for r in rules if not is_main_rule(r)]
+
+# 根据主节点出站模式配置
+if warp_enabled and warp_mode == 'all':
+    # 1. WARP 全局出站
+    outbounds.append({
+        'type': 'wireguard',
+        'tag': 'warp-out',
+        'server': warp_endpoint,
+        'server_port': warp_port,
+        'local_address': ['172.16.0.2/32', f'{warp_ipv6}/128'],
+        'private_key': warp_pvk,
+        'peer_public_key': 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
+        'reserved': warp_res
+    })
+    rules.append({'inbound': ['socks-loopback'], 'outbound': 'warp-out'})
+    route['final'] = 'warp-out'
+
+elif warp_enabled and warp_mode == 'google':
+    # 2. WARP 分流出站
+    outbounds.append({
+        'type': 'wireguard',
+        'tag': 'warp-out',
+        'server': warp_endpoint,
+        'server_port': warp_port,
+        'local_address': ['172.16.0.2/32', f'{warp_ipv6}/128'],
+        'private_key': warp_pvk,
+        'peer_public_key': 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
+        'reserved': warp_res
+    })
+    rules.append({'inbound': ['socks-loopback'], 'outbound': 'warp-out'})
+    rules.append({
+        'geosite': ['google', 'youtube', 'netflix', 'openai'],
+        'domain_suffix': ['google.com', 'googlevideo.com', 'youtube.com', 'netflix.com', 'openai.com', 'chatgpt.com'],
+        'outbound': 'warp-out'
+    })
+    route['final'] = 'direct'
+
+elif psi_main_enabled:
+    # 3. 赛风出站
+    outbounds.append({
+        'type': 'socks',
+        'tag': 'psiphon-main-out',
+        'server': '127.0.0.1',
+        'server_port': psi_main_port,
+        'version': '5',
+        'network': 'tcp'
+    })
+    rules.append({'inbound': ['socks-loopback'], 'outbound': 'psiphon-main-out'})
+    route['final'] = 'psiphon-main-out'
+
+else:
+    # 4. 原生直连出站
+    rules.append({'inbound': ['socks-loopback'], 'outbound': 'direct'})
+    route['final'] = 'direct'
+
+try:
+    with open(cfg_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+except Exception as e:
+    sys.exit(1)
+PY_APPLY_MAIN
+
+    # 关键：无论主节点出站怎么变，重新把副节点完整挂回最前，确保副节点绝不受干扰！
+    sync_all_secondary_nodes
+    return 0
+}
+
+# 校验并应用配置重启
 apply_changes() {
-    if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json >/tmp/s-box-check.log 2>&1; then
-        echo "错误：sing-box 配置校验失败，未重启服务。"
-        cat /tmp/s-box-check.log
-        return 1
-    fi
-
-    echo "正在应用更改，重启 Sing-box 服务..."
-    service_restart sing-box
-    sleep 1
-    if ! service_is_active sing-box; then
-        echo "错误：sing-box 服务启动失败。"
-        if $IS_OPENRC || $IS_DIRECT; then
-            tail -n 50 /var/log/sing-box.log 2>/dev/null
-        else
-            journalctl -u sing-box -n 50 --no-pager
-        fi
-        return 1
-    fi
-    
-    if [[ -f /etc/s-box/argo.conf ]]; then
-        source /etc/s-box/argo.conf
-    fi
-    
-    if is_enabled "$USE_NGINX" && [[ -f ${NGINX_CONF_DIR}/singbox-argo.conf ]]; then
-        echo "正在重启 Nginx 和 Argo 服务..."
-        regenerate_nginx_conf
-        service_restart argo-tunnel
-        update_argo_domain
-    elif [[ -f /etc/s-box/argo.conf ]]; then
-        echo "正在重启 Argo 服务..."
-        service_restart argo-tunnel
-        sleep 2
-        sync_argo_domains_from_cloudflared_config
-        update_argo_domain
-    fi
-    
-    regenerate_info_log
-    echo "更改已成功应用并重启服务！"
-}
-
-repair_runtime_config() {
     if [[ ! -f /etc/s-box/sb.json ]]; then
-        echo "未找到 /etc/s-box/sb.json，无法修复。"
+        log_err "配置文件不存在！"
         return 1
     fi
-
-    echo "正在修复本地监听地址并同步 Argo/Nginx 配置..."
-    local temp_json=$(mktemp)
-    if ! jq '
-        .inbounds |= map(
-            if (.tag == "trojan-ws-in") then
-                .listen = "127.0.0.1"
-            elif (.tag == "vless-in" or .tag == "vmess-in" or .tag == "trojan-tls-in" or .tag == "hy2-in" or .tag == "tuic-in" or .tag == "anytls-in") then
-                .listen = "0.0.0.0"
-            else
-                .
-            end
-        )
-    ' /etc/s-box/sb.json > "$temp_json"; then
-        rm -f "$temp_json"
-        echo "修复失败：无法写入 JSON。"
-        return 1
+    if [[ -x /etc/s-box/sing-box ]]; then
+        if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1; then
+            log_err "Sing-box 配置文件格式或语法检查未通过！"
+            return 1
+        fi
     fi
-    mv "$temp_json" /etc/s-box/sb.json
-
-    if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json >/tmp/s-box-check.log 2>&1; then
-        echo "错误：修复后的 sing-box 配置校验失败。"
-        cat /tmp/s-box-check.log
-        return 1
-    fi
-
-    if [[ -f /etc/s-box/argo.conf ]]; then
-        source /etc/s-box/argo.conf
-    fi
-    if is_enabled "$USE_NGINX" && [[ -f ${NGINX_CONF_DIR}/singbox-argo.conf ]]; then
-        regenerate_nginx_conf
-        service_restart nginx
-    fi
-
     service_restart sing-box
-    sleep 1
-    if ! service_is_active sing-box; then
-        echo "错误：sing-box 服务启动失败。"
-        if $IS_OPENRC || $IS_DIRECT; then
-            tail -n 50 /var/log/sing-box.log 2>/dev/null
+    return 0
+}
+
+# ==================== 1. 主节点出站管理子菜单 ====================
+configure_warp_outbound() {
+    clear
+    echo
+    green "============================================================"
+    green "  主节点出站管理 (直连出站 / WARP 出站 / 赛风出站)"
+    green "============================================================"
+    yellow "  说明: 本设置仅作用于【主节点】入站流量"
+    yellow "        副节点(自定义代理出站、赛风出站)为独立平行系统，不受影响"
+    echo "============================================================"
+    
+    if [ ! -f "$WORKDIR/sb.json" ]; then
+        red "未检测到已安装的 Sing-box 配置，请先安装主节点"
+        reading "按回车返回..." _
+        return 1
+    fi
+
+    local current_status current_mode current_psi
+    current_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null || echo "false")
+    current_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null || echo "all")
+    current_psi=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null || echo "false")
+
+    echo
+    purple "当前主节点出站状态:"
+    if [[ "$current_status" == "true" ]]; then
+        if [[ "$current_mode" == "all" ]]; then
+            blue "  主节点出站模式: ✓ WARP 全局出站 (全部主节点流量走 WARP)"
         else
-            journalctl -u sing-box -n 50 --no-pager
+            blue "  主节点出站模式: ✓ WARP 分流出站 (Google/YouTube/Netflix/OpenAI 走 WARP)"
         fi
-        return 1
-    fi
-    if [[ -f /etc/s-box/argo.conf ]]; then
-        service_restart argo-tunnel
-        sleep 2
-        sync_argo_domains_from_cloudflared_config
-    fi
-    regenerate_info_log
-
-    echo "修复完成。当前监听："
-    ss -tlnp 2>/dev/null | grep -E ':(8401|8402|38202|48203|58204)\b' || true
-    echo ""
-    echo "如果使用免 Nginx 固定隧道，请确认 Cloudflare Public Hostname："
-    local vmess_port=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    local trojan_ws_port=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    [[ -n "$ARGO_VMESS_DOMAIN" && -n "$vmess_port" ]] && echo "  ${ARGO_VMESS_DOMAIN} -> http://127.0.0.1:${vmess_port}"
-    [[ -n "$ARGO_TROJAN_DOMAIN" && -n "$trojan_ws_port" ]] && echo "  ${ARGO_TROJAN_DOMAIN} -> http://127.0.0.1:${trojan_ws_port}"
-    [[ -n "$ARGO_TROJAN_DOMAIN" ]] && echo "Trojan Argo 链接必须使用 ${ARGO_TROJAN_DOMAIN}，不能使用 VMess 域名。"
-}
-
-check_port() {
-    local port=$1
-    if ss -tunlp | grep -q ":$port "; then
-        return 1
+        local ep=$(get_warp_endpoint)
+        green "  WARP Endpoint: $ep"
+    elif [[ "$current_psi" == "true" ]]; then
+        blue "  主节点出站模式: ✓ 赛风出站 (全部主节点流量走本地 Psiphon)"
     else
-        return 0
+        green "  主节点出站模式: ✓ 直连出站 (Direct 原生网络直连)"
     fi
+
+    echo
+    echo "------------------------------------------------------------"
+    yellow "  0. 主节点 - 直连出站 (Direct, 恢复原生直连)"
+    yellow "  1. 主节点 - WARP 全局出站 (全部主节点流量走 WARP)"
+    yellow "  2. 主节点 - WARP 分流出站 (仅 Google/YouTube/Netflix/OpenAI)"
+    yellow "  3. 主节点 - 赛风出站 (主节点流量走本地 Psiphon 核心)"
+    echo "------------------------------------------------------------"
+    green  "  4. 优选 WARP Endpoint IP (优化连接质量与延迟)"
+    blue   "  5. 恢复 Cloudflare 默认 Endpoint"
+    blue   "  6. 重新获取勇哥 WARP API 配置凭证"
+    green  "  7. 检测主节点当前出口 IP"
+    echo "------------------------------------------------------------"
+    red    "  q. 返回主菜单"
+    echo "============================================================"
+    reading "请选择 [0-7, q]: " new_choice
+
+    case "$new_choice" in
+        0)
+            echo "false" > "$WORKDIR/warp_enabled.txt"
+            echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
+            stop_main_psiphon
+            apply_main_node_outbound
+            apply_changes
+            green "已切换为主节点: 直连出站 (Direct)"
+            ;;
+        1)
+            init_warp_config
+            echo "true" > "$WORKDIR/warp_enabled.txt"
+            echo "all" > "$WORKDIR/warp_mode.txt"
+            echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
+            stop_main_psiphon
+            apply_main_node_outbound
+            apply_changes
+            green "已切换为主节点: WARP 全局出站 (全部流量走 WARP)"
+            ;;
+        2)
+            init_warp_config
+            echo "true" > "$WORKDIR/warp_enabled.txt"
+            echo "google" > "$WORKDIR/warp_mode.txt"
+            echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
+            stop_main_psiphon
+            apply_main_node_outbound
+            apply_changes
+            green "已切换为主节点: WARP 分流出站 (流媒体/AI 走 WARP)"
+            ;;
+        3)
+            echo "false" > "$WORKDIR/warp_enabled.txt"
+            echo "true" > "$WORKDIR/psiphon_main_enabled.txt"
+            start_main_psiphon
+            apply_main_node_outbound
+            apply_changes
+            green "已切换为主节点: 赛风出站 (Psiphon)"
+            ;;
+        4)
+            yellow "正在测试最优 WARP Endpoint..."
+            local best_ep="162.159.192.1"
+            # 候选 IP 测试
+            local candidates=("162.159.192.1" "162.159.193.10" "162.159.195.2" "188.114.96.1" "188.114.97.1")
+            for ep in "${candidates[@]}"; do
+                if ping -c 1 -W 1 "$ep" >/dev/null 2>&1; then
+                    best_ep="$ep"
+                    break
+                fi
+            done
+            echo "$best_ep" > "$WORKDIR/warp_best_endpoint.txt"
+            echo "2408" > "$WORKDIR/warp_best_port.txt"
+            apply_main_node_outbound
+            apply_changes
+            green "已设置优选 Endpoint: ${best_ep}:2408"
+            ;;
+        5)
+            echo "162.159.192.1" > "$WORKDIR/warp_best_endpoint.txt"
+            echo "2408" > "$WORKDIR/warp_best_port.txt"
+            apply_main_node_outbound
+            apply_changes
+            green "已恢复 Cloudflare 默认 Endpoint (162.159.192.1:2408)"
+            ;;
+        6)
+            yellow "正在重新获取 WARP 凭据..."
+            init_warp_config
+            apply_main_node_outbound
+            apply_changes
+            green "WARP 凭据已刷新！"
+            ;;
+        7)
+            warp_egress_test
+            ;;
+        q|Q|"")
+            return 0
+            ;;
+        *)
+            red "无效输入"
+            ;;
+    esac
+    echo
+    reading "按回车继续..." _
 }
 
-modify_vless() {
-    local suffix="$1"
-    local tag="vless-in"
-    local name="VLESS-Reality"
-    if [[ "$suffix" == "-warp" ]]; then
-        tag="vless-warp-in"
-        name="VLESS-Reality-WARP"
+# ==================== 2. 副节点 - 自定义代理出站管理 ====================
+add_proxy_egress_group() {
+    init_proxy_groups_dir
+    echo
+    green "==== 添加自定义代理出站节点组 (副节点) ===="
+    yellow "支持外部链接: vless://, vmess://, trojan://, hy2://, tuic://, ss://"
+    echo
+    reading "请输入分组备注名称 (如 香港BGP、美国VPS等): " remark
+    [[ -z "$remark" ]] && remark="外部代理-$(date +%s)"
+
+    reading "请粘贴代理节点链接: " proxy_url
+    proxy_url=$(echo "$proxy_url" | tr -d ' \r\n')
+    [[ -z "$proxy_url" ]] && { red "[!] 链接不能为空"; return 1; }
+
+    local group_tag="proxy-$(( $(get_all_proxy_groups | wc -l) + 1 ))"
+    while proxy_group_exists "$group_tag"; do
+        group_tag="proxy-$((RANDOM % 1000 + 1))"
+    done
+    local out_tag="${group_tag}-out"
+
+    yellow "[*] 正在解析代理链接..."
+    local out_json
+    out_json=$(validate_and_parse_proxy_url "$proxy_url" "$out_tag")
+    if [[ $? -ne 0 || -z "$out_json" ]]; then
+        red "[!] 解析失败，请检查链接格式！"
+        return 1
     fi
+
+    # 选择本地副节点入站协议
+    echo
+    purple "请选择为该代理出口搭建的本地入站协议 (支持多选或默认):"
+    echo "  1. Hysteria2 入站 (UDP高加速)"
+    echo "  2. TUIC v5 入站 (QUIC高性能)"
+    echo "  3. VLESS-Reality 入站 (TCP抗封锁)"
+    echo "  4. 同时开启 Hy2 + TUIC"
+    reading "请选择 [1-4, 默认4]: " proto_sel
+    [[ -z "$proto_sel" ]] && proto_sel="4"
+
+    local hy2_p="0" tuic_p="0" vless_p="0"
+    case "$proto_sel" in
+        1) hy2_p=$(get_free_port) ;;
+        2) tuic_p=$(get_free_port) ;;
+        3) vless_p=$(get_free_port) ;;
+        *) hy2_p=$(get_free_port); tuic_p=$(get_free_port) ;;
+    esac
+
+    # 保存副节点目录
+    local gdir="${PROXY_GROUPS_DIR}/${group_tag}"
+    mkdir -p "$gdir"
+    echo "$remark" > "$gdir/remark.txt"
+    echo "$proxy_url" > "$gdir/raw_url.txt"
+    echo "$out_json" > "$gdir/outbound.json"
+    echo "$hy2_p" > "$gdir/hy2_port.txt"
+    echo "$tuic_p" > "$gdir/tuic_port.txt"
+    echo "$vless_p" > "$gdir/vless_port.txt"
+    echo "$group_tag" >> "$PROXY_GROUPS_DIR/groups.txt"
+
+    # 同步并应用
+    sync_proxy_group_to_singbox "$group_tag"
+    apply_changes
+
+    green "[✓] 代理节点组 [$remark] 添加成功！"
+    generate_proxy_group_links "$group_tag"
+}
+
+generate_proxy_group_links() {
+    local tag="$1"
+    local gdir="${PROXY_GROUPS_DIR}/${tag}"
+    [[ -d "$gdir" ]] || return 1
+
+    local remark hy2_p tuic_p vless_p uuid ip
+    remark=$(cat "$gdir/remark.txt" 2>/dev/null || echo "$tag")
+    hy2_p=$(cat "$gdir/hy2_port.txt" 2>/dev/null || echo "0")
+    tuic_p=$(cat "$gdir/tuic_port.txt" 2>/dev/null || echo "0")
+    vless_p=$(cat "$gdir/vless_port.txt" 2>/dev/null || echo "0")
+    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat "$WORKDIR/uuid.txt" 2>/dev/null)
+    ip="${ALL_IPS[0]:-127.0.0.1}"
+
+    echo
+    blue "============================================================"
+    blue "  【副节点-代理出站】: $remark (标识: $tag)"
+    blue "============================================================"
+    if [[ "$hy2_p" -gt 0 ]]; then
+        local hy2_link="hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&sni=www.bing.com#${remark}-Hy2"
+        green "1. Hysteria2 节点链接:"
+        echo "   $hy2_link"
+    fi
+    if [[ "$tuic_p" -gt 0 ]]; then
+        local tuic_link="tuic://${uuid}:${uuid}@${ip}:${tuic_p}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#${remark}-TUIC"
+        green "2. TUIC v5 节点链接:"
+        echo "   $tuic_link"
+    fi
+    if [[ "$vless_p" -gt 0 ]]; then
+        local pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
+        local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
+        local vless_link="vless://${uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=#${remark}-Reality"
+        green "3. VLESS-Reality 节点链接:"
+        echo "   $vless_link"
+    fi
+    blue "============================================================"
+}
+
+proxy_egress_menu() {
     while true; do
-        local cur_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .listen_port' /etc/s-box/sb.json)
-        local cur_uuid=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .users[0].uuid' /etc/s-box/sb.json)
-        local cur_sni=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .tls.server_name' /etc/s-box/sb.json)
-        local cur_dest=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .tls.reality.handshake.server' /etc/s-box/sb.json)
-        local cur_dest_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .tls.reality.handshake.server_port' /etc/s-box/sb.json)
-        
-        echo "--------------------------------------------------"
-        echo "          ${name} 参数修改"
-        echo "--------------------------------------------------"
-        echo "1. 修改监听端口 (当前: $cur_port)"
-        echo "2. 修改 UUID (当前: $cur_uuid)"
-        echo "3. 修改 SNI 域名 (当前: $cur_sni)"
-        echo "4. 修改目标 IP/强绑定域名 (当前: $cur_dest:$cur_dest_port)"
-        echo "0. 返回"
-        echo "--------------------------------------------------"
-        read -p "请选择修改项 [0-4]: " vless_choice
-        
-        if [[ "$vless_choice" == "0" || -z "$vless_choice" ]]; then
-            break
+        clear
+        echo
+        green "============================================================"
+        green "  【副节点】自定义代理出站多出口路由管理"
+        green "============================================================"
+        yellow "  说明: 副节点拥有独立入站端口与专属路由，出站直接转发至外部代理"
+        yellow "        与主节点(直连/WARP/赛风)完全平行独立，互不干扰"
+        green "============================================================"
+        echo
+
+        local groups
+        mapfile -t groups < <(get_all_proxy_groups)
+
+        purple "当前代理节点组 (共 ${#groups[@]} 个):"
+        if [[ ${#groups[@]} -gt 0 ]]; then
+            local idx=1
+            for t in "${groups[@]}"; do
+                local r=$(cat "${PROXY_GROUPS_DIR}/$t/remark.txt" 2>/dev/null || echo "$t")
+                local hp=$(cat "${PROXY_GROUPS_DIR}/$t/hy2_port.txt" 2>/dev/null || echo "0")
+                local tp=$(cat "${PROXY_GROUPS_DIR}/$t/tuic_port.txt" 2>/dev/null || echo "0")
+                local vp=$(cat "${PROXY_GROUPS_DIR}/$t/vless_port.txt" 2>/dev/null || echo "0")
+                local p_info=""
+                [[ "$hp" -gt 0 ]] && p_info="${p_info}Hy2:$hp "
+                [[ "$tp" -gt 0 ]] && p_info="${p_info}TUIC:$tp "
+                [[ "$vp" -gt 0 ]] && p_info="${p_info}VLESS:$vp "
+                green "  [$idx] [$t] $r  ->  入站端口: [ ${p_info:-无} ]"
+                ((idx++))
+            done
+        else
+            yellow "  暂无代理节点组"
         fi
-        
-        case $vless_choice in
-            1)
-                read -p "请输入新端口: " new_port
-                if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-                    if ss -tunlp | grep -q ":$new_port " && [ "$new_port" -ne "$cur_port" ]; then
-                        echo "警告：端口 $new_port 已被占用！"
-                    else
-                        local temp_json=$(mktemp)
-                        jq --arg tag "$tag" --argjson port "$new_port" '(.inbounds[] | select(.tag==$tag) | .listen_port) = $port' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                        echo "端口修改成功，新端口: $new_port"
-                        apply_changes
-                    fi
-                else
-                    echo "无效端口！"
-                fi
-                ;;
+
+        echo
+        echo "------------------------------------------------------------"
+        green  "  1. 添加新代理节点组 (导入外部代理链接)"
+        green  "  2. 查看所有代理组节点链接"
+        yellow "  3. 修改代理组出站链接"
+        red    "  4. 删除代理节点组"
+        blue   "  5. 重新同步全部代理配置并重启"
+        echo "------------------------------------------------------------"
+        red    "  0. 返回主菜单"
+        echo "============================================================"
+        reading "请选择 [0-5]: " choice
+        case "$choice" in
+            1) add_proxy_egress_group ;;
             2)
-                read -p "请输入新 UUID (留空随机生成): " new_uuid
-                if [[ -z "$new_uuid" ]]; then
-                    new_uuid=$(/etc/s-box/sing-box generate uuid)
-                fi
-                local temp_json=$(mktemp)
-                jq --arg tag "$tag" --arg uuid "$new_uuid" '(.inbounds[] | select(.tag==$tag) | .users[0].uuid) = $uuid' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                echo "UUID 修改成功，新 UUID: $new_uuid"
-                apply_changes
+                for t in "${groups[@]}"; do generate_proxy_group_links "$t"; done
                 ;;
             3)
-                read -p "请输入新 SNI 域名: " new_sni
-                if [[ -n "$new_sni" ]]; then
-                    local temp_json=$(mktemp)
-                    jq --arg tag "$tag" --arg sni "$new_sni" '(.inbounds[] | select(.tag==$tag) | .tls.server_name) = $sni' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                    echo "SNI 修改成功，新 SNI: $new_sni"
-                    apply_changes
+                if [[ ${#groups[@]} -eq 0 ]]; then
+                    yellow "暂无代理节点组"
                 else
-                    echo "域名不能为空！"
+                    reading "请输入要修改的 tag (如 proxy-1): " edit_tag
+                    if proxy_group_exists "$edit_tag"; then
+                        reading "请粘贴新的代理链接: " new_url
+                        new_url=$(echo "$new_url" | tr -d ' \r\n')
+                        if [[ -n "$new_url" ]]; then
+                            local out_json
+                            out_json=$(validate_and_parse_proxy_url "$new_url" "${edit_tag}-out")
+                            if [[ $? -eq 0 && -n "$out_json" ]]; then
+                                echo "$new_url" > "${PROXY_GROUPS_DIR}/$edit_tag/raw_url.txt"
+                                echo "$out_json" > "${PROXY_GROUPS_DIR}/$edit_tag/outbound.json"
+                                sync_proxy_group_to_singbox "$edit_tag"
+                                apply_changes
+                                green "代理链接已更新并生效！"
+                            fi
+                        fi
+                    fi
                 fi
                 ;;
             4)
-                read -p "请输入新目标域名/IP: " new_dest
-                read -p "请输入新目标端口 [默认 443]: " new_dest_port
-                [[ -z "$new_dest_port" ]] && new_dest_port=443
-                if [[ -n "$new_dest" ]]; then
-                    local temp_json=$(mktemp)
-                    jq --arg tag "$tag" --arg dest "$new_dest" --argjson dest_port "$new_dest_port" '
-                        (.inbounds[] | select(.tag==$tag) | .tls.reality.handshake.server) = $dest |
-                        (.inbounds[] | select(.tag==$tag) | .tls.reality.handshake.server_port) = $dest_port
-                    ' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                    echo "目标修改成功，新目标: $new_dest:$new_dest_port"
-                    apply_changes
+                if [[ ${#groups[@]} -eq 0 ]]; then
+                    yellow "暂无代理节点组"
                 else
-                    echo "目标不能为空！"
-                fi
-                ;;
-            *)
-                echo "无效选项！"
-                ;;
-        esac
-    done
-}
-
-modify_vmess() {
-    local suffix="$1"
-    local tag="vmess-in"
-    local name="VMess-WS"
-    if [[ "$suffix" == "-warp" ]]; then
-        tag="vmess-warp-in"
-        name="VMess-WS-WARP"
-    fi
-    while true; do
-        local cur_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .listen_port' /etc/s-box/sb.json)
-        local cur_uuid=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .users[0].uuid' /etc/s-box/sb.json)
-        local cur_path=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .transport.path' /etc/s-box/sb.json)
-        
-        echo "--------------------------------------------------"
-        echo "          ${name} 参数修改"
-        echo "--------------------------------------------------"
-        echo "1. 修改监听端口 (当前: $cur_port)"
-        echo "2. 修改 UUID (当前: $cur_uuid)"
-        echo "3. 修改 WS 路径 (当前: $cur_path)"
-        echo "0. 返回"
-        echo "--------------------------------------------------"
-        read -p "请选择修改项 [0-3]: " vmess_choice
-        
-        if [[ "$vmess_choice" == "0" || -z "$vmess_choice" ]]; then
-            break
-        fi
-        
-        case $vmess_choice in
-            1)
-                read -p "请输入新端口: " new_port
-                if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-                    if ss -tunlp | grep -q ":$new_port " && [ "$new_port" -ne "$cur_port" ]; then
-                        echo "警告：端口 $new_port 已被占用！"
-                    else
-                        local temp_json=$(mktemp)
-                        jq --arg tag "$tag" --argjson port "$new_port" '(.inbounds[] | select(.tag==$tag) | .listen_port) = $port' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                        echo "端口修改成功，新端口: $new_port"
+                    reading "请输入要删除的 tag (如 proxy-1): " del_tag
+                    if proxy_group_exists "$del_tag"; then
+                        rm -rf "${PROXY_GROUPS_DIR:?}/$del_tag"
+                        sed -i "/^${del_tag}$/d" "$PROXY_GROUPS_DIR/groups.txt"
+                        # 从 sb.json 中移除
+                        python3 -c "
+import json
+with open('$WORKDIR/sb.json') as f: d=json.load(f)
+d['outbounds']=[o for o in d.get('outbounds',[]) if o.get('tag')!='${del_tag}-out']
+d['inbounds']=[i for i in d.get('inbounds',[]) if '${del_tag}' not in i.get('tag','')]
+d.setdefault('route',{}).setdefault('rules',[])
+d['route']['rules']=[r for r in d['route']['rules'] if r.get('outbound')!='${del_tag}-out']
+with open('$WORKDIR/sb.json','w') as f: json.dump(d,f,indent=2)
+"
                         apply_changes
+                        green "已删除代理节点组: $del_tag"
                     fi
-                else
-                    echo "无效端口！"
-                fi
-                ;;
-            2)
-                read -p "请输入新 UUID (留空随机生成): " new_uuid
-                if [[ -z "$new_uuid" ]]; then
-                    new_uuid=$(/etc/s-box/sing-box generate uuid)
-                fi
-                local temp_json=$(mktemp)
-                jq --arg tag "$tag" --arg uuid "$new_uuid" '(.inbounds[] | select(.tag==$tag) | .users[0].uuid) = $uuid' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                echo "UUID 修改成功，新 UUID: $new_uuid"
-                apply_changes
-                ;;
-            3)
-                read -p "请输入新 WS 路径 (必须以 / 开头，例如 /my-path): " new_path
-                if [[ -n "$new_path" ]]; then
-                    if [[ ! "$new_path" =~ ^/ ]]; then
-                        new_path="/${new_path}"
-                    fi
-                    local temp_json=$(mktemp)
-                    jq --arg tag "$tag" --arg path "$new_path" '(.inbounds[] | select(.tag==$tag) | .transport.path) = $path' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                    echo "WS 路径修改成功，新路径: $new_path"
-                    apply_changes
-                else
-                    echo "路径不能为空！"
-                fi
-                ;;
-            *)
-                echo "无效选项！"
-                ;;
-        esac
-    done
-}
-
-modify_trojan() {
-    local suffix="$1"
-    local tag="trojan-tls-in"
-    local name="Trojan-WS-TLS"
-    if [[ "$suffix" == "-warp" ]]; then
-        tag="trojan-tls-warp-in"
-        name="Trojan-WS-TLS-WARP"
-    fi
-    while true; do
-        local cur_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .listen_port' /etc/s-box/sb.json)
-        local cur_pass=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .users[0].password' /etc/s-box/sb.json)
-        local cur_sni=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .tls.server_name' /etc/s-box/sb.json)
-        local cur_path=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .transport.path' /etc/s-box/sb.json)
-        
-        local has_trojan_ws=false
-        local cur_ws_port=""
-        local cur_ws_path=""
-        if jq -e '.inbounds[] | select(.tag=="trojan-ws-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-            has_trojan_ws=true
-            cur_ws_port=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .listen_port' /etc/s-box/sb.json)
-            cur_ws_path=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .transport.path' /etc/s-box/sb.json)
-        fi
-        
-        echo "--------------------------------------------------"
-        echo "          ${name} 参数修改"
-        echo "--------------------------------------------------"
-        echo "1. 修改监听端口 (当前: $cur_port)"
-        echo "2. 修改 密码 (当前: $cur_pass)"
-        echo "3. 修改 伪装域名 (当前: $cur_sni)"
-        echo "4. 修改 WS 路径 (当前: $cur_path)"
-        if $has_trojan_ws && [[ "$suffix" != "-warp" ]]; then
-            echo "5. 修改 Argo 内部 Trojan-WS 端口 (当前: $cur_ws_port)"
-            echo "6. 修改 Argo 内部 Trojan-WS 路径 (当前: $cur_ws_path)"
-        fi
-        echo "0. 返回"
-        echo "--------------------------------------------------"
-        local max_opt=4
-        if $has_trojan_ws && [[ "$suffix" != "-warp" ]]; then
-            max_opt=6
-        fi
-        read -p "请选择修改项 [0-$max_opt]: " trojan_choice
-        
-        if [[ "$trojan_choice" == "0" || -z "$trojan_choice" ]]; then
-            break
-        fi
-        
-        case $trojan_choice in
-            1)
-                read -p "请输入新端口: " new_port
-                if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-                    if ss -tunlp | grep -q ":$new_port " && [ "$new_port" -ne "$cur_port" ]; then
-                        echo "警告：端口 $new_port 已被占用！"
-                    else
-                        local temp_json=$(mktemp)
-                        jq --arg tag "$tag" --argjson port "$new_port" '(.inbounds[] | select(.tag==$tag) | .listen_port) = $port' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                        echo "端口修改成功，新端口: $new_port"
-                        apply_changes
-                    fi
-                else
-                    echo "无效端口！"
-                fi
-                ;;
-            2)
-                read -p "请输入新密码: " new_pass
-                if [[ -n "$new_pass" ]]; then
-                    local temp_json=$(mktemp)
-                    if $has_trojan_ws && [[ "$suffix" != "-warp" ]]; then
-                        jq --arg tag "$tag" --arg password "$new_pass" '
-                            ((.inbounds[] | select(.tag==$tag) | .users[0].password) = $password) |
-                            ((.inbounds[] | select(.tag=="trojan-ws-in") | .users[0].password) = $password)
-                        ' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                    else
-                        jq --arg tag "$tag" --arg password "$new_pass" '(.inbounds[] | select(.tag==$tag) | .users[0].password) = $password' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                    fi
-                    echo "密码修改成功，新密码: $new_pass"
-                    apply_changes
-                else
-                    echo "密码不能为空！"
-                fi
-                ;;
-            3)
-                read -p "请输入新伪装域名: " new_sni
-                if [[ -n "$new_sni" ]]; then
-                    local temp_json=$(mktemp)
-                    jq --arg tag "$tag" --arg sni "$new_sni" '(.inbounds[] | select(.tag==$tag) | .tls.server_name) = $sni' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                    echo "伪装域名修改成功，新伪装域名: $new_sni"
-                    apply_changes
-                else
-                    echo "域名不能为空！"
-                fi
-                ;;
-            4)
-                read -p "请输入新 WS 路径 (必须以 / 开头，例如 /my-path): " new_path
-                if [[ -n "$new_path" ]]; then
-                    if [[ ! "$new_path" =~ ^/ ]]; then
-                        new_path="/${new_path}"
-                    fi
-                    local temp_json=$(mktemp)
-                    jq --arg tag "$tag" --arg path "$new_path" '(.inbounds[] | select(.tag==$tag) | .transport.path) = $path' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                    echo "WS 路径修改成功，新路径: $new_path"
-                    apply_changes
-                else
-                    echo "路径不能为空！"
                 fi
                 ;;
             5)
-                if $has_trojan_ws && [[ "$suffix" != "-warp" ]]; then
-                    read -p "请输入新 Argo 内部 Trojan-WS 端口: " new_port
-                    if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-                        if ss -tunlp | grep -q ":$new_port " && [ "$new_port" -ne "$cur_ws_port" ]; then
-                            echo "警告：端口 $new_port 已被占用！"
-                        else
-                            local temp_json=$(mktemp)
-                            jq --argjson port "$new_port" '(.inbounds[] | select(.tag=="trojan-ws-in") | .listen_port) = $port' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                            echo "Argo 内部 Trojan-WS 端口修改成功，新端口: $new_port"
-                            apply_changes
-                        fi
-                    else
-                        echo "无效端口！"
-                    fi
-                else
-                    echo "无效选项！"
-                fi
-                ;;
-            6)
-                if $has_trojan_ws && [[ "$suffix" != "-warp" ]]; then
-                    read -p "请输入新 Argo 内部 Trojan-WS 路径 (必须以 / 开头): " new_path
-                    if [[ -n "$new_path" ]]; then
-                        if [[ ! "$new_path" =~ ^/ ]]; then
-                            new_path="/${new_path}"
-                        fi
-                        local temp_json=$(mktemp)
-                        jq --arg path "$new_path" '(.inbounds[] | select(.tag=="trojan-ws-in") | .transport.path) = $path' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                        echo "Argo 内部 Trojan-WS 路径修改成功，新路径: $new_path"
-                        apply_changes
-                    fi
-                else
-                    echo "无效选项！"
-                fi
-                ;;
-            *)
-                echo "无效选项！"
-                ;;
-        esac
-    done
-}
-
-modify_hy2() {
-    local suffix="$1"
-    local tag="hy2-in"
-    local name="Hysteria2"
-    if [[ "$suffix" == "-warp" ]]; then
-        tag="hy2-warp-in"
-        name="Hysteria2-WARP"
-    fi
-    while true; do
-        local cur_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .listen_port' /etc/s-box/sb.json)
-        local cur_pass=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .users[0].password' /etc/s-box/sb.json)
-        
-        echo "--------------------------------------------------"
-        echo "          ${name} 参数修改"
-        echo "--------------------------------------------------"
-        echo "1. 修改监听端口 (当前: $cur_port)"
-        echo "2. 修改 密码 (当前: $cur_pass)"
-        echo "0. 返回"
-        echo "--------------------------------------------------"
-        read -p "请选择修改项 [0-2]: " hy2_choice
-        
-        if [[ "$hy2_choice" == "0" || -z "$hy2_choice" ]]; then
-            break
-        fi
-        
-        case $hy2_choice in
-            1)
-                read -p "请输入新端口: " new_port
-                if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-                    if ss -tunlp | grep -q ":$new_port " && [ "$new_port" -ne "$cur_port" ]; then
-                        echo "警告：端口 $new_port 已被占用！"
-                    else
-                        local temp_json=$(mktemp)
-                        jq --arg tag "$tag" --argjson port "$new_port" '(.inbounds[] | select(.tag==$tag) | .listen_port) = $port' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                        echo "端口修改成功，新端口: $new_port"
-                        apply_changes
-                    fi
-                else
-                    echo "无效端口！"
-                fi
-                ;;
-            2)
-                read -p "请输入新密码: " new_pass
-                if [[ -n "$new_pass" ]]; then
-                    local temp_json=$(mktemp)
-                    jq --arg tag "$tag" --arg password "$new_pass" '(.inbounds[] | select(.tag==$tag) | .users[0].password) = $password' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                    echo "密码修改成功，新密码: $new_pass"
-                    apply_changes
-                else
-                    echo "密码不能为空！"
-                fi
-                ;;
-            *)
-                echo "无效选项！"
-                ;;
-        esac
-    done
-}
-
-modify_tuic() {
-    local suffix="$1"
-    local tag="tuic-in"
-    local name="TUIC v5"
-    if [[ "$suffix" == "-warp" ]]; then
-        tag="tuic-warp-in"
-        name="TUIC-WARP"
-    fi
-    while true; do
-        local cur_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .listen_port' /etc/s-box/sb.json)
-        local cur_uuid=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .users[0].uuid' /etc/s-box/sb.json)
-        
-        echo "--------------------------------------------------"
-        echo "          ${name} 参数修改"
-        echo "--------------------------------------------------"
-        echo "1. 修改监听端口 (当前: $cur_port)"
-        echo "2. 修改 UUID/密码 (当前: $cur_uuid)"
-        echo "0. 返回"
-        echo "--------------------------------------------------"
-        read -p "请选择修改项 [0-2]: " tuic_choice
-        
-        if [[ "$tuic_choice" == "0" || -z "$tuic_choice" ]]; then
-            break
-        fi
-        
-        case $tuic_choice in
-            1)
-                read -p "请输入新端口: " new_port
-                if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-                    if ss -tunlp | grep -q ":$new_port " && [ "$new_port" -ne "$cur_port" ]; then
-                        echo "警告：端口 $new_port 已被占用！"
-                    else
-                        local temp_json=$(mktemp)
-                        jq --arg tag "$tag" --argjson port "$new_port" '(.inbounds[] | select(.tag==$tag) | .listen_port) = $port' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                        echo "端口修改成功，新端口: $new_port"
-                        apply_changes
-                    fi
-                else
-                    echo "无效端口！"
-                fi
-                ;;
-            2)
-                read -p "请输入新 UUID/密码 (留空随机生成): " new_uuid
-                if [[ -z "$new_uuid" ]]; then
-                    new_uuid=$(/etc/s-box/sing-box generate uuid)
-                fi
-                local temp_json=$(mktemp)
-                jq --arg tag "$tag" --arg uuid "$new_uuid" '
-                    (.inbounds[] | select(.tag==$tag) | .users[0].uuid) = $uuid |
-                    (.inbounds[] | select(.tag==$tag) | .users[0].password) = $uuid
-                ' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                echo "UUID/密码 修改成功，新 UUID/密码: $new_uuid"
+                sync_all_secondary_nodes
                 apply_changes
+                green "已重新同步所有副节点！"
                 ;;
-            *)
-                echo "无效选项！"
-                ;;
+            0) return 0 ;;
+            *) red "无效选项" ;;
         esac
+        echo
+        reading "按回车继续..." _
     done
 }
 
-modify_anytls() {
-    local suffix="$1"
-    local tag="anytls-in"
-    local name="AnyTLS"
-    if [[ "$suffix" == "-warp" ]]; then
-        tag="anytls-warp-in"
-        name="AnyTLS-WARP"
+# ==================== 3. 副节点 - 赛风多出口管理 ====================
+add_psiphon_instance() {
+    install_psiphon_core || return 1
+    init_psiphon_instances_dir
+    echo
+    green "==== 添加赛风国家出口组 (副节点) ===="
+    show_supported_psiphon_codes
+    echo
+    reading "请输入国家代码 (如 US, JP, SG, HK, GB, DE 等): " cc
+    cc="${cc^^}"
+    [[ -z "$cc" ]] && { red "[!] 国家代码不能为空"; return 1; }
+
+    local inst_dir="${PSI_INSTANCES_DIR}/${cc}"
+    mkdir -p "$inst_dir"
+
+    local socks_p=$(get_free_loopback_port)
+    local cfg_file="$inst_dir/psiphon.config"
+    write_psiphon_config "$socks_p" "$cc" "$cfg_file" "$inst_dir/data"
+
+    # 启动专属实例
+    nohup "$WORKDIR/psiphon-tunnel-core" --config "$cfg_file" >> "$inst_dir/psiphon.log" 2>&1 &
+    echo $! > "$inst_dir/psiphon.pid"
+    echo "$socks_p" > "$inst_dir/socks_port.txt"
+
+    # 选择本地入站
+    echo
+    purple "请选择为该赛风出口搭建的本地入站协议:"
+    echo "  1. Hysteria2 入站 (UDP高加速)"
+    echo "  2. TUIC v5 入站 (QUIC高性能)"
+    echo "  3. VLESS-Reality 入站"
+    echo "  4. 同时开启 Hy2 + TUIC"
+    reading "请选择 [1-4, 默认4]: " proto_sel
+    [[ -z "$proto_sel" ]] && proto_sel="4"
+
+    local hy2_p="0" tuic_p="0" vless_p="0"
+    case "$proto_sel" in
+        1) hy2_p=$(get_free_port) ;;
+        2) tuic_p=$(get_free_port) ;;
+        3) vless_p=$(get_free_port) ;;
+        *) hy2_p=$(get_free_port); tuic_p=$(get_free_port) ;;
+    esac
+
+    echo "$hy2_p" > "$inst_dir/hy2_port.txt"
+    echo "$tuic_p" > "$inst_dir/tuic_port.txt"
+    echo "$vless_p" > "$inst_dir/vless_port.txt"
+    echo "$cc" >> "$PSI_INSTANCES_DIR/instances.txt"
+
+    sync_psiphon_instance_to_singbox "$cc"
+    apply_changes
+
+    green "[✓] 赛风国家出口组 [$cc - $(get_country_name "$cc")] 添加并启动成功！"
+    generate_psiphon_instance_links "$cc"
+}
+
+generate_psiphon_instance_links() {
+    local cc="${1^^}"
+    local inst_dir="${PSI_INSTANCES_DIR}/${cc}"
+    [[ -d "$inst_dir" ]] || return 1
+
+    local hy2_p tuic_p vless_p uuid ip cname
+    hy2_p=$(cat "$inst_dir/hy2_port.txt" 2>/dev/null || echo "0")
+    tuic_p=$(cat "$inst_dir/tuic_port.txt" 2>/dev/null || echo "0")
+    vless_p=$(cat "$inst_dir/vless_port.txt" 2>/dev/null || echo "0")
+    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat "$WORKDIR/uuid.txt" 2>/dev/null)
+    ip="${ALL_IPS[0]:-127.0.0.1}"
+    cname=$(get_country_name "$cc")
+
+    echo
+    purple "============================================================"
+    purple "  【副节点-赛风出口】: $cc ($cname)"
+    purple "============================================================"
+    if [[ "$hy2_p" -gt 0 ]]; then
+        local hy2_link="hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&sni=www.bing.com#Psi-${cc}-Hy2"
+        green "1. Hysteria2 节点链接:"
+        echo "   $hy2_link"
     fi
+    if [[ "$tuic_p" -gt 0 ]]; then
+        local tuic_link="tuic://${uuid}:${uuid}@${ip}:${tuic_p}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#Psi-${cc}-TUIC"
+        green "2. TUIC v5 节点链接:"
+        echo "   $tuic_link"
+    fi
+    if [[ "$vless_p" -gt 0 ]]; then
+        local pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
+        local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
+        local vless_link="vless://${uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=#Psi-${cc}-Reality"
+        green "3. VLESS-Reality 节点链接:"
+        echo "   $vless_link"
+    fi
+    purple "============================================================"
+}
+
+psiphon_management_menu() {
     while true; do
-        local cur_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .listen_port' /etc/s-box/sb.json)
-        local cur_pass=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .users[0].password' /etc/s-box/sb.json)
-        local cur_sni=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag==$tag) | .tls.server_name' /etc/s-box/sb.json)
-        
-        echo "--------------------------------------------------"
-        echo "          ${name} 参数修改"
-        echo "--------------------------------------------------"
-        echo "1. 修改监听端口 (当前: $cur_port)"
-        echo "2. 修改 密码 (当前: $cur_pass)"
-        echo "3. 修改 伪装域名 (当前: $cur_sni)"
-        echo "0. 返回"
-        echo "--------------------------------------------------"
-        read -p "请选择修改项 [0-3]: " anytls_choice
-        
-        if [[ "$anytls_choice" == "0" || -z "$anytls_choice" ]]; then
-            break
+        clear
+        echo
+        green "============================================================"
+        green "  【副节点】Psiphon 赛风出站多出口管理"
+        green "============================================================"
+        yellow "  说明: 副节点拥有独立入站端口与专属路由，出站走赛风对应国家"
+        yellow "        与主节点完全平行独立，互不干扰"
+        green "============================================================"
+        echo
+
+        local insts
+        mapfile -t insts < <(get_all_psiphon_instances)
+
+        purple "当前赛风出口组 (共 ${#insts[@]} 个):"
+        if [[ ${#insts[@]} -gt 0 ]]; then
+            local idx=1
+            for cc in "${insts[@]}"; do
+                local cname=$(get_country_name "$cc")
+                local hp=$(cat "${PSI_INSTANCES_DIR}/$cc/hy2_port.txt" 2>/dev/null || echo "0")
+                local tp=$(cat "${PSI_INSTANCES_DIR}/$cc/tuic_port.txt" 2>/dev/null || echo "0")
+                local vp=$(cat "${PSI_INSTANCES_DIR}/$cc/vless_port.txt" 2>/dev/null || echo "0")
+                local p_info=""
+                [[ "$hp" -gt 0 ]] && p_info="${p_info}Hy2:$hp "
+                [[ "$tp" -gt 0 ]] && p_info="${p_info}TUIC:$tp "
+                [[ "$vp" -gt 0 ]] && p_info="${p_info}VLESS:$vp "
+                green "  [$idx] [$cc] $cname  ->  入站端口: [ ${p_info:-无} ]"
+                ((idx++))
+            done
+        else
+            yellow "  暂无赛风出口组"
         fi
-        
-        case $anytls_choice in
-            1)
-                read -p "请输入新端口: " new_port
-                if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-                    if ss -tunlp | grep -q ":$new_port " && [ "$new_port" -ne "$cur_port" ]; then
-                        echo "警告：端口 $new_port 已被占用！"
-                    else
-                        local temp_json=$(mktemp)
-                        jq --argjson port "$new_port" '(.inbounds[] | select(.tag=="anytls-in") | .listen_port) = $port' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                        echo "端口修改成功，新端口: $new_port"
-                        apply_changes
-                    fi
-                else
-                    echo "无效端口！"
-                fi
-                ;;
+
+        echo
+        echo "------------------------------------------------------------"
+        green  "  1. 添加赛风国家出口组"
+        green  "  2. 查看所有赛风出口组节点链接"
+        red    "  3. 删除赛风国家出口组"
+        blue   "  4. 重启所有赛风实例"
+        echo "------------------------------------------------------------"
+        red    "  0. 返回主菜单"
+        echo "============================================================"
+        reading "请选择 [0-4]: " choice
+
+        case "$choice" in
+            1) add_psiphon_instance ;;
             2)
-                read -p "请输入新密码: " new_pass
-                if [[ -n "$new_pass" ]]; then
-                    local temp_json=$(mktemp)
-                    jq --arg password "$new_pass" '(.inbounds[] | select(.tag=="anytls-in") | .users[0].password) = $password' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                    echo "密码修改成功，新密码: $new_pass"
-                    apply_changes
-                else
-                    echo "密码不能为空！"
-                fi
+                for cc in "${insts[@]}"; do generate_psiphon_instance_links "$cc"; done
                 ;;
             3)
-                read -p "请输入新伪装域名: " new_sni
-                if [[ -n "$new_sni" ]]; then
-                    local temp_json=$(mktemp)
-                    jq --arg sni "$new_sni" '(.inbounds[] | select(.tag=="anytls-in") | .tls.server_name) = $sni' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                    echo "伪装域名修改成功，新伪装域名: $new_sni"
-                    apply_changes
+                if [[ ${#insts[@]} -eq 0 ]]; then
+                    yellow "暂无赛风出口组"
                 else
-                    echo "域名不能为空！"
+                    reading "请输入要删除的国家码 (如 US): " del_cc
+                    del_cc="${del_cc^^}"
+                    if [[ -d "${PSI_INSTANCES_DIR}/$del_cc" ]]; then
+                        local pid=$(cat "${PSI_INSTANCES_DIR}/$del_cc/psiphon.pid" 2>/dev/null)
+                        [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
+                        rm -rf "${PSI_INSTANCES_DIR:?}/$del_cc"
+                        sed -i "/^${del_cc}$/d" "$PSI_INSTANCES_DIR/instances.txt"
+                        # 从 sb.json 中移除
+                        python3 -c "
+import json
+with open('$WORKDIR/sb.json') as f: d=json.load(f)
+d['outbounds']=[o for o in d.get('outbounds',[]) if o.get('tag')!='psiphon-${del_cc,,}']
+d['inbounds']=[i for i in d.get('inbounds',[]) if '${del_cc,,}' not in i.get('tag','')]
+d.setdefault('route',{}).setdefault('rules',[])
+d['route']['rules']=[r for r in d['route']['rules'] if r.get('outbound')!='psiphon-${del_cc,,}']
+with open('$WORKDIR/sb.json','w') as f: json.dump(d,f,indent=2)
+"
+                        apply_changes
+                        green "已删除赛风出口组: $del_cc"
+                    fi
                 fi
                 ;;
-            *)
-                echo "无效选项！"
+            4)
+                yellow "正在重启所有赛风实例..."
+                for cc in "${insts[@]}"; do
+                    local idir="${PSI_INSTANCES_DIR}/$cc"
+                    local pid=$(cat "$idir/psiphon.pid" 2>/dev/null)
+                    [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
+                    nohup "$WORKDIR/psiphon-tunnel-core" --config "$idir/psiphon.config" >> "$idir/psiphon.log" 2>&1 &
+                    echo $! > "$idir/psiphon.pid"
+                done
+                green "赛风实例已重启！"
                 ;;
+            0) return 0 ;;
+            *) red "无效选项" ;;
         esac
+        echo
+        reading "按回车继续..." _
     done
 }
 
-modify_argo() {
-    if [[ ! -f /usr/local/bin/cloudflared ]]; then
-        echo "错误：未安装 Cloudflared，无法配置 Argo 隧道！"
-        read -p "按回车键继续..." temp
-        return
+# ==================== 4. 查看主节点信息与全部汇总 ====================
+show_links() {
+    if [[ -f /etc/s-box/info.log ]]; then
+        cat /etc/s-box/info.log
+    else
+        yellow "未找到 /etc/s-box/info.log，正在尝试重新生成..."
+        # 直接输出主节点信息
+        local uuid ip pbk sid reym
+        uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat "$WORKDIR/uuid.txt" 2>/dev/null)
+        ip="${ALL_IPS[0]:-127.0.0.1}"
+        pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
+        sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null)
+        reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
+
+        green "=================================================="
+        green "         Sing-box 主节点信息"
+        green "=================================================="
+        echo "UUID / Password: $uuid"
+        echo
+        local vless_p=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
+        local vmess_p=$(jq -r '.inbounds[] | select(.tag=="vmess-ws-in") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
+        local trojan_p=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
+        local hy2_p=$(jq -r '.inbounds[] | select(.tag=="hy2-in") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
+        local tuic_p=$(jq -r '.inbounds[] | select(.tag=="tuic-in") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
+
+        [[ -n "$vless_p" && "$vless_p" != "null" ]] && echo "1. VLESS-Reality: vless://${uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#SB-VLESS-Reality"
+        [[ -n "$vmess_p" && "$vmess_p" != "null" ]] && echo "2. VMess-WS: $(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess\",\"add\":\"${ip}\",\"port\":\"${vmess_p}\",\"id\":\"${uuid}\",\"net\":\"ws\",\"path\":\"/${uuid}-vm\"}")"
+        [[ -n "$trojan_p" && "$trojan_p" != "null" ]] && echo "3. Trojan-WS-TLS: trojan://${uuid}@${ip}:${trojan_p}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=%2F${uuid}-tr#SB-Trojan-TLS"
+        [[ -n "$hy2_p" && "$hy2_p" != "null" ]] && echo "4. Hysteria2: hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&sni=www.bing.com#SB-Hysteria2"
+        [[ -n "$tuic_p" && "$tuic_p" != "null" ]] && echo "5. TUIC v5: tuic://${uuid}:${uuid}@${ip}:${tuic_p}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5"
+        green "=================================================="
     fi
-
-    while true; do
-        local argo_mode="temp"
-        local argo_token=""
-        local argo_domain=""
-        local ARGO_VMESS_DOMAIN=""
-        local ARGO_TROJAN_DOMAIN=""
-        if [[ -f /etc/s-box/argo.conf ]]; then
-            source /etc/s-box/argo.conf
-            argo_mode=$ARGO_MODE
-            argo_token=$ARGO_TOKEN
-            argo_domain=$ARGO_DOMAIN
-        else
-            if $IS_OPENRC; then
-                if grep -q "\--token" /etc/init.d/argo-tunnel 2>/dev/null; then
-                    argo_mode="token"
-                    argo_token=$(grep -oE "\--token[[:space:]]+[^[:space:]]+" /etc/init.d/argo-tunnel 2>/dev/null | awk '{print $2}')
-                fi
-            else
-                if grep -q "\--token" /etc/systemd/system/argo-tunnel.service 2>/dev/null; then
-                    argo_mode="token"
-                    argo_token=$(grep -oE "\--token[[:space:]]+[^[:space:]]+" /etc/systemd/system/argo-tunnel.service 2>/dev/null | awk '{print $2}')
-                fi
-            fi
-            if [[ -f /etc/s-box/argo.log ]]; then
-                argo_domain=$(cat /etc/s-box/argo.log)
-            fi
-        fi
-
-        echo "--------------------------------------------------"
-        echo "          Argo 隧道参数修改"
-        echo "--------------------------------------------------"
-        if [[ "$argo_mode" == "token" ]]; then
-            echo "当前模式: 固定域名隧道 (Token 模式)"
-            if is_enabled "$USE_NGINX"; then
-                echo "自备域名: $argo_domain"
-            else
-                [[ -n "$ARGO_VMESS_DOMAIN" ]] && echo "VMess 子域名: $ARGO_VMESS_DOMAIN"
-                [[ -n "$ARGO_TROJAN_DOMAIN" ]] && echo "Trojan 子域名: $ARGO_TROJAN_DOMAIN"
-            fi
-            echo "Token值 : ${argo_token:0:15}... (已隐藏后续字符)"
-        else
-            echo "当前模式: 临时域名隧道 (TryCloudflare 模式)"
-            echo "临时域名: $argo_domain"
-        fi
-        echo "--------------------------------------------------"
-        echo "1. 切换为 临时域名隧道 (trycloudflare.com)"
-        echo "2. 切换为 固定域名隧道 (使用 Cloudflare Tunnel Token)"
-        echo "0. 返回"
-        echo "--------------------------------------------------"
-        read -p "请选择修改项 [0-2]: " argo_choice
-        
-        if [[ "$argo_choice" == "0" || -z "$argo_choice" ]]; then
-            break
-        fi
-        
-        case $argo_choice in
-            1)
-                if [[ "$argo_mode" == "temp" ]]; then
-                    echo "当前已是临时隧道模式，无需切换。"
-                    continue
-                fi
-                echo "正在切换为临时域名隧道模式..."
-                
-                local argo_target_port="${ARGO_PORT}"
-                local argo_depend="net sing-box"
-                if is_enabled "$USE_NGINX"; then
-                    local port_nginx=$(grep -oE "listen 127.0.0.1:[0-9]+" ${NGINX_CONF_DIR}/singbox-argo.conf 2>/dev/null | head -n 1 | awk -F: '{print $2}')
-                    [[ -z "$port_nginx" ]] && port_nginx=8401
-                    argo_target_port="${port_nginx}"
-                    argo_depend="net sing-box nginx"
-                fi
-                
-                if $IS_OPENRC; then
-                    cat > /etc/init.d/argo-tunnel <<EOF_INIT
-#!/sbin/openrc-run
-name="argo-tunnel"
-description="Argo Tunnel Service"
-command="/usr/local/bin/cloudflared"
-command_args="tunnel --url http://127.0.0.1:${argo_target_port}"
-command_background="yes"
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="/var/log/argo-tunnel.log"
-error_log="/var/log/argo-tunnel.log"
-depend() {
-    need ${argo_depend}
 }
-EOF_INIT
-                    chmod +x /etc/init.d/argo-tunnel
-                else
-                    cat > /etc/systemd/system/argo-tunnel.service <<EOF_SYSTEMD
-[Unit]
-Description=Argo Tunnel Service
-After=network.target
 
-[Service]
-User=root
-ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:${argo_target_port}
-Restart=on-failure
-RestartSec=10
+show_all_nodes_summary() {
+    clear
+    echo
+    green "============================================================"
+    green "  全部节点信息总览 (主节点与副节点分类汇总)"
+    green "============================================================"
+    echo
+    purple "【一、主节点列表 (多协议主节点群)】"
+    show_links
+    echo
+    purple "【二、副节点 - 赛风出站多出口节点组】"
+    local psi_insts
+    mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
+    if [[ ${#psi_insts[@]} -gt 0 ]]; then
+        for cc in "${psi_insts[@]}"; do
+            generate_psiphon_instance_links "$cc"
+        done
+    else
+        yellow "  (当前未配置赛风副节点出口组)"
+    fi
+    echo
+    purple "【三、副节点 - 自定义代理出站多出口节点组】"
+    local proxy_tags
+    mapfile -t proxy_tags < <(get_all_proxy_groups 2>/dev/null)
+    if [[ ${#proxy_tags[@]} -gt 0 ]]; then
+        for tag in "${proxy_tags[@]}"; do
+            generate_proxy_group_links "$tag"
+        done
+    else
+        yellow "  (当前未配置自定义代理副节点组)"
+    fi
+    echo
+    green "============================================================"
+}
 
-[Install]
-WantedBy=multi-user.target
-EOF_SYSTEMD
-                    systemctl daemon-reload
-                fi
-                
-                cat > /etc/s-box/argo.conf <<EOF_ARGO
-ARGO_MODE="temp"
-ARGO_TOKEN=""
-ARGO_DOMAIN=""
-ARGO_VMESS_DOMAIN=""
-ARGO_TROJAN_DOMAIN=""
-USE_NGINX="${USE_NGINX}"
-ARGO_PORT="${ARGO_PORT}"
-EOF_ARGO
-                
+# ==================== 5. 自定义节点组合推送 ====================
+custom_push_nodes() {
+    clear
+    echo
+    green "============================================================"
+    green "  自定义节点组合推送 (聚合订阅生成)"
+    green "============================================================"
+    echo
+    yellow "正在聚合所有可用主节点与副节点分享链接..."
+    echo
+    show_all_nodes_summary
+}
+
+# ==================== 6. Argo 隧道管理 ====================
+argo_management_menu() {
+    while true; do
+        clear
+        echo
+        green "============================================================"
+        green "  主节点 Argo 隧道管理 (Cloudflare Tunnel)"
+        green "============================================================"
+        echo
+        if service_is_active argo-tunnel; then
+            green "【Argo 状态】: ✓ 运行中"
+            local argo_d
+            argo_d=$(cat /etc/s-box/argo.log 2>/dev/null || cat /var/log/argo-tunnel.log 2>/dev/null | grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' | tail -n 1)
+            [[ -n "$argo_d" ]] && blue "当前域名: $argo_d"
+        else
+            yellow "【Argo 状态】: ✗ 未运行"
+        fi
+        echo
+        echo "------------------------------------------------------------"
+        green  "  1. 启动 / 重启 Argo 隧道"
+        red    "  2. 停止 Argo 隧道"
+        blue   "  3. 查看 Argo 实时日志与域名"
+        yellow "  4. 重置/重新抓取临时域名"
+        echo "------------------------------------------------------------"
+        red    "  0. 返回主菜单"
+        echo "============================================================"
+        reading "请选择 [0-4]: " choice
+
+        case "$choice" in
+            1)
                 service_restart argo-tunnel
-                update_argo_domain
-                regenerate_info_log
-                echo "成功切换为临时域名隧道模式！"
+                green "Argo 隧道已重启！"
                 ;;
             2)
-                read -p "请输入您的 Cloudflare Tunnel Token: " new_token
-                if [[ -z "$new_token" ]]; then
-                    echo "错误：Token 不能为空！"
-                    continue
-                fi
-
-                # 询问转发方式
-                echo "=================================================="
-                echo "          请选择 Argo 隧道的转发方式"
-                echo "=================================================="
-                echo "1. 启用 Nginx 作为反向代理分流 (推荐，支持多协议单域名分流，直接回车)"
-                echo "2. 不启用 Nginx (多子域名多端口直连，VMess=8401, Trojan=8402)"
-                echo "=================================================="
-                read -p "请输入选项 [1-2, 默认1]: " nginx_choice
-                local new_use_nginx="y"
-                if [[ "$nginx_choice" == "2" ]]; then
-                    new_use_nginx="n"
-                fi
-
-                local new_domain=""
-                local new_vmess_domain=""
-                local new_trojan_domain=""
-
-                if is_enabled "$new_use_nginx"; then
-                    read -p "请输入您在 Cloudflare 上为该隧道绑定的自定义域名 (如: argo.example.com): " new_domain
-                    if [[ -z "$new_domain" ]]; then
-                        echo "错误：自定义域名不能为空！"
-                        continue
-                    fi
-                else
-                    # 检查已安装什么协议以询问对应域名
-                    if jq -e '.inbounds[] | select(.tag=="vmess-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-                        read -p "请输入 VMess 节点对应的自定义子域名 (如: vmess.example.com): " new_vmess_domain
-                        if [[ -z "$new_vmess_domain" ]]; then
-                            echo "错误：VMess 子域名不能为空！"
-                            continue
-                        fi
-                    fi
-                    if jq -e '.inbounds[] | select(.tag=="trojan-ws-in")' /etc/s-box/sb.json >/dev/null 2>&1; then
-                        read -p "请输入 Trojan 节点对应的自定义子域名 (如: trojan.example.com): " new_trojan_domain
-                        if [[ -z "$new_trojan_domain" ]]; then
-                            echo "错误：Trojan 子域名不能为空！"
-                            continue
-                        fi
-                    fi
-                fi
-                
-                echo "正在配置固定域名隧道..."
-                
-                local argo_depend="net sing-box"
-                if is_enabled "$new_use_nginx"; then
-                    argo_depend="net sing-box nginx"
-                fi
-                
-                if $IS_OPENRC; then
-                    cat > /etc/init.d/argo-tunnel <<EOF_INIT
-#!/sbin/openrc-run
-name="argo-tunnel"
-description="Argo Tunnel Service"
-command="/usr/local/bin/cloudflared"
-command_args="tunnel --no-autoupdate run --token ${new_token}"
-command_background="yes"
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="/var/log/argo-tunnel.log"
-error_log="/var/log/argo-tunnel.log"
-depend() {
-    need ${argo_depend}
-}
-EOF_INIT
-                    chmod +x /etc/init.d/argo-tunnel
-                else
-                    cat > /etc/systemd/system/argo-tunnel.service <<EOF_SYSTEMD
-[Unit]
-Description=Argo Tunnel Service
-After=network.target
-
-[Service]
-User=root
-ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token ${new_token}
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF_SYSTEMD
-                    systemctl daemon-reload
-                fi
-                
-                cat > /etc/s-box/argo.conf <<EOF_ARGO
-ARGO_MODE="token"
-ARGO_TOKEN="${new_token}"
-ARGO_DOMAIN="${new_domain}"
-ARGO_VMESS_DOMAIN="${new_vmess_domain}"
-ARGO_TROJAN_DOMAIN="${new_trojan_domain}"
-USE_NGINX="${new_use_nginx}"
-ARGO_PORT="${ARGO_PORT}"
-EOF_ARGO
-
-                if ! is_enabled "$new_use_nginx"; then
-                    echo "${new_vmess_domain:-$new_trojan_domain}" > /etc/s-box/argo.log
-                else
-                    echo "$new_domain" > /etc/s-box/argo.log
-                fi
-                
+                service_stop argo-tunnel
+                green "Argo 隧道已停止！"
+                ;;
+            3)
+                echo
+                green "========== Argo 日志 (最近 20 行) =========="
+                tail -n 20 /var/log/argo-tunnel.log 2>/dev/null || journalctl -u argo-tunnel -n 20 --no-pager 2>/dev/null || yellow "暂无日志"
+                echo "============================================"
+                ;;
+            4)
                 service_restart argo-tunnel
-                regenerate_info_log
-                echo "成功配置并启用固定域名隧道！"
-                local port_nginx=$(grep -oE "listen 127.0.0.1:[0-9]+" ${NGINX_CONF_DIR}/singbox-argo.conf 2>/dev/null | head -n 1 | awk -F: '{print $2}')
-                [[ -z "$port_nginx" ]] && port_nginx=8401
-                if is_enabled "$new_use_nginx"; then
-                    echo -e "\033[1;33m【重要提示】请前往 Cloudflare Zero Trust 控制台，将该隧道对应的 Public Hostname 服务地址 (Service)"
-                    echo -e "设置为: http://127.0.0.1:${port_nginx} (请务必使用 127.0.0.1，以避免 localhost 的 IPv6 解析冲突！)\033[0m"
-                else
-                    echo -e "\033[1;33m【重要提示】请前往 Cloudflare Zero Trust 控制台，分别配置子域名对应的 Public Hostname 服务地址 (Service)："
-                    if [[ -n "$new_vmess_domain" ]]; then
-                        local port_vmess=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-                        [[ -z "$port_vmess" ]] && port_vmess=8401
-                        echo -e "  → 子域名: ${new_vmess_domain} → http://127.0.0.1:${port_vmess}"
-                    fi
-                    if [[ -n "$new_trojan_domain" ]]; then
-                        local port_trojan_ws=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-                        [[ -z "$port_trojan_ws" ]] && port_trojan_ws=8402
-                        echo -e "  → 子域名: ${new_trojan_domain} → http://127.0.0.1:${port_trojan_ws}"
-                    fi
-                    echo -e "  (请务必使用 127.0.0.1，以避免 localhost 的 IPv6 解析冲突！)\033[0m"
-                fi
+                sleep 4
+                local new_d
+                new_d=$(cat /var/log/argo-tunnel.log 2>/dev/null | grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' | tail -n 1)
+                [[ -n "$new_d" ]] && echo "$new_d" > /etc/s-box/argo.log
+                green "已刷新域名: ${new_d:-获取中...}"
                 ;;
-            *)
-                echo "无效选项！"
-                ;;
+            0) return 0 ;;
+            *) red "无效选项" ;;
         esac
+        echo
+        reading "按回车继续..." _
     done
 }
 
-modify_node_params() {
-    if [[ ! -f /etc/s-box/sb.json ]]; then
-        echo "错误：未找到配置文件 /etc/s-box/sb.json"
-        return
-    fi
-
+# ==================== 7. 系统运维与日志 ====================
+view_logs_menu() {
     while true; do
-        echo "=================================================="
-        echo "          修改已搭建节点参数"
-        echo "=================================================="
-        
-        local has_vless=false; local has_vless_warp=false
-        local has_vmess=false; local has_vmess_warp=false
-        local has_trojan=false; local has_trojan_warp=false
-        local has_hy2=false; local has_hy2_warp=false
-        local has_tuic=false; local has_tuic_warp=false
-        local has_anytls=false; local has_anytls_warp=false
-        
-        jq -e '.inbounds[] | select(.tag=="vless-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_vless=true
-        jq -e '.inbounds[] | select(.tag=="vless-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_vless_warp=true
-        jq -e '.inbounds[] | select(.tag=="vmess-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_vmess=true
-        jq -e '.inbounds[] | select(.tag=="vmess-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_vmess_warp=true
-        jq -e '.inbounds[] | select(.tag=="trojan-tls-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_trojan=true
-        jq -e '.inbounds[] | select(.tag=="trojan-tls-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_trojan_warp=true
-        jq -e '.inbounds[] | select(.tag=="hy2-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_hy2=true
-        jq -e '.inbounds[] | select(.tag=="hy2-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_hy2_warp=true
-        jq -e '.inbounds[] | select(.tag=="tuic-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_tuic=true
-        jq -e '.inbounds[] | select(.tag=="tuic-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_tuic_warp=true
-        jq -e '.inbounds[] | select(.tag=="anytls-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_anytls=true
-        jq -e '.inbounds[] | select(.tag=="anytls-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_anytls_warp=true
-        
-        local menu_index=1
-        local opt_vless=0; local opt_vless_warp=0
-        local opt_vmess=0; local opt_vmess_warp=0
-        local opt_trojan=0; local opt_trojan_warp=0
-        local opt_hy2=0; local opt_hy2_warp=0
-        local opt_tuic=0; local opt_tuic_warp=0
-        local opt_anytls=0; local opt_anytls_warp=0
-        
-        if $has_vless; then
-            echo "${menu_index}. 修改 VLESS-Reality 节点参数"
-            opt_vless=$menu_index
-            ((menu_index++))
-        fi
-        if $has_vless_warp; then
-            echo "${menu_index}. 修改 VLESS-Reality-WARP 节点参数"
-            opt_vless_warp=$menu_index
-            ((menu_index++))
-        fi
-        if $has_vmess; then
-            echo "${menu_index}. 修改 VMess-WS 节点参数"
-            opt_vmess=$menu_index
-            ((menu_index++))
-        fi
-        if $has_vmess_warp; then
-            echo "${menu_index}. 修改 VMess-WS-WARP 节点参数"
-            opt_vmess_warp=$menu_index
-            ((menu_index++))
-        fi
-        if $has_trojan; then
-            echo "${menu_index}. 修改 Trojan-WS-TLS 节点参数"
-            opt_trojan=$menu_index
-            ((menu_index++))
-        fi
-        if $has_trojan_warp; then
-            echo "${menu_index}. 修改 Trojan-WS-TLS-WARP 节点参数"
-            opt_trojan_warp=$menu_index
-            ((menu_index++))
-        fi
-        if $has_hy2; then
-            echo "${menu_index}. 修改 Hysteria2 节点参数"
-            opt_hy2=$menu_index
-            ((menu_index++))
-        fi
-        if $has_hy2_warp; then
-            echo "${menu_index}. 修改 Hysteria2-WARP 节点参数"
-            opt_hy2_warp=$menu_index
-            ((menu_index++))
-        fi
-        if $has_tuic; then
-            echo "${menu_index}. 修改 TUIC v5 节点参数"
-            opt_tuic=$menu_index
-            ((menu_index++))
-        fi
-        if $has_tuic_warp; then
-            echo "${menu_index}. 修改 TUIC-WARP 节点参数"
-            opt_tuic_warp=$menu_index
-            ((menu_index++))
-        fi
-        if $has_anytls; then
-            echo "${menu_index}. 修改 AnyTLS 节点参数"
-            opt_anytls=$menu_index
-            ((menu_index++))
-        fi
-        if $has_anytls_warp; then
-            echo "${menu_index}. 修改 AnyTLS-WARP 节点参数"
-            opt_anytls_warp=$menu_index
-            ((menu_index++))
-        fi
-        echo "0. 返回主菜单"
-        echo "=================================================="
-        read -p "请输入要修改的节点选项 [0-$((menu_index-1))]: " modify_choice
-        
-        if [[ "$modify_choice" == "0" || -z "$modify_choice" ]]; then
-            break
-        fi
-        
-        if [[ "$modify_choice" == "$opt_vless" && $opt_vless -ne 0 ]]; then
-            modify_vless ""
-        elif [[ "$modify_choice" == "$opt_vless_warp" && $opt_vless_warp -ne 0 ]]; then
-            modify_vless "-warp"
-        elif [[ "$modify_choice" == "$opt_vmess" && $opt_vmess -ne 0 ]]; then
-            modify_vmess ""
-        elif [[ "$modify_choice" == "$opt_vmess_warp" && $opt_vmess_warp -ne 0 ]]; then
-            modify_vmess "-warp"
-        elif [[ "$modify_choice" == "$opt_trojan" && $opt_trojan -ne 0 ]]; then
-            modify_trojan ""
-        elif [[ "$modify_choice" == "$opt_trojan_warp" && $opt_trojan_warp -ne 0 ]]; then
-            modify_trojan "-warp"
-        elif [[ "$modify_choice" == "$opt_hy2" && $opt_hy2 -ne 0 ]]; then
-            modify_hy2 ""
-        elif [[ "$modify_choice" == "$opt_hy2_warp" && $opt_hy2_warp -ne 0 ]]; then
-            modify_hy2 "-warp"
-        elif [[ "$modify_choice" == "$opt_tuic" && $opt_tuic -ne 0 ]]; then
-            modify_tuic ""
-        elif [[ "$modify_choice" == "$opt_tuic_warp" && $opt_tuic_warp -ne 0 ]]; then
-            modify_tuic "-warp"
-        elif [[ "$modify_choice" == "$opt_anytls" && $opt_anytls -ne 0 ]]; then
-            modify_anytls ""
-        elif [[ "$modify_choice" == "$opt_anytls_warp" && $opt_anytls_warp -ne 0 ]]; then
-            modify_anytls "-warp"
-        else
-            echo "无效的选项，请重新输入。"
-        fi
-    done
-}
-
-add_warp_nodes() {
-    if [[ ! -f /etc/s-box/sb.json ]]; then
-        echo "错误：未找到配置文件 /etc/s-box/sb.json"
-        read -p "按回车键继续..." temp
-        return
-    fi
-
-    # 检测已有的直连协议
-    local has_vless=false has_vmess=false has_trojan=false has_hy2=false has_tuic=false has_anytls=false
-    jq -e '.inbounds[] | select(.tag=="vless-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_vless=true
-    jq -e '.inbounds[] | select(.tag=="vmess-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_vmess=true
-    jq -e '.inbounds[] | select(.tag=="trojan-tls-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_trojan=true
-    jq -e '.inbounds[] | select(.tag=="hy2-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_hy2=true
-    jq -e '.inbounds[] | select(.tag=="tuic-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_tuic=true
-    jq -e '.inbounds[] | select(.tag=="anytls-in")' /etc/s-box/sb.json >/dev/null 2>&1 && has_anytls=true
-
-    # 检测已有的 WARP 节点
-    local existing_warp=""
-    jq -e '.inbounds[] | select(.tag=="vless-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && existing_warp="${existing_warp}VLESS "
-    jq -e '.inbounds[] | select(.tag=="vmess-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && existing_warp="${existing_warp}VMess "
-    jq -e '.inbounds[] | select(.tag=="trojan-tls-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && existing_warp="${existing_warp}Trojan "
-    jq -e '.inbounds[] | select(.tag=="hy2-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && existing_warp="${existing_warp}Hy2 "
-    jq -e '.inbounds[] | select(.tag=="tuic-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && existing_warp="${existing_warp}TUIC "
-    jq -e '.inbounds[] | select(.tag=="anytls-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && existing_warp="${existing_warp}AnyTLS "
-
-    echo "=================================================="
-    echo "    追加 WARP 出站节点（不影响已有直连节点）"
-    echo "=================================================="
-    echo ""
-    echo "当前已有的直连协议："
-    $has_vless && echo "  ✓ VLESS-Reality" || echo "  ✗ VLESS-Reality (未安装)"
-    $has_vmess && echo "  ✓ VMess-WS" || echo "  ✗ VMess-WS (未安装)"
-    $has_trojan && echo "  ✓ Trojan-WS-TLS" || echo "  ✗ Trojan-WS-TLS (未安装)"
-    $has_hy2 && echo "  ✓ Hysteria2" || echo "  ✗ Hysteria2 (未安装)"
-    $has_tuic && echo "  ✓ TUIC v5" || echo "  ✗ TUIC v5 (未安装)"
-    $has_anytls && echo "  ✓ AnyTLS" || echo "  ✗ AnyTLS (未安装)"
-    echo ""
-    if [[ -n "$existing_warp" ]]; then
-        echo "已有的 WARP 节点: ${existing_warp}"
-        echo "(重新添加将覆盖已有的同协议 WARP 节点)"
-        echo ""
-    fi
-    echo "请选择要添加 WARP 出站的协议（多选请用空格分隔，如 1 3 5）："
-    echo "  1. VLESS-Reality-WARP"
-    echo "  2. VMess-WS-WARP"
-    echo "  3. Trojan-WS-TLS-WARP"
-    echo "  4. Hysteria2-WARP"
-    echo "  5. TUIC-WARP"
-    echo "  6. AnyTLS-WARP"
-    echo "  0. 全部添加"
-    echo "  q. 取消返回"
-    echo "=================================================="
-    read -p "请输入选项 (如 1 3 或 0): " warp_selections
-
-    if [[ "$warp_selections" == "q" || -z "$warp_selections" ]]; then
-        return
-    fi
-
-    local add_vless=false add_vmess=false add_trojan=false add_hy2=false add_tuic=false add_anytls=false
-    if [[ "$warp_selections" == "0" ]]; then
-        add_vless=true
-        add_vmess=true
-        add_trojan=true
-        add_hy2=true
-        add_tuic=true
-        add_anytls=true
-    else
-        for sel in $warp_selections; do
-            [[ "$sel" == "1" ]] && add_vless=true
-            [[ "$sel" == "2" ]] && add_vmess=true
-            [[ "$sel" == "3" ]] && add_trojan=true
-            [[ "$sel" == "4" ]] && add_hy2=true
-            [[ "$sel" == "5" ]] && add_tuic=true
-            [[ "$sel" == "6" ]] && add_anytls=true
-        done
-    fi
-
-    if ! $add_vless && ! $add_vmess && ! $add_trojan && ! $add_hy2 && ! $add_tuic && ! $add_anytls; then
-        echo "未选择任何协议，已取消。"
-        read -p "按回车键继续..." temp
-        return
-    fi
-
-    echo ""
-    echo "正在获取 WARP 出站凭证..."
-    # 内联 get_warp_credentials 逻辑
-    local warpurl
-    warpurl=$(curl -sm5 -k https://warp.xijp.eu.org 2>/dev/null || wget -qO- --timeout=5 https://warp.xijp.eu.org 2>/dev/null)
-    local WARP_PVK="52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A="
-    local WARP_IPV6="2606:4700:110:8d8d:1845:c39f:2dd5:a03a"
-    local WARP_RES="[215, 69, 233]"
-    if [[ -n "$warpurl" ]] && ! printf '%s' "$warpurl" | grep -q -i "html"; then
-        local tmp_pvk tmp_ipv6 tmp_res
-        tmp_pvk=$(echo "$warpurl" | awk -F'：' '/Private_key/{print $2}' | xargs)
-        tmp_ipv6=$(echo "$warpurl" | awk -F'：' '/IPV6/{print $2}' | xargs)
-        tmp_res=$(echo "$warpurl" | awk -F'：' '/reserved/{print $2}' | xargs)
-        [[ -n "$tmp_pvk" ]] && WARP_PVK="$tmp_pvk"
-        [[ -n "$tmp_ipv6" ]] && WARP_IPV6="$tmp_ipv6"
-        if [[ -n "$tmp_res" ]]; then
-            if [[ ! "$tmp_res" =~ ^\[ ]]; then WARP_RES="[${tmp_res}]"; else WARP_RES="$tmp_res"; fi
-        fi
-    fi
-    echo "WARP 凭证获取完成。"
-
-    # 获取公网 IP
-    local IP
-    IP=$(curl -s4m5 icanhazip.com 2>/dev/null || curl -s4m5 api.ipify.org 2>/dev/null)
-    [[ -z "$IP" ]] && IP=$(curl -s6m5 icanhazip.com 2>/dev/null || curl -s6m5 api6.ipify.org 2>/dev/null)
-    local LISTEN="0.0.0.0"
-    [[ -z "$(curl -s4m5 icanhazip.com 2>/dev/null)" ]] && LISTEN="::"
-
-    # 从直连节点复制基础参数
-    local UUID=$(jq -r '[.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid][0]' /etc/s-box/sb.json)
-    local PVK=$(jq -r '[.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key][0]' /etc/s-box/sb.json)
-    local PUBLIC_KEY=""
-    [[ -f /etc/s-box/public.key ]] && PUBLIC_KEY=$(cat /etc/s-box/public.key | tr -d '\r\n')
-    local SHORT_ID=$(jq -r '[.inbounds[]? | select(.tls.reality.short_id[0] != null) | .tls.reality.short_id[0]][0]' /etc/s-box/sb.json)
-
-    # 凭证兜底生成机制
-    if [[ -z "$UUID" || "$UUID" == "null" ]]; then
-        UUID=$(/etc/s-box/sing-box generate uuid)
-    fi
-    if [[ -z "$PVK" || "$PVK" == "null" ]]; then
-        local reality_keys
-        reality_keys=$(/etc/s-box/sing-box generate reality-keypair 2>/dev/null)
-        if [[ -n "$reality_keys" ]]; then
-            PVK=$(echo "$reality_keys" | awk '/PrivateKey/{print $2}')
-            PUBLIC_KEY=$(echo "$reality_keys" | awk '/PublicKey/{print $2}')
-            echo "$PUBLIC_KEY" > /etc/s-box/public.key
-        else
-            PVK="52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A="
-            PUBLIC_KEY="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-            echo "$PUBLIC_KEY" > /etc/s-box/public.key
-        fi
-    fi
-    if [[ -z "$SHORT_ID" || "$SHORT_ID" == "null" ]]; then
-        SHORT_ID=$(openssl rand -hex 8)
-    fi
-
-    # 端口分配与交互逻辑
-    local used_ports=$(ss -tunlp | awk '{print $5}' | grep -oE '[0-9]+$' | sort -u)
-    get_free_port() {
-        local port
-        while true; do
-            port=$(shuf -i 20000-60000 -n 1)
-            if ! echo "$used_ports" | grep -q "^${port}$"; then
-                if ! echo -e "$_allocated_ports" | grep -q "^${port}$"; then
-                    echo "$port"
-                    return
-                fi
-            fi
-        done
-    }
-    local _allocated_ports=""
-
-    get_port_input() {
-        local proto_name=$1
-        local tag_name=$2
-        local default_port
-        default_port=$(get_free_port)
-        local port
-        while true; do
-            read -p "请输入 ${proto_name} 的端口 (当前默认随机: ${default_port}): " port
-            if [[ -z "$port" ]]; then
-                port=$default_port
-            fi
-            if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-                echo "输入错误！端口必须是 1 到 65535 之间的数字，请重新输入。"
-                continue
-            fi
-            # 排查在本次配置中已经占用
-            if echo -e "$_allocated_ports" | grep -q "^${port}$"; then
-                echo "该端口在本次配置中已分配，请重新输入。"
-                continue
-            fi
-            # 排查系统已被非当前 tag 的服务占用
-            if ss -tunlp | awk '{print $5}' | grep -oE '[0-9]+$' | grep -q "^${port}$"; then
-                local current_tag_port=$(jq -r --arg tag "$tag_name" '.inbounds[]? | select(.tag==$tag) | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-                if [[ "$port" != "$current_tag_port" ]]; then
-                    echo "该端口已被系统其他服务占用，请重新输入。"
-                    continue
-                fi
-            fi
-            _allocated_ports="${_allocated_ports}${port}\n"
-            echo "$port"
-            return
-        done
-    }
-
-    local port_vless="" port_vmess="" port_trojan="" port_hy2="" port_tuic="" port_anytls=""
-    echo ""
-    echo "=================================================="
-    echo "               配置节点监听端口"
-    echo "=================================================="
-    $add_vless && port_vless=$(get_port_input "VLESS-Reality-WARP" "vless-warp-in")
-    $add_vmess && port_vmess=$(get_port_input "VMess-WS-WARP" "vmess-warp-in")
-    $add_trojan && port_trojan=$(get_port_input "Trojan-WS-TLS-WARP" "trojan-tls-warp-in")
-    $add_hy2 && port_hy2=$(get_port_input "Hysteria2-WARP" "hy2-warp-in")
-    $add_tuic && port_tuic=$(get_port_input "TUIC-WARP" "tuic-warp-in")
-    $add_anytls && port_anytls=$(get_port_input "AnyTLS-WARP" "anytls-warp-in")
-
-    echo ""
-    echo "正在注入配置到 /etc/s-box/sb.json ..."
-    local temp_json=$(mktemp)
-    cp /etc/s-box/sb.json "$temp_json"
-
-    # 清理 outbounds 中可能残留的旧版错误 warp-out（兼容性修复）
-    if jq -e '.outbounds[]? | select(.tag=="warp-out")' "$temp_json" >/dev/null 2>&1; then
-        jq 'del(.outbounds[] | select(.tag=="warp-out"))' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-    fi
-
-    # 确保 endpoints 数组存在
-    if ! jq -e '.endpoints' "$temp_json" >/dev/null 2>&1; then
-        jq '. + {"endpoints": []}' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-    fi
-
-    # 在 endpoints 中创建或更新 warp-out（sing-box 1.11+ 使用 endpoints 定义 wireguard）
-    if ! jq -e '.endpoints[]? | select(.tag=="warp-out")' "$temp_json" >/dev/null 2>&1; then
-        jq --arg pvk "$WARP_PVK" --arg ipv6 "$WARP_IPV6" --argjson res "$WARP_RES" '
-            .endpoints += [{
-                "type": "wireguard",
-                "tag": "warp-out",
-                "address": ["172.16.0.2/32", ($ipv6 + "/128")],
-                "private_key": $pvk,
-                "peers": [{
-                    "address": "162.159.192.1",
-                    "port": 2408,
-                    "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                    "allowed_ips": ["0.0.0.0/0", "::/0"],
-                    "reserved": $res
-                }],
-                "mtu": 1280
-            }]
-        ' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-    else
-        jq --arg pvk "$WARP_PVK" --arg ipv6 "$WARP_IPV6" --argjson res "$WARP_RES" '
-            (.endpoints[] | select(.tag=="warp-out")) |= {
-                "type": "wireguard",
-                "tag": "warp-out",
-                "address": ["172.16.0.2/32", ($ipv6 + "/128")],
-                "private_key": $pvk,
-                "peers": [{
-                    "address": "162.159.192.1",
-                    "port": 2408,
-                    "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                    "allowed_ips": ["0.0.0.0/0", "::/0"],
-                    "reserved": $res
-                }],
-                "mtu": 1280
-            }
-        ' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-    fi
-
-    # 确保 route.rules 存在
-    if ! jq -e '.route' "$temp_json" >/dev/null 2>&1; then
-        jq '. + {"route": {"rules": []}}' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-    elif ! jq -e '.route.rules' "$temp_json" >/dev/null 2>&1; then
-        jq '.route.rules = []' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-    fi
-
-    add_warp_inbound() {
-        local proto_tag=$1
-        local warp_tag=$2
-        local port=$3
-        local inbound_json=$4
-
-        # 先删除已有的同 tag 入站（用于覆盖）
-        jq --arg tag "$warp_tag" 'del(.inbounds[] | select(.tag==$tag))' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-        # 添加入站
-        echo "$inbound_json" | jq -s '.[0]' > /tmp/warp_inbound.json
-        jq --slurpfile nb /tmp/warp_inbound.json '.inbounds += $nb' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-        rm -f /tmp/warp_inbound.json
-        # 添加路由规则（如果不存在）
-        if ! jq -e --arg tag "$warp_tag" '.route.rules[]? | select(.inbound[]? == $tag)' "$temp_json" >/dev/null 2>&1; then
-            jq --arg tag "$warp_tag" '.route.rules += [{"inbound": [$tag], "outbound": "warp-out"}]' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-        fi
-        echo "  ✓ ${warp_tag} → 端口 ${port}"
-    }
-
-    # ---- VLESS-Reality-WARP ----
-    if $add_vless; then
-        local port=$port_vless
-        local sni=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.server_name' /etc/s-box/sb.json)
-        local dest=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.reality.handshake.server' /etc/s-box/sb.json)
-        local dest_port=$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.reality.handshake.server_port' /etc/s-box/sb.json)
-        [[ -z "$sni" || "$sni" == "null" ]] && sni="apple.com"
-        [[ -z "$dest" || "$dest" == "null" ]] && dest="apple.com"
-        [[ -z "$dest_port" || "$dest_port" == "null" ]] && dest_port=443
-        local inbound=$(cat <<EOFJ
-{
-    "type": "vless",
-    "tag": "vless-warp-in",
-    "listen": "${LISTEN}",
-    "listen_port": ${port},
-    "users": [{"uuid": "${UUID}", "flow": "xtls-rprx-vision"}],
-    "tls": {
-        "enabled": true,
-        "server_name": "${sni}",
-        "reality": {
-            "enabled": true,
-            "handshake": {"server": "${dest}", "server_port": ${dest_port}},
-            "private_key": "${PVK}",
-            "short_id": ["${SHORT_ID}"]
-        }
-    }
-}
-EOFJ
-)
-        add_warp_inbound "vless-in" "vless-warp-in" "$port" "$inbound"
-    fi
-
-    # ---- VMess-WS-WARP ----
-    if $add_vmess; then
-        local port=$port_vmess
-        local ws_path=$(jq -r '.inbounds[] | select(.tag=="vmess-in") | .transport.path' /etc/s-box/sb.json)
-        [[ -z "$ws_path" || "$ws_path" == "null" ]] && ws_path="/${UUID}-vm-warp"
-        local warp_ws_path="${ws_path}-warp"
-        local inbound=$(cat <<EOFJ
-{
-    "type": "vmess",
-    "tag": "vmess-warp-in",
-    "listen": "${LISTEN}",
-    "listen_port": ${port},
-    "users": [{"uuid": "${UUID}", "alterId": 0}],
-    "transport": {"type": "ws", "path": "${warp_ws_path}"}
-}
-EOFJ
-)
-        add_warp_inbound "vmess-in" "vmess-warp-in" "$port" "$inbound"
-    fi
-
-    # ---- Trojan-WS-TLS-WARP ----
-    if $add_trojan; then
-        local port=$port_trojan
-        local tr_path=$(jq -r '.inbounds[] | select(.tag=="trojan-tls-in") | .transport.path' /etc/s-box/sb.json)
-        [[ -z "$tr_path" || "$tr_path" == "null" ]] && tr_path="/${UUID}-tr-warp"
-        local warp_tr_path="${tr_path}-warp"
-        local inbound=$(cat <<EOFJ
-{
-    "type": "trojan",
-    "tag": "trojan-tls-warp-in",
-    "listen": "${LISTEN}",
-    "listen_port": ${port},
-    "users": [{"password": "${UUID}"}],
-    "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-    },
-    "transport": {"type": "ws", "path": "${warp_tr_path}"}
-}
-EOFJ
-)
-        add_warp_inbound "trojan-tls-in" "trojan-tls-warp-in" "$port" "$inbound"
-    fi
-
-    # ---- Hysteria2-WARP ----
-    if $add_hy2; then
-        local port=$port_hy2
-        local inbound=$(cat <<EOFJ
-{
-    "type": "hysteria2",
-    "tag": "hy2-warp-in",
-    "listen": "${LISTEN}",
-    "listen_port": ${port},
-    "users": [{"password": "${UUID}"}],
-    "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-    }
-}
-EOFJ
-)
-        add_warp_inbound "hy2-in" "hy2-warp-in" "$port" "$inbound"
-    fi
-
-    # ---- TUIC-WARP ----
-    if $add_tuic; then
-        local port=$port_tuic
-        local inbound=$(cat <<EOFJ
-{
-    "type": "tuic",
-    "tag": "tuic-warp-in",
-    "listen": "${LISTEN}",
-    "listen_port": ${port},
-    "users": [{"uuid": "${UUID}", "password": "${UUID}"}],
-    "congestion_control": "bbr",
-    "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "alpn": ["h3"],
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-    }
-}
-EOFJ
-)
-        add_warp_inbound "tuic-in" "tuic-warp-in" "$port" "$inbound"
-    fi
-
-    # ---- AnyTLS-WARP ----
-    if $add_anytls; then
-        local port=$port_anytls
-        local inbound=$(cat <<EOFJ
-{
-    "type": "anytls",
-    "tag": "anytls-warp-in",
-    "listen": "${LISTEN}",
-    "listen_port": ${port},
-    "users": [{"password": "${UUID}"}],
-    "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-    }
-}
-EOFJ
-)
-        add_warp_inbound "anytls-in" "anytls-warp-in" "$port" "$inbound"
-    fi
-
-    # 写回并应用
-    cp "$temp_json" /etc/s-box/sb.json
-    rm -f "$temp_json"
-
-    echo ""
-    echo "正在校验配置并重启服务..."
-    if apply_changes; then
-        echo ""
-        echo "=================================================="
-        echo "WARP 出站节点追加并启动成功！已有直连节点完全保留不变。"
-        echo "=================================================="
-    else
-        echo ""
-        echo "=================================================="
-        echo "错误：配置校验失败或服务启动失败，请检查报错日志！"
-        echo "=================================================="
-    fi
-    read -p "按回车键继续..." temp
-}
-
-view_logs() {
-    while true; do
-        echo -e "\033[0;36m"
-        echo "    ______   ____     ____    ______     _    __   ____    ____ "
-        echo "   / ____/  / __ \   / __ \  / ____/    | |  / /  / __ \  / ___/ "
-        echo "  / /__    / /_/ /  / / / / / / __      | | / /  / /_/ /  \\__ \\  "
-        echo " / /___   / _, _/  / /_/ / / /_/ /      | |/ /  / ____/  ___/ /  "
-        echo "/_____/  /_/ |_|   \\____/  \\____/       |___/  /_/      /____/   "
-        echo -e "\033[0m"
-        echo "============================================================"
-        echo "  服务运行日志查看"
-        echo "============================================================"
-        echo "  1. 查看 sing-box 节点主进程日志"
-        echo "  2. 查看 cloudflared Argo 节点穿透日志"
-        echo "  3. 查看服务自愈守护日志"
+        clear
+        echo
+        green "============================================================"
+        green "  查看系统与服务运行日志"
+        green "============================================================"
+        echo
+        echo "  1. 查看 Sing-box 核心日志 (最近 30 行)"
+        echo "  2. 查看 Argo 隧道日志 (最近 30 行)"
+        echo "  3. 查看 Psiphon 赛风日志 (最近 30 行)"
+        echo "  4. 查看自愈守护 monitor.log"
         echo "------------------------------------------------------------"
         echo "  0. 返回主菜单"
         echo "============================================================"
-        read -p "请选择操作 [0-3]: " log_choice
-        case $log_choice in
+        reading "请选择 [0-4]: " choice
+        case "$choice" in
             1)
-                echo "========== sing-box 日志 (最近 30 行) =========="
-                if $IS_OPENRC || $IS_DIRECT; then
-                    tail -n 30 /var/log/sing-box.log 2>/dev/null
-                else
-                    journalctl -u sing-box -n 30 --no-pager
-                fi
-                echo "================================================="
-                read -p "按回车键继续..." temp
+                echo
+                green "========== Sing-box 运行日志 =========="
+                tail -n 30 /var/log/sing-box.log 2>/dev/null || journalctl -u sing-box -n 30 --no-pager 2>/dev/null || yellow "日志为空"
+                echo "======================================="
                 ;;
             2)
-                echo "========== Argo 穿透日志 (最近 30 行) =========="
-                if $IS_OPENRC || $IS_DIRECT; then
-                    tail -n 30 /var/log/argo-tunnel.log 2>/dev/null
-                else
-                    journalctl -u argo-tunnel -n 30 --no-pager
-                fi
-                echo "================================================="
-                read -p "按回车键继续..." temp
+                echo
+                green "========== Argo 隧道日志 =========="
+                tail -n 30 /var/log/argo-tunnel.log 2>/dev/null || journalctl -u argo-tunnel -n 30 --no-pager 2>/dev/null || yellow "日志为空"
+                echo "==================================="
                 ;;
             3)
-                echo "========== 自愈守护日志 (最近 30 行) =========="
-                if [[ -f /etc/s-box/monitor.log ]]; then
-                    tail -n 30 /etc/s-box/monitor.log 2>/dev/null
-                else
-                    echo "暂无自愈守护日志。"
-                fi
-                echo "================================================="
-                read -p "按回车键继续..." temp
-                ;;
-            0)
-                break
-                ;;
-            *)
-                echo "无效选项！"
-                ;;
-        esac
-    done
-}
-
-# ------------------------------------------------------------
-# 解析多协议节点链接并生成 Sing-box 规范的 Outbound JSON
-# ------------------------------------------------------------
-parse_proxy_link() {
-    local link="$1"
-    local tag="$2"
-    local json=""
-
-    # 过滤与去除两头空白
-    link=$(echo "$link" | awk '{$1=$1;print}')
-    [[ -z "$link" ]] && return 1
-
-    if [[ "$link" =~ ^vless:// ]]; then
-        local main_part="${link#vless://}"
-        local remark=""
-        if [[ "$main_part" =~ \# ]]; then
-            remark="${main_part#*#}"
-            main_part="${main_part%%#*}"
-        fi
-        local user_host="${main_part%%\?*}"
-        local query=""
-        if [[ "$main_part" =~ \? ]]; then
-            query="${main_part#*\?}"
-        fi
-
-        local uuid="${user_host%%@*}"
-        local host_port="${user_host#*@}"
-        local server="" port=443
-        if [[ "$host_port" =~ ^\[(.*)\]:(.*)$ ]]; then
-            server="${BASH_REMATCH[1]}"
-            port="${BASH_REMATCH[2]}"
-        elif [[ "$host_port" =~ : ]]; then
-            server="${host_port%%:*}"
-            port="${host_port##*:}"
-        else
-            server="$host_port"
-        fi
-
-        local sni="" pbk="" sid="" flow="" security="" type="tcp" path=""
-        local IFS='&'
-        for param in $query; do
-            case "$param" in
-                sni=*) sni="${param#sni=}" ;;
-                pbk=*) pbk="${param#pbk=}" ;;
-                sid=*) sid="${param#sid=}" ;;
-                flow=*) flow="${param#flow=}" ;;
-                security=*) security="${param#security=}" ;;
-                type=*) type="${param#type=}" ;;
-                path=*) path="${param#path=}" ;;
-            esac
-        done
-
-        local tls_block='{"enabled": false}'
-        if [[ "$security" == "reality" ]]; then
-            tls_block=$(cat <<EOF2
-{
-  "enabled": true,
-  "server_name": "${sni:-apple.com}",
-  "reality": {
-    "enabled": true,
-    "public_key": "${pbk}",
-    "short_id": "${sid}"
-  }
-}
-EOF2
-)
-        elif [[ "$security" == "tls" ]]; then
-            tls_block=$(cat <<EOF2
-{
-  "enabled": true,
-  "server_name": "${sni:-${server}}"
-}
-EOF2
-)
-        fi
-
-        local transport_block=""
-        if [[ "$type" == "ws" ]]; then
-            transport_block=", \"transport\": {\"type\": \"ws\", \"path\": \"${path:-/}\"}"
-        fi
-
-        local flow_line=""
-        if [[ -n "$flow" ]]; then
-            flow_line=", \"flow\": \"${flow}\""
-        fi
-
-        json=$(cat <<EOF2
-{
-  "type": "vless",
-  "tag": "${tag}",
-  "server": "${server}",
-  "server_port": ${port},
-  "uuid": "${uuid}"${flow_line}${transport_block},
-  "tls": ${tls_block}
-}
-EOF2
-)
-    elif [[ "$link" =~ ^vmess:// ]]; then
-        local b64="${link#vmess://}"
-        b64="${b64%%#*}"
-        local decoded
-        decoded=$(echo "$b64" | base64 -d 2>/dev/null || echo "$b64" | base64 --decode 2>/dev/null)
-        if [[ -n "$decoded" ]] && printf '%s' "$decoded" | command jq -e . >/dev/null 2>&1; then
-            local add port id net path host tls scy
-            add=$(echo "$decoded" | command jq -r '.add // empty')
-            port=$(echo "$decoded" | command jq -r '.port // 443')
-            id=$(echo "$decoded" | command jq -r '.id // empty')
-            net=$(echo "$decoded" | command jq -r '.net // "ws"')
-            path=$(echo "$decoded" | command jq -r '.path // "/"')
-            host=$(echo "$decoded" | command jq -r '.host // ""')
-            tls=$(echo "$decoded" | command jq -r '.tls // "none"')
-            scy=$(echo "$decoded" | command jq -r '.scy // "auto"')
-
-            local tls_block='{"enabled": false}'
-            if [[ "$tls" == "tls" ]]; then
-                tls_block="{\"enabled\": true, \"server_name\": \"${host:-$add}\"}"
-            fi
-
-            local host_line=""
-            if [[ -n "$host" ]]; then
-                host_line=", \"headers\": {\"Host\": \"${host}\"}"
-            fi
-
-            json=$(cat <<EOF2
-{
-  "type": "vmess",
-  "tag": "${tag}",
-  "server": "${add}",
-  "server_port": ${port},
-  "uuid": "${id}",
-  "security": "${scy}",
-  "transport": {
-    "type": "${net}",
-    "path": "${path}"${host_line}
-  },
-  "tls": ${tls_block}
-}
-EOF2
-)
-        fi
-    elif [[ "$link" =~ ^trojan:// ]]; then
-        local main_part="${link#trojan://}"
-        main_part="${main_part%%#*}"
-        local pass_host="${main_part%%\?*}"
-        local query=""
-        if [[ "$main_part" =~ \? ]]; then
-            query="${main_part#*\?}"
-        fi
-
-        local pass="${pass_host%%@*}"
-        local host_port="${pass_host#*@}"
-        local server="" port=443
-        if [[ "$host_port" =~ : ]]; then
-            server="${host_port%%:*}"
-            port="${host_port##*:}"
-        else
-            server="$host_port"
-        fi
-
-        local sni="" type="ws" path="/"
-        local IFS='&'
-        for param in $query; do
-            case "$param" in
-                sni=*) sni="${param#sni=}" ;;
-                type=*) type="${param#type=}" ;;
-                path=*) path="${param#path=}" ;;
-            esac
-        done
-
-        json=$(cat <<EOF2
-{
-  "type": "trojan",
-  "tag": "${tag}",
-  "server": "${server}",
-  "server_port": ${port},
-  "password": "${pass}",
-  "tls": {
-    "enabled": true,
-    "server_name": "${sni:-$server}",
-    "insecure": true
-  },
-  "transport": {
-    "type": "${type}",
-    "path": "${path}"
-  }
-}
-EOF2
-)
-    elif [[ "$link" =~ ^(hysteria2|hy2):// ]]; then
-        local main_part=""
-        if [[ "$link" =~ ^hysteria2:// ]]; then
-            main_part="${link#hysteria2://}"
-        else
-            main_part="${link#hy2://}"
-        fi
-        main_part="${main_part%%#*}"
-        local pass_host="${main_part%%\?*}"
-        local query=""
-        if [[ "$main_part" =~ \? ]]; then
-            query="${main_part#*\?}"
-        fi
-
-        local pass="${pass_host%%@*}"
-        local host_port="${pass_host#*@}"
-        local server="" port=443
-        if [[ "$host_port" =~ : ]]; then
-            server="${host_port%%:*}"
-            port="${host_port##*:}"
-        else
-            server="$host_port"
-        fi
-
-        local sni="" insecure=true
-        local IFS='&'
-        for param in $query; do
-            case "$param" in
-                sni=*) sni="${param#sni=}" ;;
-                insecure=*) [[ "${param#insecure=}" == "0" ]] && insecure=false ;;
-            esac
-        done
-
-        json=$(cat <<EOF2
-{
-  "type": "hysteria2",
-  "tag": "${tag}",
-  "server": "${server}",
-  "server_port": ${port},
-  "password": "${pass}",
-  "tls": {
-    "enabled": true,
-    "server_name": "${sni:-bing.com}",
-    "insecure": ${insecure}
-  }
-}
-EOF2
-)
-    elif [[ "$link" =~ ^tuic:// ]]; then
-        local main_part="${link#tuic://}"
-        main_part="${main_part%%#*}"
-        local user_host="${main_part%%\?*}"
-        local query=""
-        if [[ "$main_part" =~ \? ]]; then
-            query="${main_part#*\?}"
-        fi
-
-        local creds="${user_host%%@*}"
-        local host_port="${user_host#*@}"
-        local uuid="${creds%%:*}"
-        local pass="${creds#*:}"
-        local server="" port=8443
-        if [[ "$host_port" =~ : ]]; then
-            server="${host_port%%:*}"
-            port="${host_port##*:}"
-        else
-            server="$host_port"
-        fi
-
-        local sni="" congestion="bbr"
-        local IFS='&'
-        for param in $query; do
-            case "$param" in
-                sni=*) sni="${param#sni=}" ;;
-                congestion_control=*) congestion="${param#congestion_control=}" ;;
-            esac
-        done
-
-        json=$(cat <<EOF2
-{
-  "type": "tuic",
-  "tag": "${tag}",
-  "server": "${server}",
-  "server_port": ${port},
-  "uuid": "${uuid}",
-  "password": "${pass}",
-  "congestion_control": "${congestion}",
-  "tls": {
-    "enabled": true,
-    "server_name": "${sni:-bing.com}",
-    "insecure": true
-  }
-}
-EOF2
-)
-    elif [[ "$link" =~ ^ss:// ]]; then
-        local main_part="${link#ss://}"
-        main_part="${main_part%%#*}"
-        local method="" pass="" server="" port=8388
-
-        if [[ "$main_part" =~ @ ]]; then
-            local b64_user="${main_part%%@*}"
-            local host_port="${main_part#*@}"
-            if [[ "$host_port" =~ : ]]; then
-                server="${host_port%%:*}"
-                port="${host_port##*:}"
-            fi
-            local user_dec
-            user_dec=$(echo "$b64_user" | base64 -d 2>/dev/null || echo "$b64_user" | base64 --decode 2>/dev/null)
-            if [[ "$user_dec" =~ : ]]; then
-                method="${user_dec%%:*}"
-                pass="${user_dec#*:}"
-            fi
-        else
-            local dec
-            dec=$(echo "$main_part" | base64 -d 2>/dev/null || echo "$main_part" | base64 --decode 2>/dev/null)
-            if [[ "$dec" =~ (.*):(.*)@(.*):([0-9]+) ]]; then
-                method="${BASH_REMATCH[1]}"
-                pass="${BASH_REMATCH[2]}"
-                server="${BASH_REMATCH[3]}"
-                port="${BASH_REMATCH[4]}"
-            fi
-        fi
-
-        if [[ -n "$server" && -n "$method" && -n "$pass" ]]; then
-            json=$(cat <<EOF2
-{
-  "type": "shadowsocks",
-  "tag": "${tag}",
-  "server": "${server}",
-  "server_port": ${port},
-  "method": "${method}",
-  "password": "${pass}"
-}
-EOF2
-)
-        fi
-    fi
-
-    if [[ -n "$json" ]]; then
-        printf '%s' "$json"
-        return 0
-    else
-        return 1
-    fi
-}
-
-# ------------------------------------------------------------
-# 快捷新建自定义入站节点并绑定指定出站 (例如新建 Hy2 入站)
-# ------------------------------------------------------------
-add_custom_inbound() {
-    if [[ ! -f /etc/s-box/sb.json ]]; then
-        echo "错误：配置文件 /etc/s-box/sb.json 不存在！"
-        return 1
-    fi
-
-    echo "=================================================="
-    echo "       新建自定义入站节点并绑定指定出站"
-    echo "=================================================="
-    echo "请选择要新建的入站协议："
-    echo "1. Hysteria2 (Hy2)"
-    echo "2. VLESS-Reality"
-    echo "3. VMess-WS"
-    echo "4. Trojan-WS-TLS"
-    echo "5. TUIC v5"
-    echo "6. AnyTLS"
-    echo "0. 取消"
-    echo "=================================================="
-    read -p "请选择协议 [0-6]: " proto_sel
-
-    local proto="" tag_prefix=""
-    case "$proto_sel" in
-        1) proto="hysteria2"; tag_prefix="hy2-custom-in" ;;
-        2) proto="vless"; tag_prefix="vless-custom-in" ;;
-        3) proto="vmess"; tag_prefix="vmess-custom-in" ;;
-        4) proto="trojan"; tag_prefix="trojan-custom-in" ;;
-        5) proto="tuic"; tag_prefix="tuic-custom-in" ;;
-        6) proto="anytls"; tag_prefix="anytls-custom-in" ;;
-        0|*) return 0 ;;
-    esac
-
-    read -p "请输入新建入站节点的 Tag 名称 [默认 ${tag_prefix}]: " in_tag
-    [[ -z "$in_tag" ]] && in_tag="${tag_prefix}-$(date +%s)"
-
-    if command jq -e --arg tag "$in_tag" '.inbounds[]? | select(.tag==$tag)' /etc/s-box/sb.json >/dev/null 2>&1; then
-        echo "错误：入站 Tag [$in_tag] 已存在！"
-        read -p "按回车键继续..." temp
-        return 1
-    fi
-
-    # 询问监听端口 (NAT VPS 手动输入)
-    local listen_port=""
-    while true; do
-        read -p "请输入该入站节点的监听端口 (NAT VPS 请手动指定可用放行端口): " listen_port
-        if [[ "$listen_port" =~ ^[0-9]+$ ]] && [ "$listen_port" -ge 1 ] && [ "$listen_port" -le 65535 ]; then
-            if ss -tunlp | grep -q ":$listen_port "; then
-                echo "错误：端口 $listen_port 已被系统其他进程占用，请重新输入！"
-            else
-                break
-            fi
-        else
-            echo "输入无效，请输入 1-65535 之间的数字！"
-        fi
-    done
-
-    # 密码/UUID 逻辑
-    local uuid_val=""
-    read -p "请输入 通用密码/UUID (留空自动生成): " uuid_val
-    if [[ -z "$uuid_val" ]]; then
-        uuid_val=$(/etc/s-box/sing-box generate uuid 2>/dev/null || openssl rand -hex 16)
-    fi
-
-    # 选择绑定的出站
-    echo ""
-    echo "请选择该新建入站绑定的目标出站 (Outbound)："
-    local out_tags=("direct")
-    echo "  1. direct (默认直连)"
-    local out_idx=2
-    while read -r tag; do
-        [[ -n "$tag" ]] || continue
-        out_tags+=("$tag")
-        echo "  ${out_idx}. ${tag}"
-        ((out_idx++))
-    done < <(command jq -r '.outbounds[] | select(.tag != "direct" and .tag != "block" and .tag != "dns") | .tag' /etc/s-box/sb.json 2>/dev/null)
-
-    read -p "请选择目标出站编号 [1-${#out_tags[@]}]: " sel_out_idx
-    if ! [[ "$sel_out_idx" =~ ^[0-9]+$ ]] || [ "$sel_out_idx" -lt 1 ] || [ "$sel_out_idx" -gt "${#out_tags[@]}" ]; then
-        echo "输入无效！"
-        return 1
-    fi
-    local target_outbound="${out_tags[$((sel_out_idx-1))]}"
-
-    # 获取服务器公网 IP
-    local ip=$(curl -s4m5 icanhazip.com || curl -s4m5 api.ipify.org || curl -s6m5 icanhazip.com)
-    local public_key=""
-    [[ -f /etc/s-box/public.key ]] && public_key=$(cat /etc/s-box/public.key | tr -d '\r\n')
-    local short_id=$(command jq -r '.inbounds[]? | select(.tag=="vless-in") | .tls.reality.short_id[0] // empty' /etc/s-box/sb.json 2>/dev/null)
-    [[ -z "$short_id" ]] && short_id=$(openssl rand -hex 8)
-
-    local inbound_json="" share_link=""
-    case "$proto" in
-        hysteria2)
-            inbound_json=$(cat <<EOF2
-{
-  "type": "hysteria2",
-  "tag": "${in_tag}",
-  "listen": "0.0.0.0",
-  "listen_port": ${listen_port},
-  "users": [{"password": "${uuid_val}"}],
-  "tls": {
-    "enabled": true,
-    "alpn": ["h3"],
-    "certificate_path": "/etc/s-box/cert.pem",
-    "key_path": "/etc/s-box/private.key"
-  }
-}
-EOF2
-)
-            share_link="hysteria2://${uuid_val}@${ip}:${listen_port}?insecure=1&sni=www.bing.com#${in_tag}"
-            ;;
-        vless)
-            local private_key=$(command jq -r '[.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key][0]' /etc/s-box/sb.json 2>/dev/null)
-            if [[ -z "$private_key" || "$private_key" == "null" ]]; then
-                local reality_keys=$(/etc/s-box/sing-box generate reality-keypair 2>/dev/null)
-                private_key=$(echo "$reality_keys" | awk '/PrivateKey/{print $2}')
-                public_key=$(echo "$reality_keys" | awk '/PublicKey/{print $2}')
-            fi
-            inbound_json=$(cat <<EOF2
-{
-  "type": "vless",
-  "tag": "${in_tag}",
-  "listen": "0.0.0.0",
-  "listen_port": ${listen_port},
-  "users": [{"uuid": "${uuid_val}", "flow": "xtls-rprx-vision"}],
-  "tls": {
-    "enabled": true,
-    "server_name": "apple.com",
-    "reality": {
-      "enabled": true,
-      "handshake": {"server": "apple.com", "server_port": 443},
-      "private_key": "${private_key}",
-      "short_id": ["${short_id}"]
-    }
-  }
-}
-EOF2
-)
-            share_link="vless://${uuid_val}@${ip}:${listen_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=apple.com&fp=chrome&pbk=${public_key}&sid=${short_id}#${in_tag}"
-            ;;
-        vmess)
-            inbound_json=$(cat <<EOF2
-{
-  "type": "vmess",
-  "tag": "${in_tag}",
-  "listen": "0.0.0.0",
-  "listen_port": ${listen_port},
-  "users": [{"uuid": "${uuid_val}", "alterId": 0}],
-  "transport": {"type": "ws", "path": "/${uuid_val}-custom-vm"}
-}
-EOF2
-)
-            local vmess_json=$(cat <<EOF2
-{
-  "v": "2",
-  "ps": "${in_tag}",
-  "add": "${ip}",
-  "port": "${listen_port}",
-  "id": "${uuid_val}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "",
-  "path": "/${uuid_val}-custom-vm",
-  "tls": "none"
-}
-EOF2
-)
-            share_link=$(make_vmess_link "$vmess_json")
-            ;;
-        trojan)
-            inbound_json=$(cat <<EOF2
-{
-  "type": "trojan",
-  "tag": "${in_tag}",
-  "listen": "0.0.0.0",
-  "listen_port": ${listen_port},
-  "users": [{"password": "${uuid_val}"}],
-  "tls": {
-    "enabled": true,
-    "server_name": "www.bing.com",
-    "certificate_path": "/etc/s-box/cert.pem",
-    "key_path": "/etc/s-box/private.key"
-  },
-  "transport": {"type": "ws", "path": "/${uuid_val}-custom-tr"}
-}
-EOF2
-)
-            local path_enc=$(url_encode "/${uuid_val}-custom-tr")
-            share_link="trojan://${uuid_val}@${ip}:${listen_port}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=${path_enc}#${in_tag}"
-            ;;
-        tuic)
-            inbound_json=$(cat <<EOF2
-{
-  "type": "tuic",
-  "tag": "${in_tag}",
-  "listen": "0.0.0.0",
-  "listen_port": ${listen_port},
-  "users": [{"uuid": "${uuid_val}", "password": "${uuid_val}"}],
-  "congestion_control": "bbr",
-  "tls": {
-    "enabled": true,
-    "alpn": ["h3"],
-    "certificate_path": "/etc/s-box/cert.pem",
-    "key_path": "/etc/s-box/private.key"
-  }
-}
-EOF2
-)
-            share_link="tuic://${uuid_val}:${uuid_val}@${ip}:${listen_port}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#${in_tag}"
-            ;;
-        anytls)
-            inbound_json=$(cat <<EOF2
-{
-  "type": "anytls",
-  "tag": "${in_tag}",
-  "listen": "0.0.0.0",
-  "listen_port": ${listen_port},
-  "users": [{"password": "${uuid_val}"}],
-  "tls": {
-    "enabled": true,
-    "server_name": "www.bing.com",
-    "certificate_path": "/etc/s-box/cert.pem",
-    "key_path": "/etc/s-box/private.key"
-  }
-}
-EOF2
-)
-            share_link="anytls://${uuid_val}@${ip}:${listen_port}?security=tls&sni=www.bing.com&allowInsecure=1#${in_tag}"
-            ;;
-    esac
-
-    # 写入 sb.json
-    local temp_json=$(mktemp)
-    echo "$inbound_json" > /tmp/inbound_add.json
-    command jq --slurpfile ib /tmp/inbound_add.json '.inbounds += $ib' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-    rm -f /tmp/inbound_add.json
-
-    # 添加路由规则
-    if [[ "$target_outbound" != "direct" ]]; then
-        command jq --arg in_tag "$in_tag" --arg out_tag "$target_outbound" '
-            if .route.rules then
-                .route.rules += [{"inbound": [$in_tag], "outbound": $out_tag}]
-            else
-                .route.rules = [{"inbound": [$in_tag], "outbound": $out_tag}]
-            fi
-        ' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-    fi
-
-    echo ""
-    echo "=================================================="
-    echo "新建入站节点 [$in_tag] 成功！"
-    echo "监听端口: ${listen_port}"
-    echo "绑定出口: ${target_outbound}"
-    echo "--------------------------------------------------"
-    echo "节点分享链接："
-    echo "${share_link}"
-    echo "=================================================="
-
-    apply_changes
-    read -p "按回车键继续..." temp
-}
-
-# ------------------------------------------------------------
-# 查看与删除指定的本地入站节点 (Inbound)
-# ------------------------------------------------------------
-delete_custom_inbound() {
-    if [[ ! -f /etc/s-box/sb.json ]]; then
-        echo "错误：配置文件 /etc/s-box/sb.json 不存在！"
-        return 1
-    fi
-
-    echo "=================================================="
-    echo "          查看/删除指定的本地入站节点"
-    echo "=================================================="
-    local in_tags=()
-    local idx=1
-    while read -r line; do
-        [[ -n "$line" ]] || continue
-        local tag proto port
-        tag=$(echo "$line" | awk -F'|' '{print $1}')
-        proto=$(echo "$line" | awk -F'|' '{print $2}')
-        port=$(echo "$line" | awk -F'|' '{print $3}')
-        in_tags+=("$tag")
-        echo "${idx}. Tag: ${tag} | 协议: ${proto} | 监听端口: ${port:-N/A}"
-        ((idx++))
-    done < <(command jq -r '.inbounds[]? | .tag + "|" + .type + "|" + ((.listen_port // "") | tostring)' /etc/s-box/sb.json 2>/dev/null)
-
-    if [[ ${#in_tags[@]} -eq 0 ]]; then
-        echo "当前没有配置任何本地入站节点。"
-        read -p "按回车键继续..." temp
-        return 0
-    fi
-
-    echo "--------------------------------------------------"
-    read -p "请选择要删除的入站节点编号 [1-${#in_tags[@]}, 输入0返回]: " del_idx
-    if [[ "$del_idx" == "0" || -z "$del_idx" ]]; then
-        return 0
-    fi
-
-    if [[ "$del_idx" =~ ^[0-9]+$ ]] && [ "$del_idx" -ge 1 ] && [ "$del_idx" -le "${#in_tags[@]}" ]; then
-        local target_tag="${in_tags[$((del_idx-1))]}"
-        local temp_json=$(mktemp)
-        # 从 inbounds 数组中删除该 tag 的对象，并清理关联的 route.rules
-        command jq --arg tag "$target_tag" '
-            del(.inbounds[]? | select(.tag==$tag)) |
-            if .route.rules then
-                .route.rules |= map(select(.inbound != [$tag]))
-            else . end
-        ' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-
-        echo "入站节点 [$target_tag] 已成功删除，并已自动清理关联的路由绑定！"
-        apply_changes
-    else
-        echo "输入无效！"
-    fi
-    read -p "按回车键继续..." temp
-}
-
-# ------------------------------------------------------------
-# 13. 自定义代理出站多出口路由管理
-# ------------------------------------------------------------
-manage_custom_outbounds() {
-    if [[ ! -f /etc/s-box/sb.json ]]; then
-        echo "错误：配置文件 /etc/s-box/sb.json 不存在！"
-        read -p "按回车键继续..." temp
-        return 1
-    fi
-
-    while true; do
-        echo "=================================================="
-        echo "       自定义代理出站多出口路由管理"
-        echo "=================================================="
-        echo "提示：普通 NAT VPS 端口由您自主管理，无须向面板申请！"
-        echo "--------------------------------------------------"
-        echo "1. 添加外部代理出站节点 (支持粘贴链接或手动配置)"
-        echo "2. 查看已添加的外部代理出站节点"
-        echo "3. 删除指定的外部代理出站节点 (Outbound)"
-        echo "4. 快捷新建本地入站节点 (支持 Hy2/VLESS/VMess 等) 并绑定出口"
-        echo "5. 查看/删除指定的本地入站节点 (Inbound)"
-        echo "6. 自定义多出口路由分流管理 (将已有入站 绑定 至选定出站)"
-        echo "0. 返回主菜单"
-        echo "=================================================="
-        read -p "请选择操作 [0-6]: " out_choice
-
-        case "$out_choice" in
-            1)
-                echo "--------------------------------------------------"
-                echo "请选择添加方式："
-                echo "1. 复制粘贴节点链接 (支持 vless/vmess/trojan/hy2/tuic/ss)"
-                echo "2. 手动配置外部代理节点参数"
-                echo "--------------------------------------------------"
-                read -p "请选择 [1-2, 默认1]: " add_type
-                [[ -z "$add_type" ]] && add_type="1"
-
-                if [[ "$add_type" == "1" ]]; then
-                    read -p "请输入节点自定义标签/名称 (例如 outbound-us-01): " node_tag
-                    if [[ -z "$node_tag" ]]; then
-                        node_tag="outbound-$(date +%s)"
-                    fi
-
-                    # 防重名校验
-                    if command jq -e --arg tag "$node_tag" '.outbounds[] | select(.tag==$tag)' /etc/s-box/sb.json >/dev/null 2>&1; then
-                        echo "错误：标签 $node_tag 已存在！"
-                        read -p "按回车键继续..." temp
-                        continue
-                    fi
-
-                    read -p "请粘贴节点链接 (vless/vmess/trojan/hy2/tuic/ss): " raw_link
-                    local out_json
-                    out_json=$(parse_proxy_link "$raw_link" "$node_tag")
-                    if [[ -z "$out_json" ]]; then
-                        echo "错误：节点链接解析失败，请检查链接格式是否规范！"
-                        read -p "按回车键继续..." temp
-                        continue
-                    fi
-
-                    local temp_json=$(mktemp)
-                    echo "$out_json" > /tmp/outbound_add.json
-                    if command jq --slurpfile ob /tmp/outbound_add.json '.outbounds += $ob' /etc/s-box/sb.json > "$temp_json"; then
-                        mv "$temp_json" /etc/s-box/sb.json
-                        rm -f /tmp/outbound_add.json
-                        echo "外部代理节点 [$node_tag] 添加成功！"
-                        apply_changes
-                    else
-                        rm -f "$temp_json" /tmp/outbound_add.json
-                        echo "写入配置失败！"
-                    fi
-                else
-                    read -p "请输入节点标签 (例如 outbound-us): " node_tag
-                    [[ -z "$node_tag" ]] && node_tag="outbound-$(date +%s)"
-                    read -p "请输入协议类型 (vless/vmess/trojan/hysteria2/shadowsocks): " proto_type
-                    read -p "请输入目标服务器 IP/域名: " server_addr
-                    read -p "请输入目标服务器 端口: " server_port
-                    read -p "请输入 密码/UUID: " node_pass
-
-                    if [[ -z "$proto_type" || -z "$server_addr" || -z "$server_port" || -z "$node_pass" ]]; then
-                        echo "错误：关键字段不能为空！"
-                        read -p "按回车键继续..." temp
-                        continue
-                    fi
-
-                    local out_json=""
-                    case "$proto_type" in
-                        vless)
-                            out_json=$(cat <<EOF2
-{
-  "type": "vless",
-  "tag": "${node_tag}",
-  "server": "${server_addr}",
-  "server_port": ${server_port},
-  "uuid": "${node_pass}",
-  "tls": {"enabled": false}
-}
-EOF2
-)
-                            ;;
-                        vmess)
-                            out_json=$(cat <<EOF2
-{
-  "type": "vmess",
-  "tag": "${node_tag}",
-  "server": "${server_addr}",
-  "server_port": ${server_port},
-  "uuid": "${node_pass}",
-  "security": "auto",
-  "transport": {"type": "ws", "path": "/"},
-  "tls": {"enabled": false}
-}
-EOF2
-)
-                            ;;
-                        trojan)
-                            out_json=$(cat <<EOF2
-{
-  "type": "trojan",
-  "tag": "${node_tag}",
-  "server": "${server_addr}",
-  "server_port": ${server_port},
-  "password": "${node_pass}",
-  "tls": {"enabled": true, "insecure": true}
-}
-EOF2
-)
-                            ;;
-                        hysteria2|hy2)
-                            out_json=$(cat <<EOF2
-{
-  "type": "hysteria2",
-  "tag": "${node_tag}",
-  "server": "${server_addr}",
-  "server_port": ${server_port},
-  "password": "${node_pass}",
-  "tls": {"enabled": true, "insecure": true}
-}
-EOF2
-)
-                            ;;
-                        shadowsocks|ss)
-                            read -p "请输入 加密方式 (默认 aes-128-gcm): " ss_method
-                            [[ -z "$ss_method" ]] && ss_method="aes-128-gcm"
-                            out_json=$(cat <<EOF2
-{
-  "type": "shadowsocks",
-  "tag": "${node_tag}",
-  "server": "${server_addr}",
-  "server_port": ${server_port},
-  "method": "${ss_method}",
-  "password": "${node_pass}"
-}
-EOF2
-)
-                            ;;
-                        *)
-                            echo "暂不支持的协议类型！"
-                            read -p "按回车键继续..." temp
-                            continue
-                            ;;
-                    esac
-
-                    local temp_json=$(mktemp)
-                    echo "$out_json" > /tmp/outbound_add.json
-                    if command jq --slurpfile ob /tmp/outbound_add.json '.outbounds += $ob' /etc/s-box/sb.json > "$temp_json"; then
-                        mv "$temp_json" /etc/s-box/sb.json
-                        rm -f /tmp/outbound_add.json
-                        echo "外部代理节点 [$node_tag] 添加成功！"
-                        apply_changes
-                    else
-                        rm -f "$temp_json" /tmp/outbound_add.json
-                        echo "写入配置失败！"
-                    fi
-                fi
-                read -p "按回车键继续..." temp
-                ;;
-            2)
-                echo "========== 当前外部代理出站节点列表 =========="
-                command jq -r '
-                    .outbounds[]
-                    | select(.tag != "direct" and .tag != "warp-out" and .tag != "block" and .tag != "dns")
-                    | "标签: " + .tag + " | 协议: " + .type + " | 服务器: " + (.server // "N/A") + ":" + ((.server_port // "") | tostring)
-                ' /etc/s-box/sb.json 2>/dev/null
-                echo "================================================="
-                read -p "按回车键继续..." temp
-                ;;
-            3)
-                echo "========== 当前可删除的外部代理出站 =========="
-                local custom_tags=()
-                local idx=1
-                while read -r tag; do
-                    [[ -n "$tag" ]] || continue
-                    custom_tags+=("$tag")
-                    echo "${idx}. ${tag}"
-                    ((idx++))
-                done < <(command jq -r '.outbounds[] | select(.tag != "direct" and .tag != "warp-out" and .tag != "block" and .tag != "dns") | .tag' /etc/s-box/sb.json 2>/dev/null)
-
-                if [[ ${#custom_tags[@]} -eq 0 ]]; then
-                    echo "暂无任何自定义外部代理出站节点。"
-                    read -p "按回车键继续..." temp
-                    continue
-                fi
-
-                read -p "请选择要删除的节点编号 [1-${#custom_tags[@]}]: " del_idx
-                if [[ "$del_idx" =~ ^[0-9]+$ ]] && [ "$del_idx" -ge 1 ] && [ "$del_idx" -le "${#custom_tags[@]}" ]; then
-                    local target_tag="${custom_tags[$((del_idx-1))]}"
-                    local temp_json=$(mktemp)
-                    # 删除 outbound 并删除 route 规则中依赖该 outbound 的规则
-                    command jq --arg tag "$target_tag" '
-                        del(.outbounds[] | select(.tag==$tag)) |
-                        if .route.rules then
-                            .route.rules |= map(select(.outbound != $tag))
-                        else . end
-                    ' /etc/s-box/sb.json > "$temp_json" && mv "$temp_json" /etc/s-box/sb.json
-                    echo "节点 [$target_tag] 已成功删除并清理关联路由！"
-                    apply_changes
-                else
-                    echo "输入无效！"
-                fi
-                read -p "按回车键继续..." temp
+                echo
+                green "========== Psiphon 赛风日志 =========="
+                tail -n 30 "$WORKDIR/psiphon.log" 2>/dev/null || yellow "日志为空"
+                echo "======================================"
                 ;;
             4)
-                add_custom_inbound
+                echo
+                green "========== 自愈守护任务日志 =========="
+                tail -n 30 /etc/s-box/monitor.log 2>/dev/null || yellow "日志为空"
+                echo "======================================"
                 ;;
-            5)
-                delete_custom_inbound
-                ;;
-            6)
-                echo "========== 多出口路由绑定分流管理 =========="
-                echo "可用入站 (Inbounds):"
-                local in_tags=()
-                local in_idx=1
-                while read -r tag; do
-                    [[ -n "$tag" ]] || continue
-                    in_tags+=("$tag")
-                    echo "  ${in_idx}. ${tag}"
-                    ((in_idx++))
-                done < <(command jq -r '.inbounds[]?.tag' /etc/s-box/sb.json 2>/dev/null)
-
-                if [[ ${#in_tags[@]} -eq 0 ]]; then
-                    echo "当前没有配置任何入站节点。"
-                    read -p "按回车键继续..." temp
-                    continue
-                fi
-
-                read -p "请选择需要绑定出口的入站编号 [1-${#in_tags[@]}]: " sel_in_idx
-                if ! [[ "$sel_in_idx" =~ ^[0-9]+$ ]] || [ "$sel_in_idx" -lt 1 ] || [ "$sel_in_idx" -gt "${#in_tags[@]}" ]; then
-                    echo "输入无效！"
-                    read -p "按回车键继续..." temp
-                    continue
-                fi
-                local target_inbound="${in_tags[$((sel_in_idx-1))]}"
-
-                echo ""
-                echo "可用出站出口 (Outbounds):"
-                local out_tags=("direct")
-                echo "  1. direct (默认直连)"
-                local out_idx=2
-                while read -r tag; do
-                    [[ -n "$tag" ]] || continue
-                    out_tags+=("$tag")
-                    echo "  ${out_idx}. ${tag}"
-                    ((out_idx++))
-                done < <(command jq -r '.outbounds[] | select(.tag != "direct" and .tag != "block" and .tag != "dns") | .tag' /etc/s-box/sb.json 2>/dev/null)
-
-                read -p "请选择 [$target_inbound] 指定路由的出口编号 [1-${#out_tags[@]}]: " sel_out_idx
-                if ! [[ "$sel_out_idx" =~ ^[0-9]+$ ]] || [ "$sel_out_idx" -lt 1 ] || [ "$sel_out_idx" -gt "${#out_tags[@]}" ]; then
-                    echo "输入无效！"
-                    read -p "按回车键继续..." temp
-                    continue
-                fi
-                local target_outbound="${out_tags[$((sel_out_idx-1))]}"
-
-                local temp_json=$(mktemp)
-                cp /etc/s-box/sb.json "$temp_json"
-
-                # 确保 route.rules 结构存在
-                if ! command jq -e '.route.rules' "$temp_json" >/dev/null 2>&1; then
-                    command jq '.route |= (. + {"rules": []})' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-                fi
-
-                # 先清除该 inbound 原本的单独规则
-                command jq --arg in_tag "$target_inbound" '
-                    .route.rules |= map(select(.inbound != [$in_tag]))
-                ' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-
-                # 如果选择的不是 direct，添加绑定规则
-                if [[ "$target_outbound" != "direct" ]]; then
-                    command jq --arg in_tag "$target_inbound" --arg out_tag "$target_outbound" '
-                        .route.rules += [{"inbound": [$in_tag], "outbound": $out_tag}]
-                    ' "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-                    echo "路由规则已设置: 入站 [$target_inbound] → 出站 [$target_outbound]"
-                else
-                    echo "已恢复: 入站 [$target_inbound] 恢复默认直连路由！"
-                fi
-
-                mv "$temp_json" /etc/s-box/sb.json
-                apply_changes
-                read -p "按回车键继续..." temp
-                ;;
-            0)
-                break
-                ;;
-            *)
-                echo "无效选项！"
-                ;;
+            0) return 0 ;;
+            *) red "无效选项" ;;
         esac
+        echo
+        reading "按回车继续..." _
     done
 }
 
-# ------------------------------------------------------------
-# 14. 批量测试外部代理节点延迟
-# ------------------------------------------------------------
-batch_test_node_latency() {
-    echo "=================================================="
-    echo "          批量测试外部代理节点延迟"
-    echo "=================================================="
-    echo "1. 测试当前配置文件中保存的所有外部代理节点"
-    echo "2. 临时粘贴节点链接进行一次性批量延迟测速"
-    echo "0. 返回主菜单"
-    echo "=================================================="
-    read -p "请选择操作 [0-2]: " test_choice
-
-    local nodes_json=""
-    case "$test_choice" in
-        1)
-            if [[ ! -f /etc/s-box/sb.json ]]; then
-                echo "错误：未找到配置文件 /etc/s-box/sb.json"
-                read -p "按回车键继续..." temp
-                return 1
-            fi
-            nodes_json=$(command jq -c '.outbounds[] | select(.tag != "direct" and .tag != "warp-out" and .tag != "block" and .tag != "dns")' /etc/s-box/sb.json 2>/dev/null)
-            ;;
-        2)
-            echo "请连续粘贴节点链接 (每行一条，按回车+Ctrl+D 结束输入)："
-            local raw_links=""
-            raw_links=$(cat)
-            if [[ -z "$raw_links" ]]; then
-                echo "取消输入。"
-                read -p "按回车键继续..." temp
-                return 0
-            fi
-
-            local idx=1
-            local tmp_arr="[]"
-            while read -r line; do
-                [[ -n "$line" ]] || continue
-                local parsed
-                parsed=$(parse_proxy_link "$line" "temp-node-${idx}")
-                if [[ -n "$parsed" ]]; then
-                    tmp_arr=$(echo "$tmp_arr" | command jq --argjson item "$parsed" '. += [$item]')
-                    ((idx++))
-                fi
-            done <<< "$raw_links"
-
-            nodes_json=$(echo "$tmp_arr" | command jq -c '.[]')
-            ;;
-        0|*)
-            return 0
-            ;;
-    esac
-
-    if [[ -z "$nodes_json" ]]; then
-        echo "未找到可测速的外部代理节点。"
-        read -p "按回车键继续..." temp
-        return 0
-    fi
-
-    echo ""
-    echo "正在开始并发测试节点延迟，请稍候..."
-    echo "----------------------------------------------------------------------------------"
-    printf "%-5s | %-18s | %-10s | %-25s | %-14s\n" "序号" "节点Tag" "协议类型" "目标地址:端口" "连接/握手延迟"
-    echo "----------------------------------------------------------------------------------"
-
-    local results_file=$(mktemp)
-    local idx=1
-
-    while read -r node; do
-        [[ -n "$node" ]] || continue
-        (
-            local tag type server port
-            tag=$(echo "$node" | command jq -r '.tag // "N/A"')
-            type=$(echo "$node" | command jq -r '.type // "N/A"')
-            server=$(echo "$node" | command jq -r '.server // ""')
-            port=$(echo "$node" | command jq -r '.server_port // ""')
-
-            if [[ -z "$server" || -z "$port" ]]; then
-                echo "999999:${tag}:${type}:${server}:${port}:超时/失败" >> "$results_file"
-                exit 0
-            fi
-
-            # 测量网络 latency (以毫秒为单位)
-            local start_time end_time cost_ms="超时" cost_num=999999
-            start_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
-
-            if [[ "$type" == "hysteria2" || "$type" == "hy2" || "$type" == "tuic" ]]; then
-                if timeout 2 bash -c "</dev/udp/${server}/${port}" >/dev/null 2>&1 || timeout 2 nc -z -u -w 2 "${server}" "${port}" >/dev/null 2>&1; then
-                    end_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
-                    cost_num=$((end_time - start_time))
-                    cost_ms="${cost_num} ms (UDP)"
-                fi
-            else
-                if timeout 2 bash -c "</dev/tcp/${server}/${port}" >/dev/null 2>&1; then
-                    end_time=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
-                    cost_num=$((end_time - start_time))
-                    cost_ms="${cost_num} ms"
-                fi
-            fi
-
-            echo "${cost_num}:${tag}:${type}:${server}:${port}:${cost_ms}" >> "$results_file"
-        ) &
-        ((idx++))
-    done <<< "$nodes_json"
-
-    wait
-
-    # 按延迟时间从低到高排序输出
-    local row_idx=1
-    sort -n -t: -k1 "$results_file" | while IFS=':' read -r cost_num tag type server port cost_ms; do
-        [[ -n "$tag" ]] || continue
-        local status_color="\033[0;32m"
-        if [[ "$cost_num" -eq 999999 ]]; then
-            status_color="\033[0;31m"
-        elif [[ "$cost_num" -gt 300 ]]; then
-            status_color="\033[0;33m"
-        fi
-        printf "%-5s | %-18s | %-10s | %-25s | ${status_color}%-14s\033[0m\n" "${row_idx}" "${tag}" "${type}" "${server}:${port}" "${cost_ms}"
-        ((row_idx++))
-    done
-
-    rm -f "$results_file"
-    echo "----------------------------------------------------------------------------------"
-    echo "测试完成。"
-    read -p "按回车键继续..." temp
-}
-
-if [[ "$1" == "repair" ]]; then
-    repair_runtime_config
-    exit $?
-fi
-
+# ==================== Cron 自愈守护任务 ====================
 if [[ "$1" == "cron" ]]; then
     log_file="/etc/s-box/monitor.log"
-    # 如果日志文件超过 50KB 则进行清空截断，避免体积无限膨胀
     if [[ -f "$log_file" && $(wc -c < "$log_file") -gt 51200 ]]; then
         : > "$log_file"
     fi
 
-    # 监测并重启 sing-box
     if ! service_is_active sing-box; then
         service_restart sing-box
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] 检测到 Sing-box 未运行，已自动拉起！" >> "$log_file"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Sing-box 未运行，已自动拉起！" >> "$log_file"
     fi
-    
-    # 检查是否配置了 Argo
+
     if [[ -f /etc/s-box/argo.conf ]]; then
-        source /etc/s-box/argo.conf
-    fi
-    if [[ -f ${NGINX_CONF_DIR}/singbox-argo.conf ]] || (! is_enabled "$USE_NGINX" && [[ -f /etc/s-box/argo.conf ]]); then
         if ! service_is_active argo-tunnel; then
             service_restart argo-tunnel
-            
-            # 判断 argo 模式
-            argo_mode="temp"
-            if [[ -f /etc/s-box/argo.conf ]]; then
-                source /etc/s-box/argo.conf
-                argo_mode=$ARGO_MODE
-            else
-                if $IS_OPENRC; then
-                    if grep -q "\--token" /etc/init.d/argo-tunnel 2>/dev/null; then
-                        argo_mode="token"
-                    fi
-                elif ! $IS_DIRECT; then
-                    if grep -q "\--token" /etc/systemd/system/argo-tunnel.service 2>/dev/null; then
-                        argo_mode="token"
-                    fi
-                fi
-            fi
-            
-            # 只有在临时模式下才需要重新抓取临时域名
-            if [[ "$argo_mode" == "temp" ]]; then
-                update_argo_domain
-            fi
-            regenerate_info_log
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] 检测到 Argo 隧道未运行，已自动拉起并重置配置！" >> "$log_file"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Argo 隧道未运行，已自动拉起！" >> "$log_file"
+        fi
+    fi
+
+    # 检查赛风主实例
+    if [[ -f "$WORKDIR/psiphon_main_enabled.txt" && "$(cat "$WORKDIR/psiphon_main_enabled.txt")" == "true" ]]; then
+        local pid=$(cat "$WORKDIR/psiphon.pid" 2>/dev/null)
+        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+            start_main_psiphon
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Psiphon 主进程未运行，已自动拉起！" >> "$log_file"
         fi
     fi
     exit 0
 fi
 
-while true; do
-    check_cron_status() {
-        if crontab -l 2>/dev/null | grep -q "sb cron"; then
-            echo -e "\033[0;32m已启用\033[0m"
-        else
-            echo -e "\033[0;31m已禁用\033[0m"
-        fi
-    }
+# ==================== 主菜单 ====================
+menu() {
+    while true; do
+        clear
+        echo
+        green "============================================================"
+        green "  Sing-box Linux 多协议节点管理脚本 v${SCRIPT_VERSION}"
+        green "============================================================"
+        purple "  支持协议: Argo, VLESS-Reality, VMess, Trojan, Hy2, TUIC, AnyTLS"
+        echo "============================================================"
 
-    echo "=================================================="
-    echo "          Sing-box 快捷管理工具 sb"
-    echo "=================================================="
-    echo "1. 查看已配置的节点分享链接"
-    echo "2. 重启 Sing-box 和 Argo 隧道服务"
-    echo "3. 停止 Sing-box 和 Argo 隧道服务"
-    echo "4. 查看 Argo 隧道实时域名与连接状态"
-    echo "5. 修改已搭建节点参数"
-    echo "6. 配置 Argo 隧道参数"
-    echo "7. 彻底卸载脚本环境"
-    echo "8. 开启/关闭服务自愈守护任务 (当前: $(check_cron_status))"
-    echo "9. 查看运行日志"
-    echo "10. 诊断并修复监听/Argo 同步"
-    echo "11. 追加 WARP 出站节点（不影响已有直连节点）"
-    echo "12. 重新配置协议组合 (可添加/删除直连或 WARP 节点)"
-    echo "13. 自定义代理出站多出口路由管理"
-    echo "14. 批量测试外部代理节点延迟"
-    echo "0. 退出"
-    echo "=================================================="
-    read -p "请输入选项 [0-14]: " menu_choice
-    case $menu_choice in
-        1)
-            if [[ -f /etc/s-box/info.log ]]; then
-                cat /etc/s-box/info.log
+        # 加载 IP
+        if [ ${#ALL_IPS[@]} -eq 0 ]; then
+            if [ -f "$WORKDIR/all_ips.txt" ]; then
+                mapfile -t ALL_IPS < "$WORKDIR/all_ips.txt"
             else
-                echo "未找到节点信息日志，请确认是否安装成功。"
+                get_all_ips >/dev/null 2>&1
             fi
-            ;;
-        2)
-            echo "正在重启服务..."
-            service_restart sing-box
-            if [[ -f /etc/s-box/argo.conf ]]; then
-                source /etc/s-box/argo.conf
+        fi
+
+        purple "  本机 IP 列表:"
+        local idx=1
+        for ip in "${ALL_IPS[@]}"; do
+            [[ -n "$ip" ]] && green "    [$idx] $ip  ->  [可用]"
+            ((idx++))
+        done
+        echo "============================================================"
+        echo
+
+        # 检查安装状态与各模块状态
+        if [ -f "$WORKDIR/sb.json" ]; then
+            if service_is_active sing-box; then
+                green "【主节点状态】: ✓ 已安装并运行中"
+            else
+                yellow "【主节点状态】: ⚠ 已安装但未运行"
             fi
-            if is_enabled "$USE_NGINX" && [[ -f ${NGINX_CONF_DIR}/singbox-argo.conf ]]; then
-                service_restart argo-tunnel
-                update_argo_domain
-            elif [[ -f /etc/s-box/argo.conf ]]; then
-                service_restart argo-tunnel
-                update_argo_domain
+
+            # 主节点出站
+            local warp_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
+            local warp_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
+            local psi_main=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null)
+            if [[ "$warp_status" == "true" ]]; then
+                if [[ "$warp_mode" == "all" ]]; then
+                    blue "【主节点出站】: ✓ WARP 全局出站 (全部主节点流量走 WARP)"
+                else
+                    blue "【主节点出站】: ✓ WARP 分流出站 (Google/YouTube/Netflix/OpenAI)"
+                fi
+            elif [[ "$psi_main" == "true" ]]; then
+                blue "【主节点出站】: ✓ 赛风出站 (Psiphon 节点出站)"
+            else
+                green "【主节点出站】: ✓ 直连出站 (Direct 原生网络直连)"
             fi
-            regenerate_info_log
-            echo "重启完成并已重新生成分享链接！"
-            ;;
-        3)
-            echo "正在停止服务..."
-            service_stop sing-box
-            service_stop argo-tunnel
-            echo "服务已停止！"
-            ;;
-        4)
-            echo "正在获取隧道状态..."
+
+            # 副节点 - 赛风
+            local psi_insts
+            mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
+            if [[ ${#psi_insts[@]} -gt 0 ]]; then
+                purple "【副节点-赛风】: ✓ 已配置 ${#psi_insts[@]} 个国家出口组 (${psi_insts[*]})"
+            else
+                purple "【副节点-赛风】: ✗ 未配置"
+            fi
+
+            # 副节点 - 代理
+            local proxy_tags
+            mapfile -t proxy_tags < <(get_all_proxy_groups 2>/dev/null)
+            if [[ ${#proxy_tags[@]} -gt 0 ]]; then
+                purple "【副节点-代理】: ✓ 已配置 ${#proxy_tags[@]} 个代理出口组 (${proxy_tags[*]})"
+            else
+                purple "【副节点-代理】: ✗ 未配置"
+            fi
+
+            # Argo
             if service_is_active argo-tunnel; then
-                echo "Argo 隧道处于运行状态："
-                if $IS_OPENRC || $IS_DIRECT; then
-                    tail -n 15 /var/log/argo-tunnel.log 2>/dev/null
-                else
-                    journalctl -u argo-tunnel -n 15 --no-pager
-                fi
+                green "【Argo 隧道】 : ✓ 运行中"
             else
-                echo "Argo 隧道服务未运行。"
+                yellow "【Argo 隧道】 : ✗ 未运行/未启用"
             fi
-            ;;
-        5)
-            modify_node_params
-            ;;
-        6)
-            modify_argo
-            ;;
-        7)
-            if [[ -f /etc/s-box/uninstall.sh ]]; then
-                bash /etc/s-box/uninstall.sh
-                exit 0
-            elif [[ -f /root/singbox/uninstall.sh ]]; then
-                bash /root/singbox/uninstall.sh
-                exit 0
-            elif [[ -f ./uninstall.sh ]]; then
-                bash ./uninstall.sh
-                exit 0
-            else
-                echo "未找到卸载脚本，正在执行直接清理..."
-                service_stop sing-box
-                service_stop argo-tunnel
-                service_disable sing-box
-                service_disable argo-tunnel
-                if $IS_OPENRC; then
-                    rm -f /etc/init.d/sing-box /etc/init.d/argo-tunnel
-                elif $IS_DIRECT; then
-                    rm -f /etc/s-box/sing-box.pid /etc/s-box/argo-tunnel.pid
+        else
+            yellow "【主节点状态】: ✗ 未安装"
+        fi
+
+        echo
+        echo "============================================================"
+        blue   "  【主节点管理】"
+        echo "------------------------------------------------------------"
+        green  "  1. 一键重新配置/安装主节点 (多协议: Reality/VMess/Trojan/Hy2/TUIC/AnyTLS)"
+        green  "  2. 主节点出站管理 (直连出站 / WARP 全局出站 / WARP 分流出站 / 赛风出站)"
+        green  "  3. 主节点 Argo 隧道管理 (开关/重置/固定与临时隧道)"
+        green  "  4. 查看主节点信息与订阅 (含各协议链接及主节点出站状态)"
+        echo "------------------------------------------------------------"
+        purple "  【副节点管理 (平行独立)】"
+        echo "------------------------------------------------------------"
+        purple "  5. 【副节点】赛风出站多出口管理 (添加/删除出口组、延迟测试、状态)"
+        purple "  6. 【副节点】自定义代理出站多出口管理 (添加/修改/删除外部代理出站、测速)"
+        echo "------------------------------------------------------------"
+        white  "  【综合功能与系统运维】"
+        echo "------------------------------------------------------------"
+        blue   "  7. 自定义节点组合推送 (自由勾选主/副节点生成专属订阅)"
+        blue   "  8. 查看全部节点信息总览 (主节点 + 副节点分类汇总)"
+        green  "  9. 重启所有服务 (主节点 + 赛风多实例 + 自定义代理完整同步)"
+        yellow " 10. 诊断 / 端口管理与冲突修复"
+        blue   " 11. 查看运行日志 (sing-box / Argo / Psiphon / 自愈守护)"
+        yellow " 12. 开启/关闭服务自愈守护定时任务"
+        red    " 13. 卸载删除主节点与服务"
+        echo "------------------------------------------------------------"
+        red    "  0. 退出脚本"
+        echo "============================================================"
+
+        reading "请选择 [0-13]: " choice
+        echo
+
+        case "$choice" in
+            1)
+                if [[ -f /etc/s-box/install.sh ]]; then
+                    bash /etc/s-box/install.sh reconfig
+                elif [[ -f ./install.sh ]]; then
+                    bash ./install.sh reconfig
                 else
-                    rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/argo-tunnel.service
-                    systemctl daemon-reload
+                    curl -sL https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh -o /tmp/install.sh && bash /tmp/install.sh reconfig
                 fi
-                rm -rf /etc/s-box /usr/local/bin/cloudflared /usr/local/bin/sb
+                ;;
+            2) configure_warp_outbound ;;
+            3) argo_management_menu ;;
+            4) show_links; echo; reading "按回车继续..." _ ;;
+            5) psiphon_management_menu ;;
+            6) proxy_egress_menu ;;
+            7) custom_push_nodes; echo; reading "按回车继续..." _ ;;
+            8) show_all_nodes_summary; echo; reading "按回车继续..." _ ;;
+            9)
+                yellow "正在重启所有服务..."
+                service_restart sing-box
+                [[ -f /etc/s-box/argo.conf ]] && service_restart argo-tunnel
+                sync_all_secondary_nodes
+                apply_changes
+                green "所有服务已重启并完成配置同步！"
+                reading "按回车继续..." _
+                ;;
+            10)
+                yellow "正在诊断与修复配置..."
+                apply_main_node_outbound
+                sync_all_secondary_nodes
+                apply_changes
+                green "诊断与修复完成！"
+                reading "按回车继续..." _
+                ;;
+            11) view_logs_menu ;;
+            12)
                 if crontab -l 2>/dev/null | grep -q "sb cron"; then
                     crontab -l | grep -v "sb cron" | crontab -
+                    green "已关闭服务自愈守护任务。"
+                else
+                    (crontab -l 2>/dev/null; echo "* * * * * /usr/local/bin/sb cron >> /etc/s-box/monitor.log 2>&1") | crontab -
+                    : > /etc/s-box/monitor.log 2>/dev/null
+                    green "已开启服务自愈守护任务 (每分钟检测一次)。"
                 fi
-                if is_enabled "$USE_NGINX"; then
-                    service_restart nginx
+                reading "按回车继续..." _
+                ;;
+            13)
+                reading "确定彻底卸载 Sing-box 及所有组件? (y/N): " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    service_stop sing-box
+                    service_stop argo-tunnel
+                    service_disable sing-box 2>/dev/null
+                    service_disable argo-tunnel 2>/dev/null
+                    pkill -9 -f "psiphon-tunnel-core" 2>/dev/null || true
+                    rm -rf /etc/s-box /usr/local/bin/cloudflared /usr/local/bin/sb
+                    crontab -l 2>/dev/null | grep -v "sb cron" | crontab - 2>/dev/null || true
+                    green "Sing-box 环境已彻底卸载清理！"
+                    exit 0
                 fi
-                echo "清理完成！"
-                exit 0
-            fi
-            ;;
-        8)
-            if crontab -l 2>/dev/null | grep -q "sb cron"; then
-                crontab -l | grep -v "sb cron" | crontab -
-                echo "已成功关闭自愈守护定时任务。"
-            else
-                echo "=================================================="
-                echo "          配置服务自愈守护检测频率"
-                echo "=================================================="
-                echo "1. 每分钟检测一次 (默认，直接回车)"
-                echo "2. 每 5 分钟检测一次"
-                echo "3. 每 10 分钟检测一次"
-                echo "4. 每 30 分钟检测一次"
-                echo "5. 每小时检测一次"
-                echo "=================================================="
-                read -p "请输入选项 [1-5, 默认1]: " cron_choice
-                cron_time="* * * * *"
-                case $cron_choice in
-                    2) cron_time="*/5 * * * *" ;;
-                    3) cron_time="*/10 * * * *" ;;
-                    4) cron_time="*/30 * * * *" ;;
-                    5) cron_time="0 * * * *" ;;
-                    *) cron_time="* * * * *" ;;
-                esac
-                (crontab -l 2>/dev/null; echo "${cron_time} /usr/local/bin/sb cron >> /etc/s-box/monitor.log 2>&1") | crontab -
-                : > /etc/s-box/monitor.log 2>/dev/null
-                echo "已成功开启自愈守护定时任务 (检测频率: ${cron_time})。"
-            fi
-            read -p "按回车键继续..." temp
-            ;;
-        9)
-            view_logs
-            ;;
-        10)
-            repair_runtime_config
-            read -p "按回车键继续..." temp
-            ;;
-        11)
-            add_warp_nodes
-            ;;
-        12)
-            if [[ -f /etc/s-box/install.sh ]]; then
-                bash /etc/s-box/install.sh reconfig
-            elif [[ -f /root/singbox/install.sh ]]; then
-                bash /root/singbox/install.sh reconfig
-            elif [[ -f ./install.sh ]]; then
-                bash ./install.sh reconfig
-            else
-                echo "未找到安装脚本 /etc/s-box/install.sh，尝试在线获取并执行重新配置..."
-                curl -sL https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh -o /tmp/install.sh && bash /tmp/install.sh reconfig
-            fi
-            exit 0
-            ;;
-        13)
-            manage_custom_outbounds
-            ;;
-        14)
-            batch_test_node_latency
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            echo "无效输入，请重新选择。"
-            ;;
-    esac
-done
-EOF
+                ;;
+            0) exit 0 ;;
+            *) red "无效选项" ;;
+        esac
+    done
+}
+
+menu
+EOF_SB_TOOL
 chmod +x /usr/local/bin/sb
 }
 
-if [[ "$1" == "reconfig" ]]; then
-    SKIP_INSTALLED_CHECK=true
-fi
+# ==================== 初次安装 / 部署主流程 ====================
+install_singbox_main() {
+    log_info "开始安装/更新 Sing-box 环境依赖..."
 
-if [[ "$1" == "repair" ]]; then
-    create_sb_tool >/dev/null 2>&1
-    bash /usr/local/bin/sb repair
-    exit $?
-fi
+    # 安装系统依赖
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1
+        apt-get install -y curl wget tar jq openssl git net-tools cron >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y curl wget tar jq openssl git net-tools cronie >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        apk update >/dev/null 2>&1
+        apk add curl wget tar jq openssl git net-tools >/dev/null 2>&1
+    fi
 
-# 检测是否已安装
-if [[ -f /etc/s-box/sb.json && "$SKIP_INSTALLED_CHECK" != "true" ]]; then
-    echo "=================================================="
-    echo "          检测到已安装 Sing-box 服务"
-    echo "=================================================="
-    echo "1. 进入 Sing-box 快捷管理菜单 (直接回车)"
-    echo "2. 重新安装/更新 Sing-box 服务"
-    echo "0. 退出"
-    echo "=================================================="
-    read -p "请选择操作 [0-2, 默认1]: " init_choice
-    [[ -z "$init_choice" ]] && init_choice=1
-    
-    if [[ "$init_choice" == "1" ]]; then
-        create_sb_tool >/dev/null 2>&1
-        if [[ -f /usr/local/bin/sb ]]; then
-            bash /usr/local/bin/sb
-            exit 0
-        else
-            log_warn "未找到快捷管理工具 /usr/local/bin/sb，自动进入安装流程。"
+    mkdir -p "$WORKDIR" "$PROXY_GROUPS_DIR" "$PSI_INSTANCES_DIR"
+
+    # 获取系统架构并下载 sing-box
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        armv7l|armv7) arch="armv7" ;;
+        *) arch="amd64" ;;
+    esac
+
+    if [[ ! -x "$WORKDIR/sing-box" ]]; then
+        log_info "正在下载最新 Sing-box 核心 (Linux-${arch})..."
+        local sb_ver="1.11.4"
+        local sb_url="https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${arch}.tar.gz"
+        local tmp_sb_dir="/tmp/sb_download"
+        mkdir -p "$tmp_sb_dir"
+        if curl -fsSL "$sb_url" -o "$tmp_sb_dir/sb.tar.gz" 2>/dev/null; then
+            tar -xzf "$tmp_sb_dir/sb.tar.gz" -C "$tmp_sb_dir"
+            local bin_path=$(find "$tmp_sb_dir" -type f -name "sing-box" | head -n 1)
+            [[ -n "$bin_path" ]] && cp -f "$bin_path" "$WORKDIR/sing-box"
         fi
-    elif [[ "$init_choice" == "0" ]]; then
-        exit 0
+        rm -rf "$tmp_sb_dir"
+        chmod +x "$WORKDIR/sing-box" 2>/dev/null
     fi
-fi
 
-# 节点配置默认值（自适应从已有 sb.json 中提取启用状态，用作交互选择的默认状态，实现无损的增量配置）
-if [[ -f /etc/s-box/sb.json ]]; then
-    jq -e '.inbounds[] | select(.tag=="vless-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_VLESS="y" || ENABLE_VLESS="n"
-    jq -e '.inbounds[] | select(.tag=="vmess-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_VMESS="y" || ENABLE_VMESS="n"
-    jq -e '.inbounds[] | select(.tag=="trojan-tls-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_TROJAN="y" || ENABLE_TROJAN="n"
-    jq -e '.inbounds[] | select(.tag=="hy2-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_HY2="y" || ENABLE_HY2="n"
-    jq -e '.inbounds[] | select(.tag=="tuic-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_TUIC="y" || ENABLE_TUIC="n"
-    jq -e '.inbounds[] | select(.tag=="anytls-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_ANYTLS="y" || ENABLE_ANYTLS="n"
-    
-    jq -e '.inbounds[] | select(.tag=="vless-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_VLESS_WARP="y" || ENABLE_VLESS_WARP="n"
-    jq -e '.inbounds[] | select(.tag=="vmess-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_VMESS_WARP="y" || ENABLE_VMESS_WARP="n"
-    jq -e '.inbounds[] | select(.tag=="trojan-tls-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_TROJAN_WARP="y" || ENABLE_TROJAN_WARP="n"
-    jq -e '.inbounds[] | select(.tag=="hy2-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_HY2_WARP="y" || ENABLE_HY2_WARP="n"
-    jq -e '.inbounds[] | select(.tag=="tuic-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_TUIC_WARP="y" || ENABLE_TUIC_WARP="n"
-    jq -e '.inbounds[] | select(.tag=="anytls-warp-in")' /etc/s-box/sb.json >/dev/null 2>&1 && ENABLE_ANYTLS_WARP="y" || ENABLE_ANYTLS_WARP="n"
-    
-    if [[ -f /etc/s-box/argo.conf ]] || systemctl is-active argo-tunnel >/dev/null 2>&1 || rc-service argo-tunnel status >/dev/null 2>&1; then
-        ENABLE_ARGO="y"
-    else
-        ENABLE_ARGO="n"
-    fi
-else
-    ENABLE_VLESS="y"
-    ENABLE_VMESS="y"
-    ENABLE_TROJAN="y"
-    ENABLE_HY2="y"
-    ENABLE_TUIC="y"
-    ENABLE_ANYTLS="y"
-    ENABLE_ARGO="y"
-    ENABLE_VLESS_WARP="n"
-    ENABLE_VMESS_WARP="n"
-    ENABLE_TROJAN_WARP="n"
-    ENABLE_HY2_WARP="n"
-    ENABLE_TUIC_WARP="n"
-    ENABLE_ANYTLS_WARP="n"
-fi
+    # 生成基础 UUID、Reality 证书与密钥
+    local UUID
+    UUID=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null)
+    [[ -z "$UUID" ]] && UUID="a3b8c2d1-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+    echo "$UUID" > "$WORKDIR/UUID.txt"
 
-get_prompt_default() {
-    local current_val=$1
-    if [[ "$current_val" == "y" || "$current_val" == "yes" ]]; then
-        echo "Y/n"
-    else
-        echo "y/N"
+    if [[ ! -f "$WORKDIR/cert.pem" || ! -f "$WORKDIR/private.key" ]]; then
+        openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$WORKDIR/private.key" -out "$WORKDIR/cert.pem" -days 3650 -subj "/CN=www.bing.com" >/dev/null 2>&1
     fi
-}
 
-# 提供自定义组合的交互式提示
-echo "=================================================="
-echo "          请选择要安装的节点组合"
-echo "=================================================="
-echo "1. 默认安装全部/保持原装节点协议 (直接回车)"
-echo "2. 自定义选择需要安装的节点协议"
-echo "3. 只安装走 WARP 出站的备份节点"
-echo "=================================================="
-read -p "请输入选项 [1-3, 默认1]: " menu_choice
-
-if [[ "$menu_choice" == "2" ]]; then
-    local opt
-    read -p "1. 是否安装 VLESS-Reality? [$(get_prompt_default $ENABLE_VLESS), 默认 ${ENABLE_VLESS}]: " opt
-    [[ -n "$opt" ]] && ENABLE_VLESS=$(echo "$opt" | tr 'A-Z' 'a-z')
-    
-    read -p "2. 是否安装 VMess-WS? [$(get_prompt_default $ENABLE_VMESS), 默认 ${ENABLE_VMESS}]: " opt
-    [[ -n "$opt" ]] && ENABLE_VMESS=$(echo "$opt" | tr 'A-Z' 'a-z')
-    
-    read -p "3. 是否安装 Trojan-WS-TLS (自签证书)? [$(get_prompt_default $ENABLE_TROJAN), 默认 ${ENABLE_TROJAN}]: " opt
-    [[ -n "$opt" ]] && ENABLE_TROJAN=$(echo "$opt" | tr 'A-Z' 'a-z')
-    
-    read -p "4. 是否安装 Hysteria2? [$(get_prompt_default $ENABLE_HY2), 默认 ${ENABLE_HY2}]: " opt
-    [[ -n "$opt" ]] && ENABLE_HY2=$(echo "$opt" | tr 'A-Z' 'a-z')
-    
-    read -p "5. 是否安装 TUIC v5? [$(get_prompt_default $ENABLE_TUIC), 默认 ${ENABLE_TUIC}]: " opt
-    [[ -n "$opt" ]] && ENABLE_TUIC=$(echo "$opt" | tr 'A-Z' 'a-z')
-    
-    read -p "6. 是否安装 AnyTLS? [$(get_prompt_default $ENABLE_ANYTLS), 默认 ${ENABLE_ANYTLS}]: " opt
-    [[ -n "$opt" ]] && ENABLE_ANYTLS=$(echo "$opt" | tr 'A-Z' 'a-z')
-    
-    read -p "7. 是否安装 Argo 隧道穿透 (支持 VMess/Trojan)? [$(get_prompt_default $ENABLE_ARGO), 默认 ${ENABLE_ARGO}]: " opt
-    [[ -n "$opt" ]] && ENABLE_ARGO=$(echo "$opt" | tr 'A-Z' 'a-z')
-    
-    local has_warp_installed="n"
-    if [[ "$ENABLE_VLESS_WARP" == "y" || "$ENABLE_VMESS_WARP" == "y" || "$ENABLE_TROJAN_WARP" == "y" || "$ENABLE_HY2_WARP" == "y" || "$ENABLE_TUIC_WARP" == "y" || "$ENABLE_ANYTLS_WARP" == "y" ]]; then
-        has_warp_installed="y"
-    fi
-    read -p "8. 是否同时配置/调整走 WARP 出站的备份节点？[$(get_prompt_default $has_warp_installed), 默认 ${has_warp_installed}]: " opt_warp_global
-    [[ -z "$opt_warp_global" ]] && opt_warp_global=$has_warp_installed
-    
-    if [[ "$opt_warp_global" == "y" || "$opt_warp_global" == "yes" ]]; then
-        is_enabled "$ENABLE_VLESS" && { read -p "   是否额外开启 VLESS-Reality-WARP? [$(get_prompt_default $ENABLE_VLESS_WARP), 默认 ${ENABLE_VLESS_WARP}]: " opt; [[ -n "$opt" ]] && ENABLE_VLESS_WARP=$(echo "$opt" | tr 'A-Z' 'a-z'); }
-        is_enabled "$ENABLE_VMESS" && { read -p "   是否额外开启 VMess-WS-WARP? [$(get_prompt_default $ENABLE_VMESS_WARP), 默认 ${ENABLE_VMESS_WARP}]: " opt; [[ -n "$opt" ]] && ENABLE_VMESS_WARP=$(echo "$opt" | tr 'A-Z' 'a-z'); }
-        is_enabled "$ENABLE_TROJAN" && { read -p "   是否额外开启 Trojan-WS-TLS-WARP? [$(get_prompt_default $ENABLE_TROJAN_WARP), 默认 ${ENABLE_TROJAN_WARP}]: " opt; [[ -n "$opt" ]] && ENABLE_TROJAN_WARP=$(echo "$opt" | tr 'A-Z' 'a-z'); }
-        is_enabled "$ENABLE_HY2" && { read -p "   是否额外开启 Hysteria2-WARP? [$(get_prompt_default $ENABLE_HY2_WARP), 默认 ${ENABLE_HY2_WARP}]: " opt; [[ -n "$opt" ]] && ENABLE_HY2_WARP=$(echo "$opt" | tr 'A-Z' 'a-z'); }
-        is_enabled "$ENABLE_TUIC" && { read -p "   是否额外开启 TUIC-WARP? [$(get_prompt_default $ENABLE_TUIC_WARP), 安排 ${ENABLE_TUIC_WARP}]: " opt; [[ -n "$opt" ]] && ENABLE_TUIC_WARP=$(echo "$opt" | tr 'A-Z' 'a-z'); }
-        is_enabled "$ENABLE_ANYTLS" && { read -p "   是否额外开启 AnyTLS-WARP? [$(get_prompt_default $ENABLE_ANYTLS_WARP), 默认 ${ENABLE_ANYTLS_WARP}]: " opt; [[ -n "$opt" ]] && ENABLE_ANYTLS_WARP=$(echo "$opt" | tr 'A-Z' 'a-z'); }
-    fi
-elif [[ "$menu_choice" == "3" ]]; then
-    ENABLE_VLESS="n"
-    ENABLE_VMESS="n"
-    ENABLE_TROJAN="n"
-    ENABLE_HY2="n"
-    ENABLE_TUIC="n"
-    ENABLE_ANYTLS="n"
-    ENABLE_ARGO="n"
-    
-    echo "=================================================="
-    echo "          请选择要安装的 WARP 出站节点"
-    echo "=================================================="
-    echo "1. 默认安装全部 WARP 节点 (直接回车)"
-    echo "2. 自定义选择需要安装的 WARP 节点"
-    echo "=================================================="
-    read -p "请输入选项 [1-2, 默认1]: " warp_choice
-    
-    if [[ "$warp_choice" == "2" ]]; then
-        read -p "1. 是否安装 VLESS-Reality-WARP? [y/N, 默认N]: " opt
-        [[ "$opt" == "y" || "$opt" == "yes" ]] && ENABLE_VLESS_WARP="y" || ENABLE_VLESS_WARP="n"
-        
-        read -p "2. 是否安装 VMess-WS-WARP? [y/N, 默认N]: " opt
-        [[ "$opt" == "y" || "$opt" == "yes" ]] && ENABLE_VMESS_WARP="y" || ENABLE_VMESS_WARP="n"
-        
-        read -p "3. 是否安装 Trojan-WS-TLS-WARP (自签证书)? [y/N, 默认N]: " opt
-        [[ "$opt" == "y" || "$opt" == "yes" ]] && ENABLE_TROJAN_WARP="y" || ENABLE_TROJAN_WARP="n"
-        
-        read -p "4. 是否安装 Hysteria2-WARP? [y/N, 默认N]: " opt
-        [[ "$opt" == "y" || "$opt" == "yes" ]] && ENABLE_HY2_WARP="y" || ENABLE_HY2_WARP="n"
-        
-        read -p "5. 是否安装 TUIC-WARP? [y/N, 默认N]: " opt
-        [[ "$opt" == "y" || "$opt" == "yes" ]] && ENABLE_TUIC_WARP="y" || ENABLE_TUIC_WARP="n"
-        
-        read -p "6. 是否安装 AnyTLS-WARP? [y/N, 默认N]: " opt
-        [[ "$opt" == "y" || "$opt" == "yes" ]] && ENABLE_ANYTLS_WARP="y" || ENABLE_ANYTLS_WARP="n"
-    else
-        ENABLE_VLESS_WARP="y"
-        ENABLE_VMESS_WARP="y"
-        ENABLE_TROJAN_WARP="y"
-        ENABLE_HY2_WARP="y"
-        ENABLE_TUIC_WARP="y"
-        ENABLE_ANYTLS_WARP="y"
-    fi
-    
-    # 防呆校验
-    if [[ "$ENABLE_VLESS_WARP" != "y" && "$ENABLE_VMESS_WARP" != "y" && "$ENABLE_TROJAN_WARP" != "y" && "$ENABLE_HY2_WARP" != "y" && "$ENABLE_TUIC_WARP" != "y" && "$ENABLE_ANYTLS_WARP" != "y" ]]; then
-        log_warn "未选择任何 WARP 节点，将默认安装全部 WARP 节点。"
-        ENABLE_VLESS_WARP="y"
-        ENABLE_VMESS_WARP="y"
-        ENABLE_TROJAN_WARP="y"
-        ENABLE_HY2_WARP="y"
-        ENABLE_TUIC_WARP="y"
-        ENABLE_ANYTLS_WARP="y"
-    fi
-else
-    # 默认选项下的 Warp 节点行为
-    local has_warp_installed="n"
-    if [[ "$ENABLE_VLESS_WARP" == "y" || "$ENABLE_VMESS_WARP" == "y" || "$ENABLE_TROJAN_WARP" == "y" || "$ENABLE_HY2_WARP" == "y" || "$ENABLE_TUIC_WARP" == "y" || "$ENABLE_ANYTLS_WARP" == "y" ]]; then
-        has_warp_installed="y"
-    fi
-    # 只有原来没有配置过 warp 且没有进入自定义分支时，默认一键安装全部才对 warp 也进行全开；如果原来已经有配置，默认一键继续沿用旧配置状态
-    if [[ "$has_warp_installed" == "n" ]]; then
-        read -p "是否同时安装走 WARP 出站的备份节点？[y/N, 默认N]: " opt_warp_global
-        if [[ "$opt_warp_global" == "y" || "$opt_warp_global" == "yes" ]]; then
-            ENABLE_VLESS_WARP="y"
-            ENABLE_VMESS_WARP="y"
-            ENABLE_TROJAN_WARP="y"
-            ENABLE_HY2_WARP="y"
-            ENABLE_TUIC_WARP="y"
-            ENABLE_ANYTLS_WARP="y"
+    if [[ ! -f "$WORKDIR/private_key.txt" || ! -f "$WORKDIR/public_key.txt" ]]; then
+        if [[ -x "$WORKDIR/sing-box" ]]; then
+            local keypair=$("$WORKDIR/sing-box" generate reality-keypair 2>/dev/null)
+            local pvk=$(echo "$keypair" | awk '/PrivateKey:/{print $2}' | tr -d '\r\n')
+            local pbk=$(echo "$keypair" | awk '/PublicKey:/{print $2}' | tr -d '\r\n')
+            echo "$pvk" > "$WORKDIR/private_key.txt"
+            echo "$pbk" > "$WORKDIR/public_key.txt"
         fi
     fi
-fi
+    echo "apple.com" > "$WORKDIR/reym.txt"
+    echo "" > "$WORKDIR/short_id.txt"
 
-# 统一判断，空值或 y/yes 都视为启用
-is_enabled() {
-    [[ "$1" == "y" || "$1" == "yes" || -z "$1" ]] && return 0 || return 1
-}
+    # 获取 IP
+    get_all_ips >/dev/null 2>&1
+    local IP="${ALL_IPS[0]:-127.0.0.1}"
 
-# 提供 Argo 配置的交互选择
-USE_NGINX="y"
-ARGO_MODE="temp"
-ARGO_TOKEN=""
-ARGO_DOMAIN=""
-ARGO_VMESS_DOMAIN=""
-ARGO_TROJAN_DOMAIN=""
+    # 默认端口分配
+    local PORT_VLESS=$(get_free_port)
+    local PORT_VMESS=$(get_free_port)
+    local PORT_TROJAN_TLS=$(get_free_port)
+    local PORT_HY2=$(get_free_port)
+    local PORT_TUIC=$(get_free_port)
+    local PORT_ANYTLS=$(get_free_port)
+    local PORT_LOOPBACK=$(get_free_loopback_port)
 
-if is_enabled "$ENABLE_ARGO"; then
-    # 尝试从已有配置自适应继承
-    if [[ -f /etc/s-box/argo.conf ]]; then
-        source /etc/s-box/argo.conf
-    fi
-    
-    # 询问 Argo 隧道的运行模式
-    if [[ "$ARGO_MODE" != "token" ]]; then
-        echo "=================================================="
-        echo "          请选择 Argo 隧道的运行模式"
-        echo "=================================================="
-        echo "1. 申请临时域名隧道 (TryCloudflare，直接回车)"
-        echo "2. 使用自备固定域名隧道 (使用 Cloudflare Tunnel Token)"
-        echo "=================================================="
-        read -p "请输入选项 [1-2, 默认1]: " argo_mode_choice
-        if [[ "$argo_mode_choice" == "2" ]]; then
-            ARGO_MODE="token"
-        else
-            ARGO_MODE="temp"
-        fi
-    fi
+    # 生成主 sing-box 配置
+    local REALITY_PVK=$(cat "$WORKDIR/private_key.txt" 2>/dev/null)
+    local REALITY_PBK=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
 
-    if [[ "$ARGO_MODE" == "token" ]]; then
-        # 输入 Token
-        if [[ -z "$ARGO_TOKEN" ]]; then
-            while true; do
-                read -p "请输入您的 Cloudflare Tunnel Token: " ARGO_TOKEN
-                if [[ -n "$ARGO_TOKEN" ]]; then
-                    break
-                fi
-                log_err "Token 不能为空，请重新输入！"
-            done
-        fi
-
-        # 选择转发方式
-        echo "=================================================="
-        echo "          请选择 Argo 隧道的转发方式"
-        echo "=================================================="
-        echo "1. 启用 Nginx 作为反向代理分流 (推荐，支持多协议单域名分流，直接回车)"
-        echo "2. 不启用 Nginx (多子域名多端口直连，VMess=8401, Trojan=8402)"
-        echo "=================================================="
-        read -p "请输入选项 [1-2, 默认1]: " nginx_choice
-        if [[ "$nginx_choice" == "2" ]]; then
-            USE_NGINX="n"
-        else
-            USE_NGINX="y"
-        fi
-
-        if is_enabled "$USE_NGINX"; then
-            # 单域名模式
-            while true; do
-                read -p "请输入您在 Cloudflare 上为该隧道绑定的自定义域名 (如: argo.example.com): " ARGO_DOMAIN
-                if [[ -n "$ARGO_DOMAIN" ]]; then
-                    break
-                fi
-                log_err "自定义域名不能为空，请重新输入！"
-            done
-        else
-            # 免 Nginx 多子域名模式
-            if is_enabled "$ENABLE_VMESS"; then
-                while true; do
-                    read -p "请输入 VMess 节点对应的自定义子域名 (如: vmess.example.com): " ARGO_VMESS_DOMAIN
-                    if [[ -n "$ARGO_VMESS_DOMAIN" ]]; then
-                        break
-                    fi
-                    log_err "VMess 子域名不能为空，请重新输入！"
-                done
-            fi
-            if is_enabled "$ENABLE_TROJAN"; then
-                while true; do
-                    read -p "请输入 Trojan 节点对应的自定义子域名 (如: trojan.example.com): " ARGO_TROJAN_DOMAIN
-                    if [[ -n "$ARGO_TROJAN_DOMAIN" ]]; then
-                        break
-                    fi
-                    log_err "Trojan 子域名不能为空，请重新输入！"
-                done
-            fi
-        fi
-    else
-        # 临时域名模式强制启用 Nginx
-        USE_NGINX="y"
-    fi
-fi
-
-# 1. 系统检测与包管理器识别
-if [[ -f /etc/os-release ]]; then
-    . /etc/os-release
-    if [[ "$ID" == "ubuntu" ]]; then
-        release="Ubuntu"
-    elif [[ "$ID" == "debian" ]]; then
-        release="Debian"
-    elif [[ "$ID" == "centos" || "$ID" == "rhel" || "$ID" == "rocky" || "$ID" == "almalinux" ]]; then
-        release="CentOS"
-    elif [[ "$ID" == "alpine" ]]; then
-        release="Alpine"
-    else
-        log_err "暂不支持的系统类型: $NAME。请使用 Ubuntu, Debian, CentOS 或 Alpine。"
-        exit 1
-    fi
-else
-    if [[ -f /etc/redhat-release ]]; then
-        release="CentOS"
-    elif grep -q -i "debian" /etc/issue; then
-        release="Debian"
-    elif grep -q -i "ubuntu" /etc/issue; then
-        release="Ubuntu"
-    elif grep -q -i "alpine" /etc/issue; then
-        release="Alpine"
-    else
-        log_err "暂不支持的系统类型。请使用 Ubuntu, Debian, CentOS 或 Alpine。"
-        exit 1
-    fi
-fi
-
-# 架构检测
-arch=$(uname -m)
-case $arch in
-    x86_64) cpu="amd64" ;;
-    aarch64) cpu="arm64" ;;
-    armv7l) cpu="arm" ;;
-    *)
-        log_err "暂不支持的 CPU 架构: $arch"
-        exit 1
-        ;;
-esac
-
-# 2. 安装系统依赖 and Nginx
-log_info "正在安装必要的系统依赖..."
-if [[ "$release" == "Alpine" ]]; then
-    apk update
-    apk add --no-cache bash jq openssl curl tar wget procps coreutils iproute2
-    is_enabled "$ENABLE_ARGO" && is_enabled "$USE_NGINX" && apk add --no-cache nginx
-elif [[ "$release" == "CentOS" ]]; then
-    yum install -y epel-release
-    yum install -y jq openssl curl tar wget psmisc
-    is_enabled "$ENABLE_ARGO" && is_enabled "$USE_NGINX" && yum install -y nginx
-else
-    apt-get update -y
-    apt-get install -y jq openssl curl tar wget psmisc
-    is_enabled "$ENABLE_ARGO" && is_enabled "$USE_NGINX" && apt-get install -y nginx
-fi
-
-# 安装完依赖后重新检测 Nginx 配置目录（Alpine 安装 nginx 后目录才出现）
-if is_enabled "$ENABLE_ARGO" && is_enabled "$USE_NGINX"; then
-    NGINX_CONF_DIR="/etc/nginx/conf.d"
-    [[ -d "/etc/nginx/http.d" ]] && NGINX_CONF_DIR="/etc/nginx/http.d"
-    mkdir -p "${NGINX_CONF_DIR}"
-fi
-
-# 3. 创建配置文件目录
-mkdir -p /etc/s-box
-cd /etc/s-box
-
-# 4. 下载并安装 Sing-box 最新内核
-log_info "正在获取 Sing-box 最新版本号..."
-latest_version=$(curl -Ls https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name' | sed 's/v//')
-if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
-    # 备用源：从 GitHub 发布页面 HTML 解析版本号
-    latest_version=$(curl -Ls https://github.com/SagerNet/sing-box/releases/latest -o /dev/null -w '%{url_effective}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | tail -n 1)
-fi
-if [[ -z "$latest_version" || "$latest_version" == "null" ]]; then
-    latest_version="1.12.1" # 回退默认版本（需 >= 1.12.0 以支持 AnyTLS）
-    log_warn "获取最新版本号失败，使用默认版本 v$latest_version"
-fi
-
-# AnyTLS 版本兼容性校验：需要 sing-box >= 1.12.0
-if is_enabled "$ENABLE_ANYTLS"; then
-    if [[ $(printf '%s\n' "1.12.0" "$latest_version" | sort -V | head -n 1) != "1.12.0" ]]; then
-        log_warn "Sing-box v${latest_version} 不支持 AnyTLS 协议（需要 v1.12.0+），已自动跳过 AnyTLS。"
-        ENABLE_ANYTLS="n"
-    fi
-fi
-
-log_info "正在下载 Sing-box 内核 v$latest_version ($cpu)..."
-package_name="sing-box-${latest_version}-linux-${cpu}"
-download_url="https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/${package_name}.tar.gz"
-
-wget -qO sing-box.tar.gz "$download_url"
-if [[ ! -f "sing-box.tar.gz" ]]; then
-    log_err "下载 Sing-box 失败，请检查网络。"
-    exit 1
-fi
-
-tar -xzf sing-box.tar.gz
-mv "$package_name/sing-box" ./sing-box
-rm -rf sing-box.tar.gz "$package_name"
-chmod +x sing-box
-log_info "Sing-box 内核安装成功：$(./sing-box version | head -n 1)"
-
-# 5. 如果开启了 Argo，则下载并安装 Cloudflared
-if is_enabled "$ENABLE_ARGO"; then
-    log_info "正在下载 Cloudflared 客户端..."
-    cf_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cpu}"
-    wget -qO /usr/local/bin/cloudflared "$cf_url"
-    chmod +x /usr/local/bin/cloudflared
-    log_info "Cloudflared 安装成功：$(cloudflared --version)"
-fi
-
-# 6. 生成安全凭证与证书
-log_info "正在处理配置凭证..."
-UUID=""
-private_key=""
-public_key=""
-short_id=""
-
-if [[ -f /etc/s-box/sb.json ]]; then
-    UUID=$(jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' /etc/s-box/sb.json | head -n 1)
-    private_key=$(jq -r '.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key' /etc/s-box/sb.json | head -n 1)
-    short_id=$(jq -r '.inbounds[]? | select(.tls.reality.short_id[0] != null) | .tls.reality.short_id[0]' /etc/s-box/sb.json | head -n 1)
-fi
-
-[[ -z "$UUID" || "$UUID" == "null" ]] && UUID=$(./sing-box generate uuid)
-
-if [[ -z "$private_key" || "$private_key" == "null" ]]; then
-    reality_keys=$(./sing-box generate reality-keypair)
-    private_key=$(echo "$reality_keys" | awk '/PrivateKey/{print $2}')
-    public_key=$(echo "$reality_keys" | awk '/PublicKey/{print $2}')
-    echo "$public_key" > /etc/s-box/public.key
-else
-    if [[ -f /etc/s-box/public.key ]]; then
-        public_key=$(cat /etc/s-box/public.key | tr -d '\r\n')
-    fi
-    # 兜底生成以防万一
-    if [[ -z "$public_key" ]]; then
-        reality_keys=$(./sing-box generate reality-keypair)
-        private_key=$(echo "$reality_keys" | awk '/PrivateKey/{print $2}')
-        public_key=$(echo "$reality_keys" | awk '/PublicKey/{print $2}')
-        echo "$public_key" > /etc/s-box/public.key
-    fi
-fi
-
-[[ -z "$short_id" || "$short_id" == "null" ]] && short_id=$(openssl rand -hex 8)
-
-# 生成自签证书（若已存在证书则予以保留，不重复覆盖，保持证书指纹稳定）
-if [[ ! -f /etc/s-box/private.key || ! -f /etc/s-box/cert.pem ]]; then
-    openssl ecparam -genkey -name prime256v1 -out /etc/s-box/private.key
-    openssl req -new -x509 -days 36500 -key /etc/s-box/private.key -out /etc/s-box/cert.pem -subj "/CN=www.bing.com"
-fi
-
-# 7. 端口自动分配与自定义（检查端口冲突）
-check_port() {
-    local port=$1
-    if ss -tunlp | grep -q ":$port "; then
-        return 1
-    else
-        return 0
-    fi
-}
-
-get_random_port_in_range() {
-    local min=$1
-    local max=$2
-    local port
-    while true; do
-        port=$(shuf -i ${min}-${max} -n 1)
-        if check_port "$port"; then
-            echo "$port"
-            break
-        fi
-    done
-}
-
-get_custom_port() {
-    local name=$1
-    local default_val=$2
-    local port
-    while true; do
-        read -p "请输入 ${name} 的监听端口 [默认 ${default_val}]: " port
-        [[ -z "$port" ]] && port=$default_val
-        if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-            if check_port "$port"; then
-                echo "$port"
-                break
-            else
-                log_warn "端口 $port 已被占用，请重新输入！"
-            fi
-        else
-            log_err "输入不合法，请输入 1-65535 之间的数字！"
-        fi
-    done
-}
-
-get_port_range() {
-    local range_str
-    local start_port
-    local end_port
-    while true; do
-        read -p "请输入端口范围 [格式例如 10000-20000, 默认 20000-60000]: " range_str
-        if [[ -z "$range_str" ]]; then
-            start_port=20000
-            end_port=60000
-            break
-        fi
-        if [[ "$range_str" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            start_port=${BASH_REMATCH[1]}
-            end_port=${BASH_REMATCH[2]}
-            if [ "$start_port" -ge 1 ] && [ "$start_port" -le 65535 ] && \
-               [ "$end_port" -ge 1 ] && [ "$end_port" -le 65535 ] && \
-               [ "$start_port" -le "$end_port" ]; then
-                break
-            fi
-        fi
-        log_err "输入不合法！格式应为: 起始端口-结束端口 (如 10000-20000)，且在 1-65535 之间。"
-    done
-    echo "${start_port} ${end_port}"
-}
-
-# 如果已有 sb.json 配置，则尽可能继承已有端口，实现完美增量配置而不需要打乱已有的端口绑定
-if [[ -f /etc/s-box/sb.json ]]; then
-    cur_vless_port=$(jq -r '.inbounds[]? | select(.tag=="vless-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    cur_vmess_port=$(jq -r '.inbounds[]? | select(.tag=="vmess-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    cur_trojan_port=$(jq -r '.inbounds[]? | select(.tag=="trojan-tls-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    cur_hy2_port=$(jq -r '.inbounds[]? | select(.tag=="hy2-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    cur_tuic_port=$(jq -r '.inbounds[]? | select(.tag=="tuic-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    cur_anytls_port=$(jq -r '.inbounds[]? | select(.tag=="anytls-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    
-    cur_vless_warp_port=$(jq -r '.inbounds[]? | select(.tag=="vless-warp-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    cur_vmess_warp_port=$(jq -r '.inbounds[]? | select(.tag=="vmess-warp-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    cur_trojan_warp_port=$(jq -r '.inbounds[]? | select(.tag=="trojan-tls-warp-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    cur_hy2_warp_port=$(jq -r '.inbounds[]? | select(.tag=="hy2-warp-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    cur_tuic_warp_port=$(jq -r '.inbounds[]? | select(.tag=="tuic-warp-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    cur_anytls_warp_port=$(jq -r '.inbounds[]? | select(.tag=="anytls-warp-in") | .listen_port' /etc/s-box/sb.json 2>/dev/null)
-    
-    [[ -n "$cur_vless_port" && "$cur_vless_port" != "null" ]] && PORT_VLESS="$cur_vless_port"
-    [[ -n "$cur_vless_warp_port" && "$cur_vless_warp_port" != "null" ]] && PORT_VLESS_WARP="$cur_vless_warp_port"
-    [[ -n "$cur_vmess_port" && "$cur_vmess_port" != "null" ]] && PORT_VMESS="$cur_vmess_port"
-    [[ -n "$cur_vmess_warp_port" && "$cur_vmess_warp_port" != "null" ]] && PORT_VMESS_WARP="$cur_vmess_warp_port"
-    [[ -n "$cur_trojan_port" && "$cur_trojan_port" != "null" ]] && PORT_TROJAN_TLS="$cur_trojan_port"
-    [[ -n "$cur_trojan_warp_port" && "$cur_trojan_warp_port" != "null" ]] && PORT_TROJAN_TLS_WARP="$cur_trojan_warp_port"
-    [[ -n "$cur_hy2_port" && "$cur_hy2_port" != "null" ]] && PORT_HY2="$cur_hy2_port"
-    [[ -n "$cur_hy2_warp_port" && "$cur_hy2_warp_port" != "null" ]] && PORT_HY2_WARP="$cur_hy2_warp_port"
-    [[ -n "$cur_tuic_port" && "$cur_tuic_port" != "null" ]] && PORT_TUIC="$cur_tuic_port"
-    [[ -n "$cur_tuic_warp_port" && "$cur_tuic_warp_port" != "null" ]] && PORT_TUIC_WARP="$cur_tuic_warp_port"
-    [[ -n "$cur_anytls_port" && "$cur_anytls_port" != "null" ]] && PORT_ANYTLS="$cur_anytls_port"
-    [[ -n "$cur_anytls_warp_port" && "$cur_anytls_warp_port" != "null" ]] && PORT_ANYTLS_WARP="$cur_anytls_warp_port"
-fi
-
-echo "=================================================="
-echo "          请选择端口配置方式"
-echo "=================================================="
-echo "1. 自动随机端口分配 (20000-60000 范围，直接回车)"
-echo "2. 手动为每个选定协议指定固定端口"
-echo "3. 指定自定义端口范围并在此范围内随机分配"
-echo "=================================================="
-read -p "请输入选项 [1-3, 默认1]: " port_choice
-
-if [[ "$port_choice" == "2" ]]; then
-    is_enabled "$ENABLE_VLESS" && PORT_VLESS=$(get_custom_port "VLESS-Reality" "${PORT_VLESS:-28201}")
-    is_enabled "$ENABLE_VLESS_WARP" && PORT_VLESS_WARP=$(get_custom_port "VLESS-Reality-WARP" "${PORT_VLESS_WARP:-28211}")
-    if is_enabled "$ENABLE_VMESS"; then
-        if is_enabled "$ENABLE_ARGO" && ! is_enabled "$USE_NGINX"; then
-            PORT_VMESS=8401
-            log_info "Argo 免 Nginx 穿透 VMess-WS，本地端口已自动固定为 8401。"
-        else
-            PORT_VMESS=$(get_custom_port "VMess-WS" "${PORT_VMESS:-38202}")
-        fi
-    fi
-    is_enabled "$ENABLE_VMESS_WARP" && PORT_VMESS_WARP=$(get_custom_port "VMess-WS-WARP" "${PORT_VMESS_WARP:-38212}")
-    is_enabled "$ENABLE_TROJAN" && PORT_TROJAN_TLS=$(get_custom_port "Trojan-WS-TLS" "${PORT_TROJAN_TLS:-48203}")
-    is_enabled "$ENABLE_TROJAN_WARP" && PORT_TROJAN_TLS_WARP=$(get_custom_port "Trojan-WS-TLS-WARP" "${PORT_TROJAN_TLS_WARP:-48213}")
-    if is_enabled "$ENABLE_ARGO"; then
-        if is_enabled "$ENABLE_TROJAN"; then
-            if ! is_enabled "$USE_NGINX"; then
-                if is_enabled "$ENABLE_VMESS"; then
-                    PORT_TROJAN_WS=8402
-                    log_info "Argo 免 Nginx 穿透 Trojan-WS，本地端口已自动固定为 8402。"
-                else
-                    PORT_TROJAN_WS=8401
-                    log_info "Argo 免 Nginx 穿透 Trojan-WS，本地端口已自动固定为 8401。"
-                fi
-            else
-                PORT_TROJAN_WS=$(get_custom_port "Trojan-WS (Argo内部)" "${PORT_TROJAN_WS:-58204}")
-            fi
-        fi
-        is_enabled "$USE_NGINX" && PORT_NGINX=8401
-    fi
-    is_enabled "$ENABLE_HY2" && PORT_HY2=$(get_custom_port "Hysteria2" "${PORT_HY2:-21092}")
-    is_enabled "$ENABLE_HY2_WARP" && PORT_HY2_WARP=$(get_custom_port "Hysteria2-WARP" "${PORT_HY2_WARP:-21102}")
-    is_enabled "$ENABLE_TUIC" && PORT_TUIC=$(get_custom_port "TUIC v5" "${PORT_TUIC:-33104}")
-    is_enabled "$ENABLE_TUIC_WARP" && PORT_TUIC_WARP=$(get_custom_port "TUIC-WARP" "${PORT_TUIC_WARP:-33114}")
-    is_enabled "$ENABLE_ANYTLS" && PORT_ANYTLS=$(get_custom_port "AnyTLS" "${PORT_ANYTLS:-48205}")
-    is_enabled "$ENABLE_ANYTLS_WARP" && PORT_ANYTLS_WARP=$(get_custom_port "AnyTLS-WARP" "${PORT_ANYTLS_WARP:-48215}")
-elif [[ "$port_choice" == "3" ]]; then
-    read start_p end_p <<< $(get_port_range)
-    is_enabled "$ENABLE_VLESS" && [[ -z "$PORT_VLESS" ]] && PORT_VLESS=$(get_random_port_in_range $start_p $end_p)
-    is_enabled "$ENABLE_VLESS_WARP" && [[ -z "$PORT_VLESS_WARP" ]] && PORT_VLESS_WARP=$(get_random_port_in_range $start_p $end_p)
-    if is_enabled "$ENABLE_VMESS"; then
-        if is_enabled "$ENABLE_ARGO" && ! is_enabled "$USE_NGINX"; then
-            PORT_VMESS=8401
-        else
-            [[ -z "$PORT_VMESS" ]] && PORT_VMESS=$(get_random_port_in_range $start_p $end_p)
-        fi
-    fi
-    is_enabled "$ENABLE_VMESS_WARP" && [[ -z "$PORT_VMESS_WARP" ]] && PORT_VMESS_WARP=$(get_random_port_in_range $start_p $end_p)
-    is_enabled "$ENABLE_TROJAN" && [[ -z "$PORT_TROJAN_TLS" ]] && PORT_TROJAN_TLS=$(get_random_port_in_range $start_p $end_p)
-    is_enabled "$ENABLE_TROJAN_WARP" && [[ -z "$PORT_TROJAN_TLS_WARP" ]] && PORT_TROJAN_TLS_WARP=$(get_random_port_in_range $start_p $end_p)
-    if is_enabled "$ENABLE_ARGO"; then
-        if is_enabled "$ENABLE_TROJAN"; then
-            if ! is_enabled "$USE_NGINX"; then
-                if is_enabled "$ENABLE_VMESS"; then
-                    PORT_TROJAN_WS=8402
-                else
-                    PORT_TROJAN_WS=8401
-                fi
-            else
-                [[ -z "$PORT_TROJAN_WS" ]] && PORT_TROJAN_WS=$(get_random_port_in_range $start_p $end_p)
-            fi
-        fi
-        is_enabled "$USE_NGINX" && PORT_NGINX=8401
-    fi
-    is_enabled "$ENABLE_HY2" && [[ -z "$PORT_HY2" ]] && PORT_HY2=$(get_random_port_in_range $start_p $end_p)
-    is_enabled "$ENABLE_HY2_WARP" && [[ -z "$PORT_HY2_WARP" ]] && PORT_HY2_WARP=$(get_random_port_in_range $start_p $end_p)
-    is_enabled "$ENABLE_TUIC" && [[ -z "$PORT_TUIC" ]] && PORT_TUIC=$(get_random_port_in_range $start_p $end_p)
-    is_enabled "$ENABLE_TUIC_WARP" && [[ -z "$PORT_TUIC_WARP" ]] && PORT_TUIC_WARP=$(get_random_port_in_range $start_p $end_p)
-    is_enabled "$ENABLE_ANYTLS" && [[ -z "$PORT_ANYTLS" ]] && PORT_ANYTLS=$(get_random_port_in_range $start_p $end_p)
-    is_enabled "$ENABLE_ANYTLS_WARP" && [[ -z "$PORT_ANYTLS_WARP" ]] && PORT_ANYTLS_WARP=$(get_random_port_in_range $start_p $end_p)
-else
-    is_enabled "$ENABLE_VLESS" && [[ -z "$PORT_VLESS" ]] && PORT_VLESS=$(get_random_port_in_range 20000 60000)
-    is_enabled "$ENABLE_VLESS_WARP" && [[ -z "$PORT_VLESS_WARP" ]] && PORT_VLESS_WARP=$(get_random_port_in_range 20000 60000)
-    if is_enabled "$ENABLE_VMESS"; then
-        if is_enabled "$ENABLE_ARGO" && ! is_enabled "$USE_NGINX"; then
-            PORT_VMESS=8401
-        else
-            [[ -z "$PORT_VMESS" ]] && PORT_VMESS=$(get_random_port_in_range 20000 60000)
-        fi
-    fi
-    is_enabled "$ENABLE_VMESS_WARP" && [[ -z "$PORT_VMESS_WARP" ]] && PORT_VMESS_WARP=$(get_random_port_in_range 20000 60000)
-    is_enabled "$ENABLE_TROJAN" && [[ -z "$PORT_TROJAN_TLS" ]] && PORT_TROJAN_TLS=$(get_random_port_in_range 20000 60000)
-    is_enabled "$ENABLE_TROJAN_WARP" && [[ -z "$PORT_TROJAN_TLS_WARP" ]] && PORT_TROJAN_TLS_WARP=$(get_random_port_in_range 20000 60000)
-    if is_enabled "$ENABLE_ARGO"; then
-        if is_enabled "$ENABLE_TROJAN"; then
-            if ! is_enabled "$USE_NGINX"; then
-                if is_enabled "$ENABLE_VMESS"; then
-                    PORT_TROJAN_WS=8402
-                else
-                    PORT_TROJAN_WS=8401
-                fi
-            else
-                [[ -z "$PORT_TROJAN_WS" ]] && PORT_TROJAN_WS=$(get_random_port_in_range 20000 60000)
-            fi
-        fi
-        is_enabled "$USE_NGINX" && PORT_NGINX=8401
-    fi
-    is_enabled "$ENABLE_HY2" && [[ -z "$PORT_HY2" ]] && PORT_HY2=$(get_random_port_in_range 20000 60000)
-    is_enabled "$ENABLE_HY2_WARP" && [[ -z "$PORT_HY2_WARP" ]] && PORT_HY2_WARP=$(get_random_port_in_range 20000 60000)
-    is_enabled "$ENABLE_TUIC" && [[ -z "$PORT_TUIC" ]] && PORT_TUIC=$(get_random_port_in_range 20000 60000)
-    is_enabled "$ENABLE_TUIC_WARP" && [[ -z "$PORT_TUIC_WARP" ]] && PORT_TUIC_WARP=$(get_random_port_in_range 20000 60000)
-    is_enabled "$ENABLE_ANYTLS" && [[ -z "$PORT_ANYTLS" ]] && PORT_ANYTLS=$(get_random_port_in_range 20000 60000)
-    is_enabled "$ENABLE_ANYTLS_WARP" && [[ -z "$PORT_ANYTLS_WARP" ]] && PORT_ANYTLS_WARP=$(get_random_port_in_range 20000 60000)
-fi
-
-ARGO_PORT=""
-if is_enabled "$ENABLE_ARGO"; then
-    if is_enabled "$USE_NGINX"; then
-        ARGO_PORT=$PORT_NGINX
-    else
-        ARGO_PORT=8401
-    fi
-fi
-
-# 获取服务器公网 IP
-IPV4=$(curl -s4m5 icanhazip.com || curl -s4m5 api.ipify.org)
-IPV6=$(curl -s6m5 icanhazip.com || curl -s6m5 api6.ipify.org)
-IP=${IPV4:-$IPV6}
-SINGBOX_PUBLIC_LISTEN="0.0.0.0"
-if [[ -z "$IPV4" && -n "$IPV6" ]]; then
-    SINGBOX_PUBLIC_LISTEN="::"
-fi
-SINGBOX_LOCAL_LISTEN="127.0.0.1"
-
-# 8. 动态生成 sing-box 配置文件 sb.json
-log_info "正在生成 sing-box 配置文件..."
-inbounds=()
-
-if is_enabled "$ENABLE_VLESS"; then
-    inbounds+=('{
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_VLESS}"',
-      "users": [
-        {
-          "uuid": "'"${UUID}"'",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "apple.com",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "apple.com",
-            "server_port": 443
-          },
-          "private_key": "'"${private_key}"'",
-          "short_id": [
-            "'"${short_id}"'"
-          ]
-        }
-      }
-    }')
-fi
-
-if is_enabled "$ENABLE_VMESS"; then
-    inbounds+=('{
-      "type": "vmess",
-      "tag": "vmess-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_VMESS}"',
-      "users": [
-        {
-          "uuid": "'"${UUID}"'",
-          "alterId": 0
-        }
-      ],
-      "transport": {
-        "type": "ws",
-        "path": "/'"${UUID}"'-vm",
-        "max_early_data": 2048,
-        "early_data_header_name": "Sec-WebSocket-Protocol"
-      }
-    }')
-fi
-
-if is_enabled "$ENABLE_TROJAN"; then
-    inbounds+=('{
-      "type": "trojan",
-      "tag": "trojan-tls-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_TROJAN_TLS}"',
-      "users": [
-        {
-          "password": "'"${UUID}"'"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      },
-      "transport": {
-        "type": "ws",
-        "path": "/'"${UUID}"'-tr"
-      }
-    }')
-fi
-
-# 如果启用了 Argo，且启用了 Trojan，则为 Argo 创建无 TLS 的 Trojan 端口
-if is_enabled "$ENABLE_ARGO" && is_enabled "$ENABLE_TROJAN"; then
-    inbounds+=('{
-      "type": "trojan",
-      "tag": "trojan-ws-in",
-      "listen": "'"${SINGBOX_LOCAL_LISTEN}"'",
-      "listen_port": '"${PORT_TROJAN_WS}"',
-      "users": [
-        {
-          "password": "'"${UUID}"'"
-        }
-      ],
-      "transport": {
-        "type": "ws",
-        "path": "/'"${UUID}"'-tr-argo"
-      }
-    }')
-fi
-
-if is_enabled "$ENABLE_HY2"; then
-    inbounds+=('{
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_HY2}"',
-      "users": [
-        {
-          "password": "'"${UUID}"'"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": [
-          "h3"
-        ],
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      }
-    }')
-fi
-
-if is_enabled "$ENABLE_TUIC"; then
-    inbounds+=('{
-      "type": "tuic",
-      "tag": "tuic-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_TUIC}"',
-      "users": [
-        {
-          "uuid": "'"${UUID}"'",
-          "password": "'"${UUID}"'"
-        }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "alpn": [
-          "h3"
-        ],
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      }
-    }')
-fi
-
-if is_enabled "$ENABLE_ANYTLS"; then
-    inbounds+=('{
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_ANYTLS}"',
-      "users": [
-        {
-          "password": "'"${UUID}"'"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      }
-    }')
-fi
-
-# 开始生成走 WARP 的节点 inbounds
-if is_enabled "$ENABLE_VLESS_WARP"; then
-    inbounds+=('{
-      "type": "vless",
-      "tag": "vless-warp-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_VLESS_WARP}"',
-      "users": [
-        {
-          "uuid": "'"${UUID}"'",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "apple.com",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "apple.com",
-            "server_port": 443
-          },
-          "private_key": "'"${private_key}"'",
-          "short_id": [
-            "'"${short_id}"'"
-          ]
-        }
-      }
-    }')
-fi
-
-if is_enabled "$ENABLE_VMESS_WARP"; then
-    inbounds+=('{
-      "type": "vmess",
-      "tag": "vmess-warp-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_VMESS_WARP}"',
-      "users": [
-        {
-          "uuid": "'"${UUID}"'",
-          "alterId": 0
-        }
-      ],
-      "transport": {
-        "type": "ws",
-        "path": "/'"${UUID}"'-vm-warp",
-        "max_early_data": 2048,
-        "early_data_header_name": "Sec-WebSocket-Protocol"
-      }
-    }')
-fi
-
-if is_enabled "$ENABLE_TROJAN_WARP"; then
-    inbounds+=('{
-      "type": "trojan",
-      "tag": "trojan-tls-warp-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_TROJAN_TLS_WARP}"',
-      "users": [
-        {
-          "password": "'"${UUID}"'"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      },
-      "transport": {
-        "type": "ws",
-        "path": "/'"${UUID}"'-tr-warp"
-      }
-    }')
-fi
-
-if is_enabled "$ENABLE_HY2_WARP"; then
-    inbounds+=('{
-      "type": "hysteria2",
-      "tag": "hy2-warp-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_HY2_WARP}"',
-      "users": [
-        {
-          "password": "'"${UUID}"'"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": [
-          "h3"
-        ],
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      }
-    }')
-fi
-
-if is_enabled "$ENABLE_TUIC_WARP"; then
-    inbounds+=('{
-      "type": "tuic",
-      "tag": "tuic-warp-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_TUIC_WARP}"',
-      "users": [
-        {
-          "uuid": "'"${UUID}"'",
-          "password": "'"${UUID}"'"
-        }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "alpn": [
-          "h3"
-        ],
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      }
-    }')
-fi
-
-if is_enabled "$ENABLE_ANYTLS_WARP"; then
-    inbounds+=('{
-      "type": "anytls",
-      "tag": "anytls-warp-in",
-      "listen": "'"${SINGBOX_PUBLIC_LISTEN}"'",
-      "listen_port": '"${PORT_ANYTLS_WARP}"',
-      "users": [
-        {
-          "password": "'"${UUID}"'"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      }
-    }')
-fi
-
-# 将 inbounds 数组转为 JSON 片段
-inbounds_json=""
-for i in "${!inbounds[@]}"; do
-    if [[ $i -eq 0 ]]; then
-        inbounds_json="${inbounds[$i]}"
-    else
-        inbounds_json="${inbounds_json},${inbounds[$i]}"
-    fi
-done
-
-any_warp_enabled=false
-if is_enabled "$ENABLE_VLESS_WARP" || is_enabled "$ENABLE_VMESS_WARP" || is_enabled "$ENABLE_TROJAN_WARP" || is_enabled "$ENABLE_HY2_WARP" || is_enabled "$ENABLE_TUIC_WARP" || is_enabled "$ENABLE_ANYTLS_WARP"; then
-    any_warp_enabled=true
-fi
-
-outbounds_json='{
-      "type": "direct",
-      "tag": "direct"
-    }'
-
-route_json=""
-endpoints_json=""
-
-if $any_warp_enabled; then
-    log_info "正在获取 WARP 出站配置凭证..."
-    get_warp_credentials
-    
-    endpoints_json=",
-  \"endpoints\": [
-    {
-      \"type\": \"wireguard\",
-      \"tag\": \"warp-out\",
-      \"address\": [
-        \"172.16.0.2/32\",
-        \"${WARP_IPV6}/128\"
-      ],
-      \"private_key\": \"${WARP_PVK}\",
-      \"peers\": [
-        {
-          \"address\": \"162.159.192.1\",
-          \"port\": 2408,
-          \"public_key\": \"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=\",
-          \"allowed_ips\": [\"0.0.0.0/0\", \"::/0\"],
-          \"reserved\": ${WARP_RES}
-        }
-      ],
-      \"mtu\": 1280
-    }
-  ]"
-    
-    warp_tags=()
-    is_enabled "$ENABLE_VLESS_WARP" && warp_tags+=('"vless-warp-in"')
-    is_enabled "$ENABLE_VMESS_WARP" && warp_tags+=('"vmess-warp-in"')
-    is_enabled "$ENABLE_TROJAN_WARP" && warp_tags+=('"trojan-tls-warp-in"')
-    is_enabled "$ENABLE_HY2_WARP" && warp_tags+=('"hy2-warp-in"')
-    is_enabled "$ENABLE_TUIC_WARP" && warp_tags+=('"tuic-warp-in"')
-    is_enabled "$ENABLE_ANYTLS_WARP" && warp_tags+=('"anytls-warp-in"')
-    
-    warp_tags_json=""
-    for i in "${!warp_tags[@]}"; do
-        if [[ $i -eq 0 ]]; then
-            warp_tags_json="${warp_tags[$i]}"
-        else
-            warp_tags_json="${warp_tags_json},${warp_tags[$i]}"
-        fi
-    done
-    
-    route_json=",
-  \"route\": {
-    \"rules\": [
-      {
-        \"inbound\": [
-          ${warp_tags_json}
-        ],
-        \"outbound\": \"warp-out\"
-      }
-    ]
-  }"
-fi
-
-cat > /etc/s-box/sb.json <<EOF
+    cat > "$WORKDIR/sb.json" <<EOF_SB_JSON
 {
   "log": {
     "disabled": false,
     "level": "info",
     "timestamp": true
   },
+  "dns": {
+    "servers": [
+      {
+        "address": "8.8.8.8",
+        "address_resolver": "local"
+      },
+      {
+        "tag": "local",
+        "address": "local"
+      }
+    ]
+  },
   "inbounds": [
-    ${inbounds_json}
+    {
+      "tag": "vless-reality-in",
+      "type": "vless",
+      "listen": "::",
+      "listen_port": ${PORT_VLESS},
+      "users": [{"uuid": "${UUID}", "flow": "xtls-rprx-vision"}],
+      "tls": {
+        "enabled": true,
+        "server_name": "apple.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {"server": "apple.com", "server_port": 443},
+          "private_key": "${REALITY_PVK}",
+          "short_id": [""]
+        }
+      }
+    },
+    {
+      "tag": "vmess-ws-in",
+      "type": "vmess",
+      "listen": "::",
+      "listen_port": ${PORT_VMESS},
+      "users": [{"uuid": "${UUID}"}],
+      "transport": {
+        "type": "ws",
+        "path": "/${UUID}-vm"
+      }
+    },
+    {
+      "tag": "trojan-ws-in",
+      "type": "trojan",
+      "listen": "::",
+      "listen_port": ${PORT_TROJAN_TLS},
+      "users": [{"password": "${UUID}"}],
+      "transport": {
+        "type": "ws",
+        "path": "/${UUID}-tr"
+      },
+      "tls": {
+        "enabled": true,
+        "certificate_path": "/etc/s-box/cert.pem",
+        "key_path": "/etc/s-box/private.key"
+      }
+    },
+    {
+      "tag": "hy2-in",
+      "type": "hysteria2",
+      "listen": "::",
+      "listen_port": ${PORT_HY2},
+      "users": [{"password": "${UUID}"}],
+      "masquerade": "https://www.bing.com",
+      "ignore_client_bandwidth": false,
+      "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "certificate_path": "/etc/s-box/cert.pem",
+        "key_path": "/etc/s-box/private.key"
+      }
+    },
+    {
+      "tag": "tuic-in",
+      "type": "tuic",
+      "listen": "::",
+      "listen_port": ${PORT_TUIC},
+      "users": [{"uuid": "${UUID}", "password": "${UUID}"}],
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "alpn": ["h3"],
+        "certificate_path": "/etc/s-box/cert.pem",
+        "key_path": "/etc/s-box/private.key"
+      }
+    },
+    {
+      "tag": "anytls-in",
+      "type": "anytls",
+      "listen": "::",
+      "listen_port": ${PORT_ANYTLS},
+      "users": [{"password": "${UUID}"}],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.bing.com",
+        "certificate_path": "/etc/s-box/cert.pem",
+        "key_path": "/etc/s-box/private.key"
+      }
+    },
+    {
+      "tag": "socks-loopback",
+      "type": "socks",
+      "listen": "127.0.0.1",
+      "listen_port": ${PORT_LOOPBACK}
+    }
   ],
   "outbounds": [
-    ${outbounds_json}
-  ]${endpoints_json}${route_json}
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": ["socks-loopback"],
+        "outbound": "direct"
+      }
+    ],
+    "final": "direct"
+  }
 }
-EOF
+EOF_SB_JSON
 
-if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json >/tmp/s-box-check.log 2>&1; then
-    log_err "sing-box 配置校验失败，服务不会启动。错误如下："
-    cat /tmp/s-box-check.log
-    exit 1
-fi
-
-# 9. 配置 Nginx（仅如果启用了 Argo 且启用了 Nginx）
-if is_enabled "$ENABLE_ARGO" && is_enabled "$USE_NGINX"; then
-    log_info "正在配置 Nginx..."
-    
-    # 动态写入 nginx location 块
-    nginx_locations=""
-    if is_enabled "$ENABLE_VMESS"; then
-        nginx_locations="${nginx_locations}
-    location /${UUID}-vm {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:${PORT_VMESS};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \"upgrade\";
-        proxy_set_header Host \$http_host;
-    }"
-    fi
-
-    if is_enabled "$ENABLE_TROJAN"; then
-        nginx_locations="${nginx_locations}
-    location /${UUID}-tr-argo {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:${PORT_TROJAN_WS};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \"upgrade\";
-        proxy_set_header Host \$http_host;
-    }"
-    fi
-
-    # 删除 Alpine/Debian 默认的 Nginx 站点配置，避免冲突
-    rm -f ${NGINX_CONF_DIR}/default.conf 2>/dev/null
-    rm -f /etc/nginx/sites-enabled/default 2>/dev/null
-
-    listen_ipv6=""
-    if [[ -f /proc/sys/net/ipv6/conf/all/disable_ipv6 && $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) -ne 1 ]]; then
-        listen_ipv6="listen [::1]:${PORT_NGINX};"
-    fi
-
-    cat > ${NGINX_CONF_DIR}/singbox-argo.conf <<EOF
-server {
-    listen 127.0.0.1:${PORT_NGINX};
-    ${listen_ipv6}
-    server_name localhost;
-    ${nginx_locations}
-}
-EOF
-    # 测试 Nginx 配置是否合法
-    if ! nginx -t >/dev/null 2>&1; then
-        log_warn "Nginx 配置测试失败，尝试修复..."
-        nginx -t 2>&1 | tail -n 5
-    fi
-    service_enable nginx
-    service_restart nginx
-    # 验证 Nginx 是否真正监听了指定端口
-    sleep 1
-    if ss -tlnp 2>/dev/null | grep -q ":${PORT_NGINX} " || netstat -tlnp 2>/dev/null | grep -q ":${PORT_NGINX} "; then
-        log_info "Nginx 已成功启动并监听端口 ${PORT_NGINX}"
-    else
-        log_warn "Nginx 未在端口 ${PORT_NGINX} 上监听，请检查 Nginx 配置！"
-        nginx -t 2>&1
-    fi
-else
-    # 如果没启用 Nginx，为防止原有的 nginx 进程残留运行并占用端口，主动关闭并禁用它
-    if which nginx >/dev/null 2>&1 || command -v nginx >/dev/null 2>&1; then
-        log_info "正在停止可能残留运行的 Nginx 服务..."
-        service_stop nginx
-        service_disable nginx
-    fi
-fi
-
-# 10. 创建守护服务
-if $IS_OPENRC; then
-    log_info "正在创建 OpenRC 服务..."
-    
-    # Sing-box OpenRC 服务
-    cat > /etc/init.d/sing-box <<EOF
+    # 注册 systemd 或 openrc 服务
+    if $IS_OPENRC; then
+        cat > /etc/init.d/sing-box <<'EOF_INIT'
 #!/sbin/openrc-run
-name="sing-box"
 description="Sing-box Service"
 command="/etc/s-box/sing-box"
 command_args="run -c /etc/s-box/sb.json"
-command_background="yes"
-pidfile="/run/\${RC_SVCNAME}.pid"
+pidfile="/run/sing-box.pid"
+command_background=true
 output_log="/var/log/sing-box.log"
-error_log="/var/log/sing-box.log"
-depend() {
-    need net
-    after firewall
-}
-EOF
-    chmod +x /etc/init.d/sing-box
-    service_enable sing-box
-    service_restart sing-box
-elif $IS_DIRECT; then
-    log_info "正在以直接进程模式启动 sing-box..."
-    : > /var/log/sing-box.log 2>/dev/null
-    nohup /etc/s-box/sing-box run -c /etc/s-box/sb.json >> /var/log/sing-box.log 2>&1 &
-    echo $! > /etc/s-box/sing-box.pid
-else
-    log_info "正在创建 systemd 服务..."
-    
-    # Sing-box 服务
-    cat > /etc/systemd/system/sing-box.service <<EOF
+error_log="/var/log/sing-box.err"
+EOF_INIT
+        chmod +x /etc/init.d/sing-box
+        rc-update add sing-box default >/dev/null 2>&1
+    elif ! $IS_DIRECT; then
+        cat > /etc/systemd/system/sing-box.service <<'EOF_SYSTEMD'
 [Unit]
 Description=Sing-box Service
 After=network.target nss-lookup.target
 
 [Service]
-User=root
-WorkingDirectory=/etc/s-box
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 ExecStart=/etc/s-box/sing-box run -c /etc/s-box/sb.json
-Restart=on-failure
-RestartSec=10
+Restart=always
+RestartSec=3
 LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable sing-box
-    systemctl restart sing-box
-fi
-
-sleep 1
-if ! service_is_active sing-box; then
-    log_err "sing-box 服务启动失败，请查看下面的日志。"
-    if $IS_OPENRC || $IS_DIRECT; then
-        tail -n 50 /var/log/sing-box.log 2>/dev/null
-    else
-        journalctl -u sing-box -n 50 --no-pager
-    fi
-    exit 1
-fi
-
-# Argo 隧道服务（仅在启用 Argo 时）
-if is_enabled "$ENABLE_ARGO"; then
-    # 优先使用交互确定的变量，否则读取已有配置
-    argo_mode="${ARGO_MODE:-temp}"
-    argo_token="${ARGO_TOKEN}"
-    argo_domain="${ARGO_DOMAIN}"
-    if [[ -z "$ARGO_TOKEN" && -f /etc/s-box/argo.conf ]]; then
-        source /etc/s-box/argo.conf
-        argo_mode=$ARGO_MODE
-        argo_token=$ARGO_TOKEN
-        argo_domain=$ARGO_DOMAIN
+EOF_SYSTEMD
+        systemctl daemon-reload >/dev/null 2>&1
+        systemctl enable sing-box >/dev/null 2>&1
     fi
 
-    argo_depend="net sing-box"
-    if is_enabled "$USE_NGINX"; then
-        argo_depend="net sing-box nginx"
-    fi
-
-    if $IS_OPENRC; then
-        cf_args="tunnel --url http://127.0.0.1:${ARGO_PORT}"
-        if [[ "$argo_mode" == "token" ]]; then
-            cf_args="tunnel --no-autoupdate run --token ${argo_token}"
-        fi
-        cat > /etc/init.d/argo-tunnel <<EOF
-#!/sbin/openrc-run
-name="argo-tunnel"
-description="Argo Tunnel Service"
-command="/usr/local/bin/cloudflared"
-command_args="${cf_args}"
-command_background="yes"
-pidfile="/run/\${RC_SVCNAME}.pid"
-output_log="/var/log/argo-tunnel.log"
-error_log="/var/log/argo-tunnel.log"
-depend() {
-    need ${argo_depend}
-}
-EOF
-        chmod +x /etc/init.d/argo-tunnel
-        service_enable argo-tunnel
-        # 清空旧日志，避免提取到旧域名
-        : > /var/log/argo-tunnel.log 2>/dev/null
-        : > /var/log/argo-tunnel.err 2>/dev/null
-        service_restart argo-tunnel
-    elif $IS_DIRECT; then
-        # 直接进程模式：先保存 argo.conf 再用 nohup 启动
-        : > /var/log/argo-tunnel.log 2>/dev/null
-        if [[ "$argo_mode" == "token" ]]; then
-            nohup /usr/local/bin/cloudflared tunnel --no-autoupdate run --token "$argo_token" >> /var/log/argo-tunnel.log 2>&1 &
-        else
-            nohup /usr/local/bin/cloudflared tunnel --url "http://127.0.0.1:${ARGO_PORT}" >> /var/log/argo-tunnel.log 2>&1 &
-        fi
-        echo $! > /etc/s-box/argo-tunnel.pid
-    else
-        cf_exec="/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:${ARGO_PORT}"
-        if [[ "$argo_mode" == "token" ]]; then
-            cf_exec="/usr/local/bin/cloudflared tunnel --no-autoupdate run --token ${argo_token}"
-        fi
-        cat > /etc/systemd/system/argo-tunnel.service <<EOF
-[Unit]
-Description=Argo Tunnel Service
-After=network.target
-
-[Service]
-User=root
-ExecStart=${cf_exec}
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        systemctl daemon-reload
-        systemctl enable argo-tunnel
-        systemctl restart argo-tunnel
-    fi
-
-    if [[ "$argo_mode" == "token" ]]; then
-        ARGO_DOMAIN="${argo_domain:-$ARGO_DOMAIN}"
-        if ! is_enabled "$USE_NGINX"; then
-            echo "${ARGO_VMESS_DOMAIN:-$ARGO_TROJAN_DOMAIN}" > /etc/s-box/argo.log
-        else
-            echo "$ARGO_DOMAIN" > /etc/s-box/argo.log
-        fi
-        cat > /etc/s-box/argo.conf <<EOF_ARGO
-ARGO_MODE="token"
-ARGO_TOKEN="${argo_token}"
-ARGO_DOMAIN="${ARGO_DOMAIN}"
-ARGO_VMESS_DOMAIN="${ARGO_VMESS_DOMAIN}"
-ARGO_TROJAN_DOMAIN="${ARGO_TROJAN_DOMAIN}"
-USE_NGINX="${USE_NGINX}"
-ARGO_PORT="${ARGO_PORT}"
-EOF_ARGO
-    else
-        log_info "正在等待 Argo 隧道上线，获取节点临时域名..."
-        sleep 6
-
-        # 提取 trycloudflare 域名
-        ARGO_DOMAIN=""
-        for i in {1..5}; do
-            if $IS_OPENRC || $IS_DIRECT; then
-                ARGO_DOMAIN=$(cat /var/log/argo-tunnel.log /var/log/argo-tunnel.err 2>/dev/null | grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' | tail -n 1)
-            else
-                ARGO_DOMAIN=$(journalctl -u argo-tunnel -n 50 --no-pager | grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' | tail -n 1)
-            fi
-            if [[ -n "$ARGO_DOMAIN" ]]; then
-                break
-            fi
-            sleep 3
-        done
-
-        if [[ -z "$ARGO_DOMAIN" ]]; then
-            if $IS_OPENRC || $IS_DIRECT; then
-                log_warn "获取 Argo 域名超时，请稍后查看 /var/log/argo-tunnel.log。"
-            else
-                log_warn "获取 Argo 域名超时，请稍后使用 'journalctl -u argo-tunnel' 命令手动查看。"
-            fi
-            ARGO_DOMAIN="[未获取到Argo域名]"
-        fi
-        echo "$ARGO_DOMAIN" > /etc/s-box/argo.log
-        cat > /etc/s-box/argo.conf <<EOF_ARGO
-ARGO_MODE="temp"
-ARGO_TOKEN=""
-ARGO_DOMAIN="${ARGO_DOMAIN}"
-ARGO_VMESS_DOMAIN=""
-ARGO_TROJAN_DOMAIN=""
-USE_NGINX="${USE_NGINX}"
-ARGO_PORT="${ARGO_PORT}"
-EOF_ARGO
-    fi
-fi
-
-# 11. 节点输出与分享链接生成
-log_info "所有已选服务部署并启动完毕！"
-
-# 初始化 info.log
-cat > /etc/s-box/info.log <<EOF
+    # 生成 info.log
+    cat > "$WORKDIR/info.log" <<EOF_INFO
 ==================================================
-        Sing-box 多协议一键部署脚本 安装成功
+        Sing-box 多协议部署成功
 ==================================================
 通用密码/UUID: ${UUID}
-EOF
 
-any_direct_enabled=false
-if is_enabled "$ENABLE_VLESS" || is_enabled "$ENABLE_VMESS" || is_enabled "$ENABLE_TROJAN" || is_enabled "$ENABLE_HY2" || is_enabled "$ENABLE_TUIC" || is_enabled "$ENABLE_ANYTLS"; then
-    any_direct_enabled=true
-fi
-if $any_direct_enabled; then
-    echo "" >> /etc/s-box/info.log
-    echo "------------------【直连节点】--------------------" >> /etc/s-box/info.log
-fi
+------------------【主节点列表】--------------------
+1. VLESS-Reality:
+vless://${UUID}@${IP}:${PORT_VLESS}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=apple.com&fp=chrome&pbk=${REALITY_PBK}&sid=#SB-VLESS-Reality
 
-# 动态追加直连链接
-if is_enabled "$ENABLE_VLESS"; then
-    VLESS_LINK="vless://${UUID}@${IP}:${PORT_VLESS}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=apple.com&fp=chrome&pbk=${public_key}&sid=${short_id}#SB-VLESS-Reality"
-    echo "1. VLESS-Reality:" >> /etc/s-box/info.log
-    echo "${VLESS_LINK}" >> /etc/s-box/info.log
-    echo "" >> /etc/s-box/info.log
-fi
+2. VMess-WS:
+$(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess\",\"add\":\"${IP}\",\"port\":\"${PORT_VMESS}\",\"id\":\"${UUID}\",\"net\":\"ws\",\"path\":\"/${UUID}-vm\"}")
 
-if is_enabled "$ENABLE_VMESS"; then
-    VMESS_JSON=$(cat <<EOF
-{
-  "v": "2",
-  "ps": "SB-VMess-WS",
-  "add": "${IP}",
-  "port": "${PORT_VMESS}",
-  "id": "${UUID}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "",
-  "path": "/${UUID}-vm",
-  "tls": "none",
-  "sni": ""
+3. Trojan-WS-TLS:
+trojan://${UUID}@${IP}:${PORT_TROJAN_TLS}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=%2F${UUID}-tr#SB-Trojan-TLS
+
+4. Hysteria2:
+hysteria2://${UUID}@${IP}:${PORT_HY2}?insecure=1&sni=www.bing.com#SB-Hysteria2
+
+5. TUIC v5:
+tuic://${UUID}:${UUID}@${IP}:${PORT_TUIC}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5
+
+6. AnyTLS:
+anytls://${UUID}@${IP}:${PORT_ANYTLS}?security=tls&sni=www.bing.com&allowInsecure=1#SB-AnyTLS
+==================================================
+EOF_INFO
+
+    # 自动挂载所有副节点（若已有）
+    sync_all_secondary_nodes
+
+    # 启动 sing-box 服务
+    service_start sing-box
+
+    # 生成快捷工具
+    create_sb_tool
+
+    # 备份当前脚本至 /etc/s-box/install.sh
+    cp -f "$0" /etc/s-box/install.sh 2>/dev/null
+    chmod +x /etc/s-box/install.sh 2>/dev/null
+
+    # 写入 cron 守护任务
+    if ! crontab -l 2>/dev/null | grep -q "sb cron"; then
+        (crontab -l 2>/dev/null; echo "* * * * * /usr/local/bin/sb cron >> /etc/s-box/monitor.log 2>&1") | crontab - 2>/dev/null || true
+    fi
+
+    log_info "Sing-box 安装与部署完成！"
+    echo
+    cat "$WORKDIR/info.log"
+    echo
+    log_info "快捷管理命令: 【 sb 】"
 }
-EOF
-)
-    VMESS_LINK=$(make_vmess_link "$VMESS_JSON")
-    echo "2. VMess-WS (无TLS):" >> /etc/s-box/info.log
-    echo "${VMESS_LINK}" >> /etc/s-box/info.log
-    echo "" >> /etc/s-box/info.log
+
+# ==================== 入口调度 ====================
+if [[ "$1" == "reconfig" ]]; then
+    install_singbox_main
+    exit 0
 fi
 
-if is_enabled "$ENABLE_TROJAN"; then
-    TROJAN_PATH="/${UUID}-tr"
-    TROJAN_PATH_ENCODED=$(url_encode "$TROJAN_PATH")
-    TROJAN_LINK="trojan://${UUID}@${IP}:${PORT_TROJAN_TLS}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=${TROJAN_PATH_ENCODED}#SB-Trojan-WS-TLS"
-    echo "3. Trojan-WS-TLS (自签证书):" >> /etc/s-box/info.log
-    echo "${TROJAN_LINK}" >> /etc/s-box/info.log
-    echo "" >> /etc/s-box/info.log
-fi
-
-if is_enabled "$ENABLE_HY2"; then
-    HY2_LINK="hysteria2://${UUID}@${IP}:${PORT_HY2}?insecure=1&sni=www.bing.com#SB-Hysteria2"
-    echo "4. Hysteria2:" >> /etc/s-box/info.log
-    echo "${HY2_LINK}" >> /etc/s-box/info.log
-    echo "" >> /etc/s-box/info.log
-fi
-
-if is_enabled "$ENABLE_TUIC"; then
-    TUIC_LINK="tuic://${UUID}:${UUID}@${IP}:${PORT_TUIC}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5"
-    echo "5. TUIC v5:" >> /etc/s-box/info.log
-    echo "${TUIC_LINK}" >> /etc/s-box/info.log
-    echo "" >> /etc/s-box/info.log
-fi
-
-if is_enabled "$ENABLE_ANYTLS"; then
-    ANYTLS_LINK="anytls://${UUID}@${IP}:${PORT_ANYTLS}?security=tls&sni=www.bing.com&allowInsecure=1#SB-AnyTLS"
-    echo "6. AnyTLS:" >> /etc/s-box/info.log
-    echo "${ANYTLS_LINK}" >> /etc/s-box/info.log
-    echo "" >> /etc/s-box/info.log
-fi
-
-# 动态追加 WARP 链接
-any_warp_enabled=false
-if is_enabled "$ENABLE_VLESS_WARP" || is_enabled "$ENABLE_VMESS_WARP" || is_enabled "$ENABLE_TROJAN_WARP" || is_enabled "$ENABLE_HY2_WARP" || is_enabled "$ENABLE_TUIC_WARP" || is_enabled "$ENABLE_ANYTLS_WARP"; then
-    any_warp_enabled=true
-fi
-if $any_warp_enabled; then
-    echo "------------------【WARP出站节点】--------------------" >> /etc/s-box/info.log
-    
-    if is_enabled "$ENABLE_VLESS_WARP"; then
-        VLESS_WARP_LINK="vless://${UUID}@${IP}:${PORT_VLESS_WARP}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=apple.com&fp=chrome&pbk=${public_key}&sid=${short_id}#SB-VLESS-Reality-WARP"
-        echo "1. VLESS-Reality-WARP:" >> /etc/s-box/info.log
-        echo "${VLESS_WARP_LINK}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-    
-    if is_enabled "$ENABLE_VMESS_WARP"; then
-        VMESS_WARP_JSON=$(cat <<EOF
-{
-  "v": "2",
-  "ps": "SB-VMess-WS-WARP",
-  "add": "${IP}",
-  "port": "${PORT_VMESS_WARP}",
-  "id": "${UUID}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "",
-  "path": "/${UUID}-vm-warp",
-  "tls": "none",
-  "sni": ""
-}
-EOF
-)
-        VMESS_WARP_LINK=$(make_vmess_link "$VMESS_WARP_JSON")
-        echo "2. VMess-WS-WARP (无TLS):" >> /etc/s-box/info.log
-        echo "${VMESS_WARP_LINK}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-    
-    if is_enabled "$ENABLE_TROJAN_WARP"; then
-        TROJAN_WARP_PATH="/${UUID}-tr-warp"
-        TROJAN_WARP_PATH_ENCODED=$(url_encode "$TROJAN_WARP_PATH")
-        TROJAN_WARP_LINK="trojan://${UUID}@${IP}:${PORT_TROJAN_TLS_WARP}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=${TROJAN_WARP_PATH_ENCODED}#SB-Trojan-WS-TLS-WARP"
-        echo "3. Trojan-WS-TLS-WARP (自签证书):" >> /etc/s-box/info.log
-        echo "${TROJAN_WARP_LINK}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-    
-    if is_enabled "$ENABLE_HY2_WARP"; then
-        HY2_WARP_LINK="hysteria2://${UUID}@${IP}:${PORT_HY2_WARP}?insecure=1&sni=www.bing.com#SB-Hysteria2-WARP"
-        echo "4. Hysteria2-WARP:" >> /etc/s-box/info.log
-        echo "${HY2_WARP_LINK}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-    
-    if is_enabled "$ENABLE_TUIC_WARP"; then
-        TUIC_WARP_LINK="tuic://${UUID}:${UUID}@${IP}:${PORT_TUIC_WARP}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5-WARP"
-        echo "5. TUIC v5-WARP:" >> /etc/s-box/info.log
-        echo "${TUIC_WARP_LINK}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-    
-    if is_enabled "$ENABLE_ANYTLS_WARP"; then
-        ANYTLS_WARP_LINK="anytls://${UUID}@${IP}:${PORT_ANYTLS_WARP}?security=tls&sni=www.bing.com&allowInsecure=1#SB-AnyTLS-WARP"
-        echo "6. AnyTLS-WARP:" >> /etc/s-box/info.log
-        echo "${ANYTLS_WARP_LINK}" >> /etc/s-box/info.log
-        echo "" >> /etc/s-box/info.log
-    fi
-fi
-
-# 动态追加 Argo 链接
-if is_enabled "$ENABLE_ARGO"; then
-    echo "------------------【Argo穿透】--------------------" >> /etc/s-box/info.log
-    if [[ "$argo_mode" == "token" ]]; then
-        if is_enabled "$USE_NGINX"; then
-            echo "Argo 固定域名: ${ARGO_DOMAIN}" >> /etc/s-box/info.log
-        else
-            [[ -n "$ARGO_VMESS_DOMAIN" ]] && echo "VMess Argo 域名: ${ARGO_VMESS_DOMAIN}" >> /etc/s-box/info.log
-            [[ -n "$ARGO_TROJAN_DOMAIN" ]] && echo "Trojan Argo 域名: ${ARGO_TROJAN_DOMAIN}" >> /etc/s-box/info.log
-        fi
-    else
-        echo "Argo 临时域名: ${ARGO_DOMAIN}" >> /etc/s-box/info.log
-    fi
-    echo "" >> /etc/s-box/info.log
-
-    if is_enabled "$USE_NGINX"; then
-        if is_enabled "$ENABLE_VMESS"; then
-            VMESS_ARGO_JSON=$(cat <<EOF
-{
-  "v": "2",
-  "ps": "SB-VMess-Argo-80",
-  "add": "${ARGO_DOMAIN}",
-  "port": "80",
-  "id": "${UUID}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "${ARGO_DOMAIN}",
-  "path": "/${UUID}-vm",
-  "tls": "none",
-  "sni": ""
-}
-EOF
-)
-            VMESS_ARGO_80_LINK=$(make_vmess_link "$VMESS_ARGO_JSON")
-
-            VMESS_ARGO_TLS_JSON=$(cat <<EOF
-{
-  "v": "2",
-  "ps": "SB-VMess-Argo-443",
-  "add": "${ARGO_DOMAIN}",
-  "port": "443",
-  "id": "${UUID}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "${ARGO_DOMAIN}",
-  "path": "/${UUID}-vm",
-  "tls": "tls",
-  "sni": "${ARGO_DOMAIN}"
-}
-EOF
-)
-            VMESS_ARGO_443_LINK=$(make_vmess_link "$VMESS_ARGO_TLS_JSON")
-
-            echo "1. VMess Argo (80端口):" >> /etc/s-box/info.log
-            echo "${VMESS_ARGO_80_LINK}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-            echo "2. VMess Argo (443端口/TLS):" >> /etc/s-box/info.log
-            echo "${VMESS_ARGO_443_LINK}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-        fi
-
-        if is_enabled "$ENABLE_TROJAN"; then
-            TROJAN_ARGO_PATH="/${UUID}-tr-argo"
-            TROJAN_ARGO_PATH_ENCODED=$(url_encode "$TROJAN_ARGO_PATH")
-            TROJAN_ARGO_80_LINK="trojan://${UUID}@${ARGO_DOMAIN}:80?security=none&type=ws&path=${TROJAN_ARGO_PATH_ENCODED}&host=${ARGO_DOMAIN}#SB-Trojan-Argo-80"
-            TROJAN_ARGO_443_LINK="trojan://${UUID}@${ARGO_DOMAIN}:443?security=tls&sni=${ARGO_DOMAIN}&type=ws&path=${TROJAN_ARGO_PATH_ENCODED}&host=${ARGO_DOMAIN}#SB-Trojan-Argo-443"
-
-            echo "3. Trojan Argo (80端口):" >> /etc/s-box/info.log
-            echo "${TROJAN_ARGO_80_LINK}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-            echo "4. Trojan Argo (443端口/TLS):" >> /etc/s-box/info.log
-            echo "${TROJAN_ARGO_443_LINK}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-        fi
-    else
-        # 免 Nginx 模式，双子域名分别独立生成
-        argo_idx=1
-        if is_enabled "$ENABLE_VMESS" && [[ -n "$ARGO_VMESS_DOMAIN" ]]; then
-            VMESS_ARGO_JSON=$(cat <<EOF
-{
-  "v": "2",
-  "ps": "SB-VMess-Argo-80",
-  "add": "${ARGO_VMESS_DOMAIN}",
-  "port": "80",
-  "id": "${UUID}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "${ARGO_VMESS_DOMAIN}",
-  "path": "/${UUID}-vm",
-  "tls": "none",
-  "sni": ""
-}
-EOF
-)
-            VMESS_ARGO_80_LINK=$(make_vmess_link "$VMESS_ARGO_JSON")
-
-            VMESS_ARGO_TLS_JSON=$(cat <<EOF
-{
-  "v": "2",
-  "ps": "SB-VMess-Argo-443",
-  "add": "${ARGO_VMESS_DOMAIN}",
-  "port": "443",
-  "id": "${UUID}",
-  "aid": "0",
-  "scy": "auto",
-  "net": "ws",
-  "type": "none",
-  "host": "${ARGO_VMESS_DOMAIN}",
-  "path": "/${UUID}-vm",
-  "tls": "tls",
-  "sni": "${ARGO_VMESS_DOMAIN}"
-}
-EOF
-)
-            VMESS_ARGO_443_LINK=$(make_vmess_link "$VMESS_ARGO_TLS_JSON")
-
-            echo "${argo_idx}. VMess Argo (80端口):" >> /etc/s-box/info.log
-            echo "${VMESS_ARGO_80_LINK}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-            ((argo_idx++))
-            echo "${argo_idx}. VMess Argo (443端口/TLS):" >> /etc/s-box/info.log
-            echo "${VMESS_ARGO_443_LINK}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-            ((argo_idx++))
-        fi
-
-        if is_enabled "$ENABLE_TROJAN" && [[ -n "$ARGO_TROJAN_DOMAIN" ]]; then
-            TROJAN_ARGO_PATH="/${UUID}-tr-argo"
-            TROJAN_ARGO_PATH_ENCODED=$(url_encode "$TROJAN_ARGO_PATH")
-            TROJAN_ARGO_80_LINK="trojan://${UUID}@${ARGO_TROJAN_DOMAIN}:80?security=none&type=ws&path=${TROJAN_ARGO_PATH_ENCODED}&host=${ARGO_TROJAN_DOMAIN}#SB-Trojan-Argo-80"
-            TROJAN_ARGO_443_LINK="trojan://${UUID}@${ARGO_TROJAN_DOMAIN}:443?security=tls&sni=${ARGO_TROJAN_DOMAIN}&type=ws&path=${TROJAN_ARGO_PATH_ENCODED}&host=${ARGO_TROJAN_DOMAIN}#SB-Trojan-Argo-443"
-
-            echo "${argo_idx}. Trojan Argo (80端口):" >> /etc/s-box/info.log
-            echo "${TROJAN_ARGO_80_LINK}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-            ((argo_idx++))
-            echo "${argo_idx}. Trojan Argo (443端口/TLS):" >> /etc/s-box/info.log
-            echo "${TROJAN_ARGO_443_LINK}" >> /etc/s-box/info.log
-            echo "" >> /etc/s-box/info.log
-            ((argo_idx++))
-        fi
-    fi
-fi
-
-echo "==================================================" >> /etc/s-box/info.log
-
-# 创建 sb 快捷管理工具
-log_info "正在生成快捷管理工具 sb..."
-create_sb_tool
-
-# 备份一份 uninstall.sh 在 /etc/s-box 中以便 sb 工具直接调用
-if [[ -f ./uninstall.sh ]]; then
-    cp ./uninstall.sh /etc/s-box/uninstall.sh
+if [[ -f "$WORKDIR/sb.json" ]]; then
+    create_sb_tool
+    bash /usr/local/bin/sb
+    exit 0
 else
-    curl -sL https://raw.githubusercontent.com/hxzl666/singbox/main/uninstall.sh -o /etc/s-box/uninstall.sh 2>/dev/null \
-        || wget -qO /etc/s-box/uninstall.sh https://raw.githubusercontent.com/hxzl666/singbox/main/uninstall.sh 2>/dev/null
+    install_singbox_main
 fi
-chmod +x /etc/s-box/uninstall.sh 2>/dev/null
-
-# 备份 install.sh 本身以便 sb 管理菜单可调起重新配置
-if [[ -f ./install.sh ]]; then
-    cp ./install.sh /etc/s-box/install.sh
-elif [[ -f "$0" ]]; then
-    cp "$0" /etc/s-box/install.sh
-fi
-chmod +x /etc/s-box/install.sh 2>/dev/null
-
-# 添加守护自愈定时任务（每分钟检查一次）
-if ! crontab -l 2>/dev/null | grep -q "sb cron"; then
-    (crontab -l 2>/dev/null; echo "* * * * * /usr/local/bin/sb cron >> /etc/s-box/monitor.log 2>&1") | crontab -
-    : > /etc/s-box/monitor.log 2>/dev/null
-    log_info "已成功添加 Sing-box / Argo 服务监控守护定时任务。"
-fi
-
-# 打印信息到终端
-cat /etc/s-box/info.log
-
-# 提示固定隧道用户前往控制台做映射配置
-if is_enabled "$ENABLE_ARGO" && [[ "$argo_mode" == "token" ]] && ! is_enabled "$USE_NGINX"; then
-    echo ""
-    echo -e "\033[1;33m======================================================================="
-    echo "【重要提示】您已启用免 Nginx 固定隧道模式，请登录 Cloudflare Zero Trust 控制台："
-    echo "  1. 找到对应的 Argo Tunnel，进入 Public Hostname 页面"
-    if is_enabled "$ENABLE_VMESS" && [[ -n "$ARGO_VMESS_DOMAIN" ]]; then
-        echo "  2. 添加域名: ${ARGO_VMESS_DOMAIN} → Service: http://127.0.0.1:${PORT_VMESS:-8401}"
-    fi
-    if is_enabled "$ENABLE_TROJAN" && [[ -n "$ARGO_TROJAN_DOMAIN" ]]; then
-        echo "  3. 添加域名: ${ARGO_TROJAN_DOMAIN} → Service: http://127.0.0.1:${PORT_TROJAN_WS:-8402}"
-    fi
-    echo "  (注意：Service 地址请使用 127.0.0.1 而非 localhost，避免 IPv6 双栈环回解析问题)"
-    echo -e "=======================================================================\033[0m"
-    echo ""
-elif is_enabled "$ENABLE_ARGO" && [[ "$argo_mode" == "token" ]] && is_enabled "$USE_NGINX"; then
-    port_nginx_actual=$(grep -oE "listen 127.0.0.1:[0-9]+" ${NGINX_CONF_DIR}/singbox-argo.conf 2>/dev/null | head -n 1 | awk -F: '{print $2}')
-    [[ -z "$port_nginx_actual" ]] && port_nginx_actual=8401
-    echo ""
-    echo -e "\033[1;33m======================================================================="
-    echo "【重要提示】您已启用 Nginx 固定隧道模式，请登录 Cloudflare Zero Trust 控制台："
-    echo "  1. 找到对应的 Argo Tunnel，进入 Public Hostname 页面"
-    echo "  2. 添加域名: ${ARGO_DOMAIN} → Service: http://127.0.0.1:${port_nginx_actual}"
-    echo "  (注意：Service 地址请使用 127.0.0.1 而非 localhost，避免 IPv6 双栈环回解析问题)"
-    echo -e "=======================================================================\033[0m"
-    echo ""
-fi
-
-log_info "所有已选节点的链接已保存至 /etc/s-box/info.log"
-log_info "快捷管理工具已安装。今后你可以直接在终端输入【 sb 】来管理你的服务与节点配置。"
