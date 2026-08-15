@@ -781,6 +781,20 @@ write_psiphon_config() {
 EOF_PSI
 }
 
+is_main_psiphon_running() {
+    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        systemctl is-active psiphon-main >/dev/null 2>&1 && return 0
+    fi
+    local psi_pid=$(cat "$WORKDIR/psiphon.pid" 2>/dev/null)
+    if [[ -n "$psi_pid" ]] && kill -0 "$psi_pid" 2>/dev/null; then
+        return 0
+    fi
+    if pgrep -f "psiphon-tunnel-core.*psiphon\.config" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
 start_main_psiphon() {
     download_psiphon_core || return 1
     setup_psiphon_systemd_services
@@ -792,6 +806,7 @@ start_main_psiphon() {
 
     if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
         systemctl enable --now psiphon-main >/dev/null 2>&1 || true
+        systemctl restart psiphon-main >/dev/null 2>&1 || true
     else
         local psi_pid_file="$WORKDIR/psiphon.pid"
         if [[ ! -f "$psi_pid_file" ]] || ! kill -0 "$(cat "$psi_pid_file" 2>/dev/null)" 2>/dev/null; then
@@ -2370,10 +2385,8 @@ psiphon_check_current_ip() {
     purple "[*] 正在检测当前 Psiphon 赛风出口网络状态..."
     local socks_port
     socks_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
-    local psi_pid
-    psi_pid=$(cat "$WORKDIR/psiphon.pid" 2>/dev/null)
 
-    if [[ -z "$psi_pid" ]] || ! kill -0 "$psi_pid" 2>/dev/null; then
+    if ! is_main_psiphon_running; then
         yellow "[!] Psiphon 主进程未运行，正在启动..."
         start_main_psiphon
         sleep 2
@@ -2515,7 +2528,13 @@ psiphon_custom_test() {
 psiphon_view_log() {
     echo
     green "========== Psiphon 运行日志 (最近 30 行) =========="
-    tail -n 30 "$WORKDIR/psiphon.log" 2>/dev/null || yellow "日志为空"
+    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC && systemctl is-active psiphon-main >/dev/null 2>&1; then
+        journalctl -u psiphon-main -n 30 --no-pager 2>/dev/null
+    elif [[ -f "$WORKDIR/psiphon.log" && -s "$WORKDIR/psiphon.log" ]]; then
+        tail -n 30 "$WORKDIR/psiphon.log"
+    else
+        yellow "暂未读取到日志或日志为空"
+    fi
     echo "==================================================="
 }
 
@@ -2743,12 +2762,11 @@ psiphon_management_menu() {
         green "============================================================"
         green "  【Psiphon 赛风综合管理】"
         green "============================================================"
-        local psi_pid=$(cat "$WORKDIR/psiphon.pid" 2>/dev/null)
         local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
         local cur_sport=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
 
-        if [[ -n "$psi_pid" ]] && kill -0 "$psi_pid" 2>/dev/null; then
-            green "  状态: [✓ 已启动] | 当前国家: [$cur_reg - $(get_country_name "$cur_reg")] | 本地Socks端口: [$cur_sport]"
+        if is_main_psiphon_running; then
+            green "  状态: [✓ 运行中] | 当前国家: [$cur_reg - $(get_country_name "$cur_reg")] | 本地Socks端口: [$cur_sport]"
         else
             yellow "  状态: [✗ 未运行] | 预设国家: [$cur_reg - $(get_country_name "$cur_reg")] | 本地Socks端口: [$cur_sport]"
         fi
@@ -3024,8 +3042,7 @@ run_cron_check() {
     fi
 
     if [[ -f "$WORKDIR/psiphon_main_enabled.txt" && "$(cat "$WORKDIR/psiphon_main_enabled.txt")" == "true" ]]; then
-        local pid=$(cat "$WORKDIR/psiphon.pid" 2>/dev/null)
-        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        if ! is_main_psiphon_running; then
             start_main_psiphon
             echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Psiphon 主进程未运行，已自动拉起！" >> "$log_file"
         fi
