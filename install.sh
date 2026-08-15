@@ -655,10 +655,14 @@ stop_main_psiphon() {
     if [[ -f "$psi_pid_file" ]]; then
         local pid
         pid=$(cat "$psi_pid_file" 2>/dev/null)
-        [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            sleep 0.5
+            kill -9 "$pid" 2>/dev/null || true
+        fi
         rm -f "$psi_pid_file"
     fi
-    pkill -9 -f "psiphon.config" 2>/dev/null || true
+    pkill -9 -f "${WORKDIR}/psiphon-tunnel-core --config ${WORKDIR}/psiphon.config" 2>/dev/null || true
 }
 
 # ==================== 副节点目录与旧配置迁移 ====================
