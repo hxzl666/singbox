@@ -1217,8 +1217,8 @@ apply_main_node_outbound() {
       --argjson psi_port "$psi_main_port" \
       '
       .outbounds = (.outbounds // []) |
-      if any(.tag == "direct") then . else . + [{"type":"direct","tag":"direct"}] end |
-      if any(.tag == "block") then . else . + [{"type":"block","tag":"block"}] end |
+      if any(.outbounds[]; .tag == "direct") then . else .outbounds += [{"type":"direct","tag":"direct"}] end |
+      if any(.outbounds[]; .tag == "block") then . else .outbounds += [{"type":"block","tag":"block"}] end |
       
       .outbounds = [.outbounds[] | select(.tag != "warp-out" and .tag != "psiphon-main-out")] |
       
