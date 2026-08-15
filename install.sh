@@ -1276,8 +1276,7 @@ sync_psiphon_instance_to_singbox() {
           "tag": $out_tag,
           "server": "127.0.0.1",
           "server_port": $socks_port,
-          "version": "5",
-          "network": "tcp"
+          "version": "5"
         }]
       else . end |
 
@@ -1341,11 +1340,30 @@ sync_psiphon_instance_to_singbox() {
     fi
 }
 
+ensure_all_psiphon_instances_running() {
+    local psi_insts
+    mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
+    for cc in "${psi_insts[@]}"; do
+        [[ -z "$cc" ]] && continue
+        local idir="${PSI_INSTANCES_DIR}/${cc}"
+        local pid=$(cat "$idir/psiphon.pid" 2>/dev/null)
+        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+            local socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
+            [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
+            echo "$socks_p" > "$idir/socks_port.txt"
+            write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data"
+            nohup "$WORKDIR/psiphon-tunnel-core" --config "$idir/psiphon.config" >> "$idir/psiphon.log" 2>&1 &
+            echo $! > "$idir/psiphon.pid"
+        fi
+    done
+}
+
 # ==================== 副节点全面自动同步函数 ====================
 sync_all_secondary_nodes() {
     local cfg="$WORKDIR/sb.json"
     [[ -f "$cfg" ]] || return 0
     auto_migrate_legacy_nodes
+    ensure_all_psiphon_instances_running
 
     local psi_insts
     mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
@@ -2766,6 +2784,8 @@ run_cron_check() {
             echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Psiphon 主进程未运行，已自动拉起！" >> "$log_file"
         fi
     fi
+
+    ensure_all_psiphon_instances_running
 }
 
 # ==================== 快捷命令同步更新 ====================
