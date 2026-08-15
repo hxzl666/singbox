@@ -230,11 +230,37 @@ install_system_dependencies() {
 }
 
 download_singbox_core() {
+    local force="$1"
     local arch=$(detect_arch)
     mkdir -p "$WORKDIR"
-    if [[ ! -x "$WORKDIR/sing-box" ]]; then
-        local sb_ver="1.11.4"
-        yellow "[*] 正在下载 Sing-box 核心 (版本: v${sb_ver}, 架构: Linux-${arch})..."
+
+    local sb_ver="1.13.18"
+    local latest_tag
+    latest_tag=$(curl -sL -m 4 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | grep '"tag_name":' | head -n1 | sed -E 's/.*"v([^"]+)".*/\1/' 2>/dev/null)
+    [[ -n "$latest_tag" ]] && sb_ver="$latest_tag"
+
+    local need_download=0
+    if [[ ! -x "$WORKDIR/sing-box" || "$force" == "force" ]]; then
+        need_download=1
+    else
+        # 检查当前核心版本，若低于 1.12.0 (不支持 AnyTLS) 则自动更新至最新版本
+        local current_ver
+        current_ver=$("$WORKDIR/sing-box" version 2>/dev/null | head -n 1 | awk '{print $3}' | sed 's/^v//')
+        if [[ -n "$current_ver" ]]; then
+            local major minor
+            major=$(echo "$current_ver" | awk -F. '{print $1}')
+            minor=$(echo "$current_ver" | awk -F. '{print $2}')
+            if [[ "$major" -lt 1 || ( "$major" -eq 1 && "$minor" -lt 12 ) ]]; then
+                yellow "[*] 检测到当前 Sing-box 核心版本 (v${current_ver}) 低于 v1.12.0，正在自动升级至最新版 (v${sb_ver}) 以支持 AnyTLS..."
+                need_download=1
+            fi
+        else
+            need_download=1
+        fi
+    fi
+
+    if [[ $need_download -eq 1 ]]; then
+        yellow "[*] 正在下载/更新 Sing-box 核心 (版本: v${sb_ver}, 架构: Linux-${arch})..."
         local sb_urls=(
             "https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${arch}.tar.gz"
             "https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${arch}.tar.gz"
@@ -266,7 +292,7 @@ download_singbox_core() {
         red "[!] Sing-box 核心程序下载失败，请检查 VPS 网络！"
         return 1
     fi
-    green "[+] Sing-box 核心就绪: $WORKDIR/sing-box"
+    green "[+] Sing-box 核心就绪: $WORKDIR/sing-box ($("$WORKDIR/sing-box" version 2>/dev/null | head -n1))"
     return 0
 }
 
@@ -1622,12 +1648,25 @@ apply_main_node_outbound() {
 
 apply_changes() {
     if [[ ! -f /etc/s-box/sb.json ]]; then
-        log_err "配置文件不存在！"
+        log_err "配置文件 /etc/s-box/sb.json 不存在！"
         return 1
     fi
     if [[ -x /etc/s-box/sing-box ]]; then
-        if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1; then
+        local check_out
+        if ! check_out=$(/etc/s-box/sing-box check -c /etc/s-box/sb.json 2>&1); then
+            # 若因旧版本核心不支持 AnyTLS 导致报错，自动触发升级至最新核心
+            if echo "$check_out" | grep -qi "anytls"; then
+                yellow "[*] 检测到当前 Sing-box 核心版本不支持 AnyTLS，正在自动升级至最新核心..."
+                if download_singbox_core force; then
+                    if /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1; then
+                        green "[+] Sing-box 核心升级完成，AnyTLS 语法校验通过！"
+                        service_restart sing-box
+                        return 0
+                    fi
+                fi
+            fi
             log_err "Sing-box 配置文件格式或语法检查未通过！"
+            echo -e "${red}错误详情:${re}\n${check_out}"
             return 1
         fi
     fi
@@ -1648,7 +1687,7 @@ configure_main_node_protocols() {
     yellow "  - Trojan-WS-TLS (伪装 HTTPS WebSocket)"
     yellow "  - Hysteria2 (UDP 高速加速)"
     yellow "  - TUIC v5 (QUIC 高性能)"
-    yellow "  - AnyTLS (极简 TLS)"
+    yellow "  - AnyTLS (极简 TLS 混淆隧道, v1.12+)"
     echo "============================================================"
 
     local cfg="$WORKDIR/sb.json"
@@ -1661,12 +1700,12 @@ configure_main_node_protocols() {
     cur_anytls=$(jq -r '.inbounds[]? | select((.tag=="anytls-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
 
     purple "当前主节点已开启协议与端口:"
-    [[ -n "$cur_vless" ]] && green "  [✓] VLESS-Reality : 端口 ${cur_vless}" || yellow "  [✗] VLESS-Reality : 未开启"
-    [[ -n "$cur_vmess" ]] && green "  [✓] VMess-WS      : 端口 ${cur_vmess}" || yellow "  [✗] VMess-WS      : 未开启"
-    [[ -n "$cur_trojan" ]] && green "  [✓] Trojan-WS-TLS : 端口 ${cur_trojan}" || yellow "  [✗] Trojan-WS-TLS : 未开启"
-    [[ -n "$cur_hy2" ]] && green "  [✓] Hysteria2     : 端口 ${cur_hy2}" || yellow "  [✗] Hysteria2     : 未开启"
-    [[ -n "$cur_tuic" ]] && green "  [✓] TUIC v5       : 端口 ${cur_tuic}" || yellow "  [✗] TUIC v5       : 未开启"
-    [[ -n "$cur_anytls" ]] && green "  [✓] AnyTLS        : 端口 ${cur_anytls}" || yellow "  [✗] AnyTLS        : 未开启"
+    [[ -n "$cur_vless" ]] && green "  [✓] VLESS-Reality   : 端口 ${cur_vless}" || yellow "  [✗] VLESS-Reality   : 未开启"
+    [[ -n "$cur_vmess" ]] && green "  [✓] VMess-WS        : 端口 ${cur_vmess}" || yellow "  [✗] VMess-WS        : 未开启"
+    [[ -n "$cur_trojan" ]] && green "  [✓] Trojan-WS-TLS   : 端口 ${cur_trojan}" || yellow "  [✗] Trojan-WS-TLS   : 未开启"
+    [[ -n "$cur_hy2" ]] && green "  [✓] Hysteria2       : 端口 ${cur_hy2}" || yellow "  [✗] Hysteria2       : 未开启"
+    [[ -n "$cur_tuic" ]] && green "  [✓] TUIC v5         : 端口 ${cur_tuic}" || yellow "  [✗] TUIC v5         : 未开启"
+    [[ -n "$cur_anytls" ]] && green "  [✓] AnyTLS          : 端口 ${cur_anytls}" || yellow "  [✗] AnyTLS          : 未开启"
     echo "============================================================"
 
     echo
@@ -1691,11 +1730,14 @@ configure_main_node_protocols() {
 
             build_and_apply_main_inbounds "$p_vless" "$p_vmess" "$p_trojan" "$p_hy2" "$p_tuic" "$p_anytls" "$p_loop"
             apply_main_node_outbound
-            apply_changes
-            green "[✓] 全部 6 大主节点协议已配置并成功运行！"
-            echo
-            get_all_ips >/dev/null 2>&1
-            show_links
+            if apply_changes; then
+                green "[✓] 全部 6 大主节点协议已配置并成功运行！"
+                echo
+                get_all_ips >/dev/null 2>&1
+                show_links
+            else
+                red "[!] 主节点协议配置失败，请根据上方错误详情排查！"
+            fi
             ;;
         2)
             echo
@@ -1726,11 +1768,14 @@ configure_main_node_protocols() {
             local p_loop=$(get_free_loopback_port)
             build_and_apply_main_inbounds "$inp_vless" "$inp_vmess" "$inp_trojan" "$inp_hy2" "$inp_tuic" "$inp_anytls" "$p_loop"
             apply_main_node_outbound
-            apply_changes
-            green "[✓] 主节点协议已更新！"
-            echo
-            get_all_ips >/dev/null 2>&1
-            show_links
+            if apply_changes; then
+                green "[✓] 主节点协议已更新并成功运行！"
+                echo
+                get_all_ips >/dev/null 2>&1
+                show_links
+            else
+                red "[!] 主节点协议更新失败，请根据上方错误详情排查！"
+            fi
             ;;
         3)
             local new_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null)
@@ -1833,7 +1878,7 @@ build_and_apply_main_inbounds() {
           "listen": $listen_addr,
           "listen_port": $phy,
           "users": [{"password": $uuid}],
-          "masquerade": "https://www.bing.com",
+          "masquerade": {"type": "proxy", "url": "https://www.bing.com"},
           "ignore_client_bandwidth": false,
           "tls": {"enabled": true, "alpn": ["h3"], "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}
         }] else . end |
@@ -1851,8 +1896,13 @@ build_and_apply_main_inbounds() {
           "type": "anytls",
           "listen": $listen_addr,
           "listen_port": $pan,
-          "users": [{"password": $uuid}],
-          "tls": {"enabled": true, "server_name": "www.bing.com", "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}
+          "users": [{"name": "default", "password": $uuid}],
+          "tls": {
+            "enabled": true,
+            "server_name": "www.bing.com",
+            "certificate_path": "/etc/s-box/cert.pem",
+            "key_path": "/etc/s-box/private.key"
+          }
         }] else . end |
         . + [{
           "tag": "socks-loopback",
@@ -3247,7 +3297,10 @@ install_singbox_main() {
       "listen": "${LISTEN_ADDR}",
       "listen_port": ${PORT_HY2},
       "users": [{"password": "${UUID}"}],
-      "masquerade": "https://www.bing.com",
+      "masquerade": {
+        "type": "proxy",
+        "url": "https://www.bing.com"
+      },
       "ignore_client_bandwidth": false,
       "tls": {
         "enabled": true,
@@ -3275,7 +3328,7 @@ install_singbox_main() {
       "type": "anytls",
       "listen": "${LISTEN_ADDR}",
       "listen_port": ${PORT_ANYTLS},
-      "users": [{"password": "${UUID}"}],
+      "users": [{"name": "default", "password": "${UUID}"}],
       "tls": {
         "enabled": true,
         "server_name": "www.bing.com",
