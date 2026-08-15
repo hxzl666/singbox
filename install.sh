@@ -23,11 +23,9 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# 设置语言环境
 export LANG=en_US.UTF-8
 export LC_ALL=C
 
-# ==================== 颜色与输出函数 ====================
 re="\033[0m"
 red="\033[1;91m"
 green="\e[1;32m"
@@ -53,12 +51,7 @@ PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
 PSI_INSTANCES_DIR="${WORKDIR}/psiphon_instances"
 SCRIPT_VERSION="2.0.0"
 
-# 覆写 jq 确保所有提取出来的 JSON 字段都不带 Windows 的 \r 回车符
-jq() {
-    command jq "$@" | tr -d '\r'
-    return ${PIPESTATUS[0]}
-}
-
+# 基础编码与辅助函数
 b64_no_wrap() {
     printf '%s' "$1" | base64 -w 0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
 }
@@ -95,9 +88,6 @@ elif ! pidof systemd >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; 
     IS_DIRECT=true
 fi
 
-NGINX_CONF_DIR="/etc/nginx/conf.d"
-[[ -d "/etc/nginx/http.d" ]] && NGINX_CONF_DIR="/etc/nginx/http.d"
-
 # 服务控制
 service_start() {
     local name=$1
@@ -125,9 +115,6 @@ service_start() {
                 nohup /usr/local/bin/cloudflared $_cf_args >> /var/log/argo-tunnel.log 2>&1 &
                 echo $! > /etc/s-box/argo-tunnel.pid
                 ;;
-            nginx)
-                nginx >/dev/null 2>&1
-                ;;
         esac
     else
         systemctl start "$name" >/dev/null 2>&1
@@ -139,24 +126,17 @@ service_stop() {
     if $IS_OPENRC; then
         rc-service "$name" stop >/dev/null 2>&1
     elif $IS_DIRECT; then
-        case "$name" in
-            nginx)
-                nginx -s stop >/dev/null 2>&1
-                ;;
-            *)
-                local pidfile="/etc/s-box/${name}.pid"
-                if [[ -f "$pidfile" ]]; then
-                    local pid
-                    pid=$(cat "$pidfile" 2>/dev/null)
-                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                        kill "$pid" 2>/dev/null
-                        local i; for i in {1..10}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-                        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-                    fi
-                    rm -f "$pidfile"
-                fi
-                ;;
-        esac
+        local pidfile="/etc/s-box/${name}.pid"
+        if [[ -f "$pidfile" ]]; then
+            local pid
+            pid=$(cat "$pidfile" 2>/dev/null)
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null
+                local i; for i in {1..10}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+                kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+            fi
+            rm -f "$pidfile"
+        fi
     else
         systemctl stop "$name" >/dev/null 2>&1
     fi
@@ -180,21 +160,14 @@ service_is_active() {
     if $IS_OPENRC; then
         rc-service "$name" status 2>/dev/null | grep -q "started"
     elif $IS_DIRECT; then
-        case "$name" in
-            nginx)
-                pgrep -x nginx >/dev/null 2>&1
-                ;;
-            *)
-                local pidfile="/etc/s-box/${name}.pid"
-                if [[ -f "$pidfile" ]]; then
-                    local pid
-                    pid=$(cat "$pidfile" 2>/dev/null)
-                    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
-                else
-                    return 1
-                fi
-                ;;
-        esac
+        local pidfile="/etc/s-box/${name}.pid"
+        if [[ -f "$pidfile" ]]; then
+            local pid
+            pid=$(cat "$pidfile" 2>/dev/null)
+            [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+        else
+            return 1
+        fi
     else
         systemctl is-active --quiet "$name"
     fi
@@ -323,198 +296,20 @@ download_psiphon_core() {
     return 0
 }
 
-# ==================== 快捷管理脚本写入函数 ====================
-create_sb_tool() {
-mkdir -p /usr/local/bin
-cat > /usr/local/bin/sb <<'EOF_SB_TOOL'
-#!/bin/bash
-# ============================================================================
-# Sing-box 快捷管理工具 sb (全功能无需 Python，纯 jq/bash 高性能运行)
-# ============================================================================
-
-if [[ $EUID -ne 0 ]]; then
-   echo "错误：必须以 root 权限运行此脚本！"
-   exit 1
-fi
-
-export LANG=en_US.UTF-8
-export LC_ALL=C
-
-re="\033[0m"
-red="\033[1;91m"
-green="\e[1;32m"
-yellow="\e[1;33m"
-purple="\e[1;35m"
-blue="\e[1;36m"
-white="\e[1;37m"
-
-red() { echo -e "\e[1;91m$1\033[0m"; }
-green() { echo -e "\e[1;32m$1\033[0m"; }
-yellow() { echo -e "\e[1;33m$1\033[0m"; }
-purple() { echo -e "\e[1;35m$1\033[0m"; }
-blue() { echo -e "\e[1;36m$1\033[0m"; }
-white() { echo -e "\e[1;37m$1\033[0m"; }
-reading() { read -p "$(yellow "$1")" "$2"; }
-
-log_info() { echo -e "${green}[信息] $1${re}"; }
-log_warn() { echo -e "${yellow}[警告] $1${re}"; }
-log_err() { echo -e "${red}[错误] $1${re}"; }
-
-WORKDIR="/etc/s-box"
-PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
-PSI_INSTANCES_DIR="${WORKDIR}/psiphon_instances"
-SCRIPT_VERSION="2.0.0"
-
-jq() {
-    command jq "$@" | tr -d '\r'
-    return ${PIPESTATUS[0]}
-}
-
-b64_no_wrap() {
-    printf '%s' "$1" | base64 -w 0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
-}
-
-url_encode() {
-    local encoded
-    encoded=$(printf '%s' "$1" | command jq -sRr @uri 2>/dev/null) || return $?
-    printf '%s' "$encoded" | tr -d '\r\n'
-}
-
-make_vmess_link() {
-    local json="$1"
-    printf '%s' "$json" | command jq -e . >/dev/null 2>&1 || return 1
-    printf 'vmess://%s' "$(b64_no_wrap "$json")"
-}
-
-detect_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        armv7l|armv7) echo "armv7" ;;
-        i386|i686|386) echo "386" ;;
-        *) echo "amd64" ;;
-    esac
-}
-
-IS_OPENRC=false
-IS_DIRECT=false
-if [[ -x "/sbin/openrc-run" || -x "/sbin/runlevels" ]]; then
-    IS_OPENRC=true
-elif ! pidof systemd >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; then
-    IS_DIRECT=true
-fi
-
-NGINX_CONF_DIR="/etc/nginx/conf.d"
-[[ -d "/etc/nginx/http.d" ]] && NGINX_CONF_DIR="/etc/nginx/http.d"
-
-service_start() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" start >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        service_stop "$name" 2>/dev/null
-        case "$name" in
-            sing-box)
-                nohup /etc/s-box/sing-box run -c /etc/s-box/sb.json >> /var/log/sing-box.log 2>&1 &
-                echo $! > /etc/s-box/sing-box.pid
-                ;;
-            argo-tunnel)
-                local _cf_args
-                _cf_args=$(
-                    local _am="" _at="" _ap="8401"
-                    [[ -f /etc/s-box/argo.conf ]] && source /etc/s-box/argo.conf
-                    _am="${ARGO_MODE:-temp}"; _at="${ARGO_TOKEN}"; _ap="${ARGO_PORT:-8401}"
-                    if [[ "$_am" == "token" && -n "$_at" ]]; then
-                        echo "tunnel --no-autoupdate run --token $_at"
-                    else
-                        echo "tunnel --url http://127.0.0.1:${_ap}"
-                    fi
-                )
-                nohup /usr/local/bin/cloudflared $_cf_args >> /var/log/argo-tunnel.log 2>&1 &
-                echo $! > /etc/s-box/argo-tunnel.pid
-                ;;
-            nginx)
-                nginx >/dev/null 2>&1
-                ;;
-        esac
-    else
-        systemctl start "$name" >/dev/null 2>&1
-    fi
-}
-
-service_stop() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" stop >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        case "$name" in
-            nginx)
-                nginx -s stop >/dev/null 2>&1
-                ;;
-            *)
-                local pidfile="/etc/s-box/${name}.pid"
-                if [[ -f "$pidfile" ]]; then
-                    local pid
-                    pid=$(cat "$pidfile" 2>/dev/null)
-                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                        kill "$pid" 2>/dev/null
-                        local i; for i in {1..10}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-                        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-                    fi
-                    rm -f "$pidfile"
-                fi
-                ;;
-        esac
-    else
-        systemctl stop "$name" >/dev/null 2>&1
-    fi
-}
-
-service_restart() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" restart >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        service_stop "$name"
-        sleep 1
-        service_start "$name"
-    else
-        systemctl restart "$name" >/dev/null 2>&1
-    fi
-}
-
-service_is_active() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" status 2>/dev/null | grep -q "started"
-    elif $IS_DIRECT; then
-        case "$name" in
-            nginx)
-                pgrep -x nginx >/dev/null 2>&1
-                ;;
-            *)
-                local pidfile="/etc/s-box/${name}.pid"
-                if [[ -f "$pidfile" ]]; then
-                    local pid
-                    pid=$(cat "$pidfile" 2>/dev/null)
-                    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
-                else
-                    return 1
-                fi
-                ;;
-        esac
-    else
-        systemctl is-active --quiet "$name"
-    fi
-}
-
-# ==================== IP 与系统状态获取 ====================
+# ==================== IP 与端口获取 ====================
 ALL_IPS=()
 get_all_ips() {
     ALL_IPS=()
     mkdir -p "$WORKDIR"
+    if [[ -f "$WORKDIR/all_ips.txt" ]]; then
+        mapfile -t ALL_IPS < "$WORKDIR/all_ips.txt"
+    fi
+    if [[ ${#ALL_IPS[@]} -gt 0 && -n "${ALL_IPS[0]}" ]]; then
+        return 0
+    fi
+
     local ipv4_list
-    ipv4_list=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')
+    ipv4_list=$(ip -4 addr show 2>/dev/null | grep -oE 'inet [0-9.]+' | awk '{print $2}' | grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')
     if [[ -z "$ipv4_list" ]]; then
         local pub_ip
         pub_ip=$(curl -s4m3 https://api.ipify.org 2>/dev/null || curl -s4m3 https://ip.sb 2>/dev/null)
@@ -538,9 +333,15 @@ get_all_ips() {
     printf "%s\n" "${ALL_IPS[@]}" > "$WORKDIR/all_ips.txt"
 }
 
+is_port_used() {
+    local port=$1
+    ss -tulpn 2>/dev/null | grep -qE "(:${port}\s|:${port}$)" || \
+    netstat -tulpn 2>/dev/null | grep -qE "(:${port}\s|:${port}$)"
+}
+
 get_free_port() {
     local port=$(( (RANDOM % 40000) + 10000 ))
-    while ss -tulpn 2>/dev/null | grep -q ":${port} " || netstat -tulpn 2>/dev/null | grep -q ":${port} "; do
+    while is_port_used "$port"; do
         port=$(( (RANDOM % 40000) + 10000 ))
     done
     echo "$port"
@@ -548,10 +349,33 @@ get_free_port() {
 
 get_free_loopback_port() {
     local port=$(( (RANDOM % 30000) + 20000 ))
-    while ss -tulpn 2>/dev/null | grep -q "127.0.0.1:${port} " || netstat -tulpn 2>/dev/null | grep -q "127.0.0.1:${port} "; do
+    while is_port_used "$port"; do
         port=$(( (RANDOM % 30000) + 20000 ))
     done
     echo "$port"
+}
+
+read_valid_port() {
+    local prompt="$1" default_port="$2" out_var="$3"
+    local p=""
+    while true; do
+        reading "$prompt" p
+        [[ -z "$p" ]] && p="$default_port"
+        if [[ "$p" == "0" ]]; then
+            eval "$out_var=0"
+            return 0
+        fi
+        if ! [[ "$p" =~ ^[0-9]+$ ]] || [[ "$p" -lt 1 || "$p" -gt 65535 ]]; then
+            red "[!] 端口必须为 1-65535 之间的数字，请重新输入！"
+            continue
+        fi
+        if is_port_used "$p"; then
+            red "[!] 端口 $p 已被系统其他进程占用，请更换其他端口！"
+            continue
+        fi
+        eval "$out_var=$p"
+        return 0
+    done
 }
 
 # ==================== WARP 模块 ====================
@@ -651,48 +475,6 @@ show_supported_psiphon_codes() {
     echo "  FR - 法国      IN - 印度      AU - 澳大利亚  AUTO - 自动"
 }
 
-download_psiphon_core() {
-    local arch=$(detect_arch)
-    local psi_arch="$arch"
-    [[ "$arch" == "armv7" ]] && psi_arch="arm"
-    mkdir -p "$WORKDIR"
-    if [[ -x "$WORKDIR/psiphon-tunnel-core" ]]; then
-        return 0
-    fi
-
-    yellow "[*] 正在下载 Psiphon 赛风核心 (Linux-${psi_arch})..."
-    local psi_urls=(
-        "https://github.com/hxzlplp7/psiphon-tunnel-core/releases/download/v1.0.0/psiphon-tunnel-core-linux-${psi_arch}.tar.gz"
-        "https://ghproxy.net/https://github.com/hxzlplp7/psiphon-tunnel-core/releases/download/v1.0.0/psiphon-tunnel-core-linux-${psi_arch}.tar.gz"
-        "https://github.com/Psiphon-Labs/psiphon-tunnel-core/releases/download/v2.0.28/psiphon-tunnel-core-linux-${psi_arch}"
-        "https://ghproxy.net/https://github.com/Psiphon-Labs/psiphon-tunnel-core/releases/download/v2.0.28/psiphon-tunnel-core-linux-${psi_arch}"
-    )
-
-    local tmp_psi="/tmp/psi_download_tmp"
-    mkdir -p "$tmp_psi"
-    for url in "${psi_urls[@]}"; do
-        if curl -fsSL "$url" -o "$tmp_psi/psi_pkg" 2>/dev/null; then
-            if [[ "$url" == *.tar.gz ]]; then
-                tar -xzf "$tmp_psi/psi_pkg" -C "$tmp_psi" 2>/dev/null
-                local ext_f=$(find "$tmp_psi" -type f -name 'psiphon-tunnel-core*' ! -name '*.tar.gz' | head -n1)
-                [[ -n "$ext_f" ]] && cp -f "$ext_f" "$WORKDIR/psiphon-tunnel-core"
-            else
-                cp -f "$tmp_psi/psi_pkg" "$WORKDIR/psiphon-tunnel-core"
-            fi
-            [[ -f "$WORKDIR/psiphon-tunnel-core" ]] && break
-        fi
-    done
-    rm -rf "$tmp_psi"
-    chmod +x "$WORKDIR/psiphon-tunnel-core" 2>/dev/null
-
-    if [[ ! -x "$WORKDIR/psiphon-tunnel-core" ]]; then
-        log_warn "未下载到 Psiphon 核心，请检查 VPS 对 GitHub 的网络连通性。"
-        return 1
-    fi
-    green "[+] Psiphon 核心已安装: $WORKDIR/psiphon-tunnel-core"
-    return 0
-}
-
 write_psiphon_config() {
     local socks_port="$1"
     local region="$2"
@@ -748,7 +530,7 @@ stop_main_psiphon() {
     pkill -9 -f "psiphon.config" 2>/dev/null || true
 }
 
-# ==================== 副节点历史旧配置自动迁移 ====================
+# ==================== 副节点目录与旧配置迁移 ====================
 init_proxy_groups_dir() {
     mkdir -p "$PROXY_GROUPS_DIR"
     [[ -f "$PROXY_GROUPS_DIR/groups.txt" ]] || touch "$PROXY_GROUPS_DIR/groups.txt"
@@ -789,6 +571,8 @@ auto_migrate_legacy_nodes() {
     local custom_outbound_tags
     mapfile -t custom_outbound_tags < <(jq -r '.outbounds[]? | select(.tag != "direct" and .tag != "block" and .tag != "warp-out" and .tag != "psiphon-main-out") | .tag' "$cfg" 2>/dev/null)
 
+    local legacy_inbounds_to_remove=()
+
     for otag in "${custom_outbound_tags[@]}"; do
         [[ -z "$otag" || "$otag" == "null" ]] && continue
         
@@ -814,7 +598,7 @@ auto_migrate_legacy_nodes() {
             continue
         fi
 
-        # 自定义外部代理副节点 (如 outbound-us, proxy-1 等)
+        # 自定义外部代理副节点 (如 outbound-us, proxy-1, UA, JP 等)
         local gtag="$otag"
         [[ "$gtag" == *-out ]] && gtag="${gtag%-out}"
         local gdir="${PROXY_GROUPS_DIR}/${gtag}"
@@ -835,16 +619,32 @@ auto_migrate_legacy_nodes() {
             if [[ "$p_type" == "hysteria2" ]]; then hp="$p_port"; fi
             if [[ "$p_type" == "tuic" ]]; then tp="$p_port"; fi
             if [[ "$p_type" == "vless" ]]; then vp="$p_port"; fi
+            if [[ "$ib_tag" != "hy2-${gtag}-in" && "$ib_tag" != "tuic-${gtag}-in" && "$ib_tag" != "vless-${gtag}-in" ]]; then
+                legacy_inbounds_to_remove+=("$ib_tag")
+            fi
         done
 
-        if [[ "$hp" == "0" ]]; then
+        local saved_hp saved_tp saved_vp
+        saved_hp=$(cat "$gdir/hy2_port.txt" 2>/dev/null || echo "0")
+        saved_tp=$(cat "$gdir/tuic_port.txt" 2>/dev/null || echo "0")
+        saved_vp=$(cat "$gdir/vless_port.txt" 2>/dev/null || echo "0")
+
+        [[ "$hp" == "0" || -z "$hp" ]] && hp="$saved_hp"
+        [[ "$tp" == "0" || -z "$tp" ]] && tp="$saved_tp"
+        [[ "$vp" == "0" || -z "$vp" ]] && vp="$saved_vp"
+
+        if [[ "$hp" == "0" || -z "$hp" ]]; then
             hp=$(jq -r --arg t "$gtag" '.inbounds[]? | select(.tag | (contains($t) and contains("hy2"))) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
         fi
-        if [[ "$tp" == "0" ]]; then
+        if [[ "$tp" == "0" || -z "$tp" ]]; then
             tp=$(jq -r --arg t "$gtag" '.inbounds[]? | select(.tag | (contains($t) and contains("tuic"))) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
         fi
-        if [[ "$vp" == "0" ]]; then
+        if [[ "$vp" == "0" || -z "$vp" ]]; then
             vp=$(jq -r --arg t "$gtag" '.inbounds[]? | select(.tag | (contains($t) and contains("vless"))) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+        fi
+
+        if [[ "${hp:-0}" == "0" && "${tp:-0}" == "0" && "${vp:-0}" == "0" ]]; then
+            hp=$(get_free_port)
         fi
 
         echo "${hp:-0}" > "$gdir/hy2_port.txt"
@@ -855,9 +655,17 @@ auto_migrate_legacy_nodes() {
             echo "$gtag" >> "$PROXY_GROUPS_DIR/groups.txt"
         fi
     done
+
+    # 清除旧的重复入站标签，防止端口重复绑定
+    if [[ ${#legacy_inbounds_to_remove[@]} -gt 0 ]]; then
+        local tmp_cl=$(mktemp)
+        jq --argjson tags "$(printf '%s\n' "${legacy_inbounds_to_remove[@]}" | jq -R . | jq -s .)" '
+        .inbounds = [.inbounds[] | select(.tag as $t | ($tags | index($t) | not))]
+        ' "$cfg" > "$tmp_cl" && mv -f "$tmp_cl" "$cfg"
+    fi
 }
 
-# 纯 jq/bash 解析代理链接 (无需 Python3)
+# 纯 jq/bash 解析外部代理链接
 parse_proxy_url_to_json() {
     local url="$1"
     local tag="$2"
@@ -1128,6 +936,7 @@ sync_proxy_group_to_singbox() {
     tuic_port=$(cat "$group_dir/tuic_port.txt" 2>/dev/null || echo "0")
     vless_port=$(cat "$group_dir/vless_port.txt" 2>/dev/null || echo "0")
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
+    [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$cfg" 2>/dev/null | head -n1)
     reality_pvk=$(cat "$WORKDIR/private_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key' "$cfg" 2>/dev/null | head -n1)
     reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
     local out_tag="${group_tag}-out"
@@ -1215,6 +1024,7 @@ sync_psiphon_instance_to_singbox() {
     vless_port=$(cat "$inst_dir/vless_port.txt" 2>/dev/null || echo "0")
     socks_port=$(cat "$inst_dir/socks_port.txt" 2>/dev/null || echo "0")
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
+    [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$cfg" 2>/dev/null | head -n1)
     reality_pvk=$(cat "$WORKDIR/private_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key' "$cfg" 2>/dev/null | head -n1)
     reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
     local cc_lower=$(echo "$cc" | tr '[:upper:]' '[:lower:]')
@@ -1317,7 +1127,7 @@ sync_all_secondary_nodes() {
     done
 }
 
-# ==================== 主节点出站应用函数 (纯 jq) ====================
+# ==================== 主节点多协议配置与出站应用 ====================
 apply_main_node_outbound() {
     local cfg="$WORKDIR/sb.json"
     [[ -f "$cfg" ]] || return 1
@@ -1430,9 +1240,240 @@ apply_changes() {
     return 0
 }
 
-# ==================== 1. 主节点出站管理子菜单 ====================
+# ==================== 1. 主节点多协议配置管理 ====================
+configure_main_node_protocols() {
+    [[ -t 1 ]] && clear 2>/dev/null || true
+    echo
+    green "============================================================"
+    green "  主节点多协议配置与端口管理"
+    green "============================================================"
+    yellow "  支持一键开启或单独定制各主流入站协议:"
+    yellow "  - VLESS-Reality (TCP 抗封锁)"
+    yellow "  - VMess-WS (支持 CDN / WebSocket / Argo)"
+    yellow "  - Trojan-WS-TLS (伪装 HTTPS WebSocket)"
+    yellow "  - Hysteria2 (UDP 高速加速)"
+    yellow "  - TUIC v5 (QUIC 高性能)"
+    yellow "  - AnyTLS (极简 TLS)"
+    echo "============================================================"
+
+    local cfg="$WORKDIR/sb.json"
+    local cur_vless cur_vmess cur_trojan cur_hy2 cur_tuic cur_anytls
+    cur_vless=$(jq -r '.inbounds[]? | select((.tag=="vless-in" or .tag=="vless-reality-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    cur_vmess=$(jq -r '.inbounds[]? | select((.tag=="vmess-in" or .tag=="vmess-ws-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    cur_trojan=$(jq -r '.inbounds[]? | select((.tag=="trojan-tls-in" or .tag=="trojan-ws-in" or .tag=="trojan-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    cur_hy2=$(jq -r '.inbounds[]? | select((.tag=="hy2-in" or .tag=="hysteria2-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    cur_tuic=$(jq -r '.inbounds[]? | select((.tag=="tuic-in" or .tag=="tuic-in-1") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    cur_anytls=$(jq -r '.inbounds[]? | select((.tag=="anytls-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+
+    purple "当前主节点已开启协议与端口:"
+    [[ -n "$cur_vless" ]] && green "  [✓] VLESS-Reality : 端口 ${cur_vless}" || yellow "  [✗] VLESS-Reality : 未开启"
+    [[ -n "$cur_vmess" ]] && green "  [✓] VMess-WS      : 端口 ${cur_vmess}" || yellow "  [✗] VMess-WS      : 未开启"
+    [[ -n "$cur_trojan" ]] && green "  [✓] Trojan-WS-TLS : 端口 ${cur_trojan}" || yellow "  [✗] Trojan-WS-TLS : 未开启"
+    [[ -n "$cur_hy2" ]] && green "  [✓] Hysteria2     : 端口 ${cur_hy2}" || yellow "  [✗] Hysteria2     : 未开启"
+    [[ -n "$cur_tuic" ]] && green "  [✓] TUIC v5       : 端口 ${cur_tuic}" || yellow "  [✗] TUIC v5       : 未开启"
+    [[ -n "$cur_anytls" ]] && green "  [✓] AnyTLS        : 端口 ${cur_anytls}" || yellow "  [✗] AnyTLS        : 未开启"
+    echo "============================================================"
+
+    echo
+    echo "  1. 一键开启/更新全部 6 大主节点协议 (自动分配安全空闲端口)"
+    echo "  2. 自定义选择开启/关闭各协议与指定端口"
+    echo "  3. 重新生成 UUID 与 Reality 密钥对"
+    echo "------------------------------------------------------------"
+    echo "  0. 返回主菜单"
+    echo "============================================================"
+    reading "请选择 [0-3]: " p_choice
+
+    case "$p_choice" in
+        1)
+            yellow "[*] 正在一键配置全部 6 大主节点协议..."
+            local p_vless="${cur_vless:-$(get_free_port)}"
+            local p_vmess="${cur_vmess:-$(get_free_port)}"
+            local p_trojan="${cur_trojan:-$(get_free_port)}"
+            local p_hy2="${cur_hy2:-$(get_free_port)}"
+            local p_tuic="${cur_tuic:-$(get_free_port)}"
+            local p_anytls="${cur_anytls:-$(get_free_port)}"
+            local p_loop=$(get_free_loopback_port)
+
+            build_and_apply_main_inbounds "$p_vless" "$p_vmess" "$p_trojan" "$p_hy2" "$p_tuic" "$p_anytls" "$p_loop"
+            apply_main_node_outbound
+            apply_changes
+            green "[✓] 全部 6 大主节点协议已配置并成功运行！"
+            echo
+            get_all_ips >/dev/null 2>&1
+            show_links
+            ;;
+        2)
+            echo
+            reading "开启 VLESS-Reality? (当前端口: ${cur_vless:-无}, 回车保留/留空禁用/输入端口): " inp_vless
+            [[ -z "$inp_vless" && -n "$cur_vless" ]] && inp_vless="$cur_vless"
+            [[ "$inp_vless" == "y" || "$inp_vless" == "Y" ]] && inp_vless=$(get_free_port)
+
+            reading "开启 VMess-WS? (当前端口: ${cur_vmess:-无}, 回车保留/留空禁用/输入端口): " inp_vmess
+            [[ -z "$inp_vmess" && -n "$cur_vmess" ]] && inp_vmess="$cur_vmess"
+            [[ "$inp_vmess" == "y" || "$inp_vmess" == "Y" ]] && inp_vmess=$(get_free_port)
+
+            reading "开启 Trojan-WS-TLS? (当前端口: ${cur_trojan:-无}, 回车保留/留空禁用/输入端口): " inp_trojan
+            [[ -z "$inp_trojan" && -n "$cur_trojan" ]] && inp_trojan="$cur_trojan"
+            [[ "$inp_trojan" == "y" || "$inp_trojan" == "Y" ]] && inp_trojan=$(get_free_port)
+
+            reading "开启 Hysteria2? (当前端口: ${cur_hy2:-无}, 回车保留/留空禁用/输入端口): " inp_hy2
+            [[ -z "$inp_hy2" && -n "$cur_hy2" ]] && inp_hy2="$cur_hy2"
+            [[ "$inp_hy2" == "y" || "$inp_hy2" == "Y" ]] && inp_hy2=$(get_free_port)
+
+            reading "开启 TUIC v5? (当前端口: ${cur_tuic:-无}, 回车保留/留空禁用/输入端口): " inp_tuic
+            [[ -z "$inp_tuic" && -n "$cur_tuic" ]] && inp_tuic="$cur_tuic"
+            [[ "$inp_tuic" == "y" || "$inp_tuic" == "Y" ]] && inp_tuic=$(get_free_port)
+
+            reading "开启 AnyTLS? (当前端口: ${cur_anytls:-无}, 回车保留/留空禁用/输入端口): " inp_anytls
+            [[ -z "$inp_anytls" && -n "$cur_anytls" ]] && inp_anytls="$cur_anytls"
+            [[ "$inp_anytls" == "y" || "$inp_anytls" == "Y" ]] && inp_anytls=$(get_free_port)
+
+            local p_loop=$(get_free_loopback_port)
+            build_and_apply_main_inbounds "$inp_vless" "$inp_vmess" "$inp_trojan" "$inp_hy2" "$inp_tuic" "$inp_anytls" "$p_loop"
+            apply_main_node_outbound
+            apply_changes
+            green "[✓] 主节点协议已更新！"
+            echo
+            get_all_ips >/dev/null 2>&1
+            show_links
+            ;;
+        3)
+            local new_uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null)
+            [[ -n "$new_uuid" ]] && echo "$new_uuid" > "$WORKDIR/UUID.txt"
+            if [[ -x "$WORKDIR/sing-box" ]]; then
+                local kp=$("$WORKDIR/sing-box" generate reality-keypair 2>/dev/null)
+                local pvk=$(echo "$kp" | awk '/PrivateKey:/{print $2}' | tr -d '\r\n')
+                local pbk=$(echo "$kp" | awk '/PublicKey:/{print $2}' | tr -d '\r\n')
+                [[ -n "$pvk" ]] && echo "$pvk" > "$WORKDIR/private_key.txt"
+                [[ -n "$pbk" ]] && echo "$pbk" > "$WORKDIR/public_key.txt"
+            fi
+            green "UUID 与 Reality 密钥对已刷新！请重新选择 1 或 2 应用配置。"
+            ;;
+        0) return 0 ;;
+        *) red "无效选项" ;;
+    esac
+    echo
+    reading "按回车继续..." _
+}
+
+build_and_apply_main_inbounds() {
+    local p_vless="$1" p_vmess="$2" p_trojan="$3" p_hy2="$4" p_tuic="$5" p_anytls="$6" p_loop="$7"
+    local cfg="$WORKDIR/sb.json"
+    local uuid reality_pvk reym
+    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
+    [[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null)
+    echo "$uuid" > "$WORKDIR/UUID.txt"
+
+    reality_pvk=$(cat "$WORKDIR/private_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key' "$cfg" 2>/dev/null | head -n1)
+    if [[ -z "$reality_pvk" && -x "$WORKDIR/sing-box" ]]; then
+        local kp=$("$WORKDIR/sing-box" generate reality-keypair 2>/dev/null)
+        reality_pvk=$(echo "$kp" | awk '/PrivateKey:/{print $2}' | tr -d '\r\n')
+        local pbk=$(echo "$kp" | awk '/PublicKey:/{print $2}' | tr -d '\r\n')
+        echo "$reality_pvk" > "$WORKDIR/private_key.txt"
+        echo "$pbk" > "$WORKDIR/public_key.txt"
+    fi
+    reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
+
+    if [[ ! -f "$WORKDIR/cert.pem" || ! -f "$WORKDIR/private.key" ]]; then
+        openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$WORKDIR/private.key" -out "$WORKDIR/cert.pem" -days 3650 -subj "/CN=www.bing.com" >/dev/null 2>&1
+    fi
+
+    local tmp_json=$(mktemp)
+
+    jq \
+      --arg uuid "$uuid" \
+      --arg reality_pvk "$reality_pvk" \
+      --arg reym "$reym" \
+      --argjson pv "${p_vless:-0}" \
+      --argjson pvm "${p_vmess:-0}" \
+      --argjson ptr "${p_trojan:-0}" \
+      --argjson phy "${p_hy2:-0}" \
+      --argjson ptu "${p_tuic:-0}" \
+      --argjson pan "${p_anytls:-0}" \
+      --argjson ploop "${p_loop:-20080}" \
+      '
+      # 保留所有副节点入站 (包含 custom / proxy / psi 的入站)
+      .inbounds = [.inbounds[]? | select(.tag | contains("proxy") or contains("psi") or contains("custom"))] |
+
+      (
+        [] |
+        if $pv > 0 then . + [{
+          "tag": "vless-reality-in",
+          "type": "vless",
+          "listen": "::",
+          "listen_port": $pv,
+          "users": [{"uuid": $uuid, "flow": "xtls-rprx-vision"}],
+          "tls": {
+            "enabled": true,
+            "server_name": $reym,
+            "reality": {
+              "enabled": true,
+              "handshake": {"server": $reym, "server_port": 443},
+              "private_key": $reality_pvk,
+              "short_id": [""]
+            }
+          }
+        }] else . end |
+        if $pvm > 0 then . + [{
+          "tag": "vmess-ws-in",
+          "type": "vmess",
+          "listen": "::",
+          "listen_port": $pvm,
+          "users": [{"uuid": $uuid}],
+          "transport": {"type": "ws", "path": ("/" + $uuid + "-vm")}
+        }] else . end |
+        if $ptr > 0 then . + [{
+          "tag": "trojan-ws-in",
+          "type": "trojan",
+          "listen": "::",
+          "listen_port": $ptr,
+          "users": [{"password": $uuid}],
+          "transport": {"type": "ws", "path": ("/" + $uuid + "-tr")},
+          "tls": {"enabled": true, "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}
+        }] else . end |
+        if $phy > 0 then . + [{
+          "tag": "hy2-in",
+          "type": "hysteria2",
+          "listen": "::",
+          "listen_port": $phy,
+          "users": [{"password": $uuid}],
+          "masquerade": "https://www.bing.com",
+          "ignore_client_bandwidth": false,
+          "tls": {"enabled": true, "alpn": ["h3"], "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}
+        }] else . end |
+        if $ptu > 0 then . + [{
+          "tag": "tuic-in",
+          "type": "tuic",
+          "listen": "::",
+          "listen_port": $ptu,
+          "users": [{"uuid": $uuid, "password": $uuid}],
+          "congestion_control": "bbr",
+          "tls": {"enabled": true, "alpn": ["h3"], "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}
+        }] else . end |
+        if $pan > 0 then . + [{
+          "tag": "anytls-in",
+          "type": "anytls",
+          "listen": "::",
+          "listen_port": $pan,
+          "users": [{"password": $uuid}],
+          "tls": {"enabled": true, "server_name": "www.bing.com", "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}
+        }] else . end |
+        . + [{
+          "tag": "socks-loopback",
+          "type": "socks",
+          "listen": "127.0.0.1",
+          "listen_port": $ploop
+        }]
+      ) as $main_inbounds |
+      .inbounds = $main_inbounds + .inbounds
+      ' "$cfg" > "$tmp_json" && mv -f "$tmp_json" "$cfg"
+
+    sync_all_secondary_nodes
+}
+
+# ==================== 2. 主节点出站管理子菜单 ====================
 configure_warp_outbound() {
-    clear
+    [[ -t 1 ]] && clear 2>/dev/null || true
     echo
     green "============================================================"
     green "  主节点出站管理 (直连出站 / WARP 出站 / 赛风出站)"
@@ -1565,7 +1606,7 @@ configure_warp_outbound() {
     reading "按回车继续..." _
 }
 
-# ==================== 2. 副节点 - 自定义代理出站管理 ====================
+# ==================== 3. 副节点 - 自定义代理出站管理 ====================
 add_proxy_egress_group() {
     init_proxy_groups_dir
     echo
@@ -1604,10 +1645,19 @@ add_proxy_egress_group() {
 
     local hy2_p="0" tuic_p="0" vless_p="0"
     case "$proto_sel" in
-        1) hy2_p=$(get_free_port) ;;
-        2) tuic_p=$(get_free_port) ;;
-        3) vless_p=$(get_free_port) ;;
-        *) hy2_p=$(get_free_port); tuic_p=$(get_free_port) ;;
+        1)
+            read_valid_port "请输入 Hysteria2 入站端口 [回车自动分配]: " "$(get_free_port)" hy2_p
+            ;;
+        2)
+            read_valid_port "请输入 TUIC v5 入站端口 [回车自动分配]: " "$(get_free_port)" tuic_p
+            ;;
+        3)
+            read_valid_port "请输入 VLESS-Reality 入站端口 [回车自动分配]: " "$(get_free_port)" vless_p
+            ;;
+        *)
+            read_valid_port "请输入 Hysteria2 入站端口 [回车自动分配]: " "$(get_free_port)" hy2_p
+            read_valid_port "请输入 TUIC v5 入站端口 [回车自动分配]: " "$(get_free_port)" tuic_p
+            ;;
     esac
 
     local gdir="${PROXY_GROUPS_DIR}/${group_tag}"
@@ -1629,6 +1679,7 @@ add_proxy_egress_group() {
 
 generate_proxy_group_links() {
     local tag="$1"
+    [[ -z "$tag" ]] && return 1
     local gdir="${PROXY_GROUPS_DIR}/${tag}"
     [[ -d "$gdir" ]] || return 1
 
@@ -1637,8 +1688,12 @@ generate_proxy_group_links() {
     hy2_p=$(cat "$gdir/hy2_port.txt" 2>/dev/null || echo "0")
     tuic_p=$(cat "$gdir/tuic_port.txt" 2>/dev/null || echo "0")
     vless_p=$(cat "$gdir/vless_port.txt" 2>/dev/null || echo "0")
+    if [[ "$hy2_p" == "0" && "$tuic_p" == "0" && "$vless_p" == "0" ]]; then
+        return 0
+    fi
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
-    ip="${ALL_IPS[0]:-127.0.0.1}"
+    [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
+    ip="${ALL_IPS[0]:-202.73.4.182}"
 
     echo
     blue "============================================================"
@@ -1667,7 +1722,7 @@ generate_proxy_group_links() {
 proxy_egress_menu() {
     auto_migrate_legacy_nodes
     while true; do
-        clear
+        [[ -t 1 ]] && clear 2>/dev/null || true
         echo
         green "============================================================"
         green "  【副节点】自定义代理出站多出口路由管理"
@@ -1769,7 +1824,184 @@ proxy_egress_menu() {
     done
 }
 
-# ==================== 3. 副节点 - 赛风多出口管理 ====================
+# ==================== 4. 副节点 - 赛风多出口管理 ====================
+# ==================== 4. Psiphon 赛风综合管理模块 ====================
+
+psiphon_check_current_ip() {
+    echo
+    purple "[*] 正在检测当前 Psiphon 赛风出口网络状态..."
+    local socks_port
+    socks_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
+    local psi_pid
+    psi_pid=$(cat "$WORKDIR/psiphon.pid" 2>/dev/null)
+
+    if [[ -z "$psi_pid" ]] || ! kill -0 "$psi_pid" 2>/dev/null; then
+        yellow "[!] Psiphon 主进程未运行，正在启动..."
+        start_main_psiphon
+        sleep 2
+    fi
+
+    local ip info
+    ip=$(curl -sx "socks5h://127.0.0.1:${socks_port}" -s4m6 https://api.ipify.org 2>/dev/null || curl -sx "socks5h://127.0.0.1:${socks_port}" -s4m6 https://ip.sb 2>/dev/null)
+    if [[ -n "$ip" ]]; then
+        green "============================================================"
+        green "  [✓] Psiphon 当前出口 IP : $ip"
+        info=$(curl -sx "socks5h://127.0.0.1:${socks_port}" -s4m5 "https://api.ip.sb/geoip/${ip}" 2>/dev/null)
+        if [[ -n "$info" ]]; then
+            local country region city isp
+            country=$(echo "$info" | jq -r '.country // empty' 2>/dev/null)
+            region=$(echo "$info" | jq -r '.region // empty' 2>/dev/null)
+            city=$(echo "$info" | jq -r '.city // empty' 2>/dev/null)
+            isp=$(echo "$info" | jq -r '.isp // empty' 2>/dev/null)
+            blue  "      出口国家 / 地区 : ${country} - ${region} ${city}"
+            blue  "      网络运营商 (ISP): ${isp}"
+        fi
+        green "============================================================"
+    else
+        red "[!] 检测超时或 Psiphon 连接尚未建立就绪，请稍后重试或查看日志。"
+    fi
+}
+
+psiphon_switch_auto() {
+    echo
+    yellow "[*] 正在切换 Psiphon 为智能自动选择 (AUTO 优选)..."
+    echo "AUTO" > "$WORKDIR/psiphon_main_region.txt"
+    stop_main_psiphon
+    start_main_psiphon
+    apply_main_node_outbound
+    apply_changes
+    green "[✓] 已切换为智能自动选择！正在获取新出口 IP..."
+    sleep 3
+    psiphon_check_current_ip
+}
+
+psiphon_switch_manual() {
+    echo
+    green "==== 手动切换 Psiphon 出口国家 ===="
+    show_supported_psiphon_codes
+    echo
+    reading "请输入目标国家代码 (如 US, JP, SG, HK, GB, DE 等): " target_cc
+    target_cc="${target_cc^^}"
+    [[ -z "$target_cc" ]] && { red "[!] 国家代码不能为空"; return 1; }
+
+    echo "$target_cc" > "$WORKDIR/psiphon_main_region.txt"
+    stop_main_psiphon
+    start_main_psiphon
+    apply_main_node_outbound
+    apply_changes
+    green "[✓] 已切换出口国家为 [$target_cc - $(get_country_name "$target_cc")]！"
+    sleep 3
+    psiphon_check_current_ip
+}
+
+test_single_psiphon_country() {
+    local cc="${1^^}"
+    local cname=$(get_country_name "$cc")
+    local test_port=$(get_free_loopback_port)
+    local test_dir="/tmp/psi_test_${cc}_$$"
+    mkdir -p "$test_dir/data"
+
+    local cfg_file="$test_dir/psiphon.config"
+    local reg="$cc"
+    [[ "$reg" == "AUTO" ]] && reg=""
+    cat > "$cfg_file" <<EOF_TEST
+{
+  "DataRootDirectory": "${test_dir}/data",
+  "EmitDiagnosticNotices": false,
+  "EmitDiagnosticNetworkParameters": false,
+  "EmitServerAlerts": false,
+  "LocalSocksProxyPort": ${test_port},
+  "DisableLocalHTTPProxy": true,
+  "LocalHttpProxyPort": 0,
+  "EgressRegion": "${reg}",
+  "PropagationChannelId": "FFFFFFFFFFFFFFFF",
+  "SponsorId": "FFFFFFFFFFFFFFFF",
+  "UseIndistinguishableTLS": true
+}
+EOF_TEST
+
+    nohup "$WORKDIR/psiphon-tunnel-core" --config "$cfg_file" > "$test_dir/test.log" 2>&1 &
+    local test_pid=$!
+
+    local egress_ip="" is_ok=false
+    for i in {1..14}; do
+        sleep 0.5
+        if curl -sx "socks5h://127.0.0.1:${test_port}" -s4m2 https://api.ipify.org >/dev/null 2>&1 || \
+           curl -sx "socks5h://127.0.0.1:${test_port}" -s4m2 https://ip.sb >/dev/null 2>&1; then
+            egress_ip=$(curl -sx "socks5h://127.0.0.1:${test_port}" -s4m3 https://api.ipify.org 2>/dev/null || curl -sx "socks5h://127.0.0.1:${test_port}" -s4m3 https://ip.sb 2>/dev/null)
+            is_ok=true
+            break
+        fi
+    done
+
+    kill -9 "$test_pid" 2>/dev/null || true
+    rm -rf "$test_dir"
+
+    if $is_ok; then
+        green "  [✓] [$cc] $cname -> 出口 IP: ${egress_ip} (连接可用)"
+        return 0
+    else
+        yellow "  [✗] [$cc] $cname -> 连接超时或未通"
+        return 1
+    fi
+}
+
+psiphon_quick_test() {
+    echo
+    green "==== 快速测试常用国家 (US / JP / SG / HK) ===="
+    yellow "[*] 正在建立测试隧道，请稍候..."
+    echo
+    local quick_list=("US" "JP" "SG" "HK")
+    for cc in "${quick_list[@]}"; do
+        test_single_psiphon_country "$cc"
+    done
+    echo
+    green "[✓] 快速测试完毕！"
+}
+
+psiphon_test_all() {
+    echo
+    green "==== 测试所有支持的 Psiphon 出口国家 ===="
+    yellow "[*] 正在逐个检测国家可用性与出口 IP..."
+    echo
+    local all_list=("US" "JP" "SG" "HK" "GB" "DE" "CA" "NL" "FR" "IN" "AU" "KR" "TW")
+    for cc in "${all_list[@]}"; do
+        test_single_psiphon_country "$cc"
+    done
+    echo
+    green "[✓] 全部国家测试完毕！"
+}
+
+psiphon_custom_test() {
+    echo
+    green "==== 自定义测试 Psiphon 出口国家 ===="
+    show_supported_psiphon_codes
+    echo
+    reading "请输入要测试的国家代码 (如 KR, TW, NL, DE 等): " custom_cc
+    custom_cc="${custom_cc^^}"
+    [[ -z "$custom_cc" ]] && { red "[!] 国家代码不能为空"; return 1; }
+    echo
+    yellow "[*] 正在测试 [$custom_cc]..."
+    test_single_psiphon_country "$custom_cc"
+}
+
+psiphon_view_log() {
+    echo
+    green "========== Psiphon 运行日志 (最近 30 行) =========="
+    tail -n 30 "$WORKDIR/psiphon.log" 2>/dev/null || yellow "日志为空"
+    echo "==================================================="
+}
+
+psiphon_restart() {
+    echo
+    yellow "[*] 正在重启 Psiphon 主进程..."
+    stop_main_psiphon
+    start_main_psiphon
+    green "[✓] Psiphon 主进程已重启！"
+    sleep 2
+    psiphon_check_current_ip
+}
+
 add_psiphon_instance() {
     download_psiphon_core || return 1
     init_psiphon_instances_dir
@@ -1803,10 +2035,19 @@ add_psiphon_instance() {
 
     local hy2_p="0" tuic_p="0" vless_p="0"
     case "$proto_sel" in
-        1) hy2_p=$(get_free_port) ;;
-        2) tuic_p=$(get_free_port) ;;
-        3) vless_p=$(get_free_port) ;;
-        *) hy2_p=$(get_free_port); tuic_p=$(get_free_port) ;;
+        1)
+            read_valid_port "请输入 Hysteria2 入站端口 [回车自动分配]: " "$(get_free_port)" hy2_p
+            ;;
+        2)
+            read_valid_port "请输入 TUIC v5 入站端口 [回车自动分配]: " "$(get_free_port)" tuic_p
+            ;;
+        3)
+            read_valid_port "请输入 VLESS-Reality 入站端口 [回车自动分配]: " "$(get_free_port)" vless_p
+            ;;
+        *)
+            read_valid_port "请输入 Hysteria2 入站端口 [回车自动分配]: " "$(get_free_port)" hy2_p
+            read_valid_port "请输入 TUIC v5 入站端口 [回车自动分配]: " "$(get_free_port)" tuic_p
+            ;;
     esac
 
     echo "$hy2_p" > "$inst_dir/hy2_port.txt"
@@ -1823,6 +2064,7 @@ add_psiphon_instance() {
 
 generate_psiphon_instance_links() {
     local cc="${1^^}"
+    [[ -z "$cc" ]] && return 1
     local inst_dir="${PSI_INSTANCES_DIR}/${cc}"
     [[ -d "$inst_dir" ]] || return 1
 
@@ -1830,8 +2072,12 @@ generate_psiphon_instance_links() {
     hy2_p=$(cat "$inst_dir/hy2_port.txt" 2>/dev/null || echo "0")
     tuic_p=$(cat "$inst_dir/tuic_port.txt" 2>/dev/null || echo "0")
     vless_p=$(cat "$inst_dir/vless_port.txt" 2>/dev/null || echo "0")
+    if [[ "$hy2_p" == "0" && "$tuic_p" == "0" && "$vless_p" == "0" ]]; then
+        return 0
+    fi
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
-    ip="${ALL_IPS[0]:-127.0.0.1}"
+    [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
+    ip="${ALL_IPS[0]:-202.73.4.182}"
     cname=$(get_country_name "$cc")
 
     echo
@@ -1858,13 +2104,13 @@ generate_psiphon_instance_links() {
     purple "============================================================"
 }
 
-psiphon_management_menu() {
+psiphon_multigroup_menu() {
     auto_migrate_legacy_nodes
     while true; do
-        clear
+        [[ -t 1 ]] && clear 2>/dev/null || true
         echo
         green "============================================================"
-        green "  【副节点】Psiphon 赛风出站多出口管理"
+        green "  【副节点】Psiphon 赛风多出口节点组管理"
         green "============================================================"
         yellow "  说明: 副节点拥有独立入站端口与专属路由，出站走赛风对应国家"
         yellow "        与主节点完全平行独立，互不干扰"
@@ -1878,6 +2124,7 @@ psiphon_management_menu() {
         if [[ ${#insts[@]} -gt 0 ]]; then
             local idx=1
             for cc in "${insts[@]}"; do
+                [[ -z "$cc" ]] && continue
                 local cname=$(get_country_name "$cc")
                 local hp=$(cat "${PSI_INSTANCES_DIR}/$cc/hy2_port.txt" 2>/dev/null || echo "0")
                 local tp=$(cat "${PSI_INSTANCES_DIR}/$cc/tuic_port.txt" 2>/dev/null || echo "0")
@@ -1895,12 +2142,12 @@ psiphon_management_menu() {
 
         echo
         echo "------------------------------------------------------------"
-        green  "  1. 添加赛风国家出口组"
+        green  "  1. 添加赛风国家出口组 (支持自定义入站端口)"
         green  "  2. 查看所有赛风出口组节点链接"
         red    "  3. 删除赛风国家出口组"
         blue   "  4. 重启所有赛风实例"
         echo "------------------------------------------------------------"
-        red    "  0. 返回主菜单"
+        red    "  0. 返回上一级菜单"
         echo "============================================================"
         reading "请选择 [0-4]: " choice
 
@@ -1950,14 +2197,66 @@ psiphon_management_menu() {
     done
 }
 
-# ==================== 4. 查看主节点信息与全部汇总 ====================
+psiphon_management_menu() {
+    while true; do
+        [[ -t 1 ]] && clear 2>/dev/null || true
+        echo
+        green "============================================================"
+        green "  【Psiphon 赛风综合管理】"
+        green "============================================================"
+        local psi_pid=$(cat "$WORKDIR/psiphon.pid" 2>/dev/null)
+        local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
+        local cur_sport=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
+
+        if [[ -n "$psi_pid" ]] && kill -0 "$psi_pid" 2>/dev/null; then
+            green "  状态: [✓ 已启动] | 当前国家: [$cur_reg - $(get_country_name "$cur_reg")] | 本地Socks端口: [$cur_sport]"
+        else
+            yellow "  状态: [✗ 未运行] | 预设国家: [$cur_reg - $(get_country_name "$cur_reg")] | 本地Socks端口: [$cur_sport]"
+        fi
+        green "============================================================"
+        echo
+        echo "  1. 查看当前出口 IP"
+        echo "  2. 智能切换出口国家 (自动优选)"
+        echo "  3. 手动切换出口国家"
+        echo "------------------------------------------------------------"
+        echo "  4. 快速测试国家 (US/JP/SG/HK)"
+        echo "  5. 测试所有支持国家"
+        echo "  6. 自定义测试国家"
+        echo "------------------------------------------------------------"
+        echo "  7. 查看 Psiphon 日志"
+        echo "  8. 重启 Psiphon"
+        echo "  9. 多出口节点组管理 (独立入站副节点管理)"
+        echo "------------------------------------------------------------"
+        red  "  0. 返回主菜单"
+        echo "============================================================"
+        reading "请选择 [0-9]: " choice
+
+        case "$choice" in
+            1) psiphon_check_current_ip ;;
+            2) psiphon_switch_auto ;;
+            3) psiphon_switch_manual ;;
+            4) psiphon_quick_test ;;
+            5) psiphon_test_all ;;
+            6) psiphon_custom_test ;;
+            7) psiphon_view_log ;;
+            8) psiphon_restart ;;
+            9) psiphon_multigroup_menu ;;
+            0) return 0 ;;
+            *) red "无效选项" ;;
+        esac
+        echo
+        reading "按回车继续..." _
+    done
+}
+
+# ==================== 5. 查看主节点信息与全部汇总 ====================
 show_links() {
-    auto_migrate_legacy_nodes
+    get_all_ips >/dev/null 2>&1
     local cfg="$WORKDIR/sb.json"
     local uuid ip pbk sid reym
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
     [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$cfg" 2>/dev/null | head -n1)
-    ip="${ALL_IPS[0]:-127.0.0.1}"
+    ip="${ALL_IPS[0]:-202.73.4.182}"
     pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.public_key != null) | .tls.reality.public_key' "$cfg" 2>/dev/null | head -n1)
     sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.short_id != null) | .tls.reality.short_id[0] // empty' "$cfg" 2>/dev/null | head -n1)
     reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.handshake.server != null) | .tls.reality.handshake.server' "$cfg" 2>/dev/null | head -n1)
@@ -1989,8 +2288,12 @@ show_links() {
     [[ -n "$anytls_p" ]] && echo "6. AnyTLS: anytls://${uuid}@${ip}:${anytls_p}?security=tls&sni=www.bing.com&allowInsecure=1#SB-AnyTLS"
 
     # 检查 Argo
-    local argo_d
-    argo_d=$(cat /etc/s-box/argo.log 2>/dev/null || cat /var/log/argo-tunnel.log 2>/dev/null | grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' | tail -n 1)
+    local argo_d=""
+    if [[ -f /etc/s-box/argo.log ]]; then
+        argo_d=$(head -n 1 /etc/s-box/argo.log 2>/dev/null)
+    elif [[ -f /var/log/argo-tunnel.log ]]; then
+        argo_d=$(grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' /var/log/argo-tunnel.log 2>/dev/null | tail -n 1)
+    fi
     if [[ -n "$argo_d" ]]; then
         echo
         purple "--- Argo 隧道穿透节点 ---"
@@ -2002,8 +2305,8 @@ show_links() {
 }
 
 show_all_nodes_summary() {
-    clear
-    auto_migrate_legacy_nodes
+    [[ -t 1 ]] && clear 2>/dev/null || true
+    get_all_ips >/dev/null 2>&1
     echo
     green "============================================================"
     green "  全部节点信息总览 (主节点与副节点分类汇总)"
@@ -2038,7 +2341,7 @@ show_all_nodes_summary() {
 }
 
 custom_push_nodes() {
-    clear
+    [[ -t 1 ]] && clear 2>/dev/null || true
     echo
     green "============================================================"
     green "  自定义节点组合推送 (聚合订阅生成)"
@@ -2052,7 +2355,7 @@ custom_push_nodes() {
 # ==================== 6. Argo 隧道管理 ====================
 argo_management_menu() {
     while true; do
-        clear
+        [[ -t 1 ]] && clear 2>/dev/null || true
         echo
         green "============================================================"
         green "  主节点 Argo 隧道管理 (Cloudflare Tunnel)"
@@ -2060,8 +2363,12 @@ argo_management_menu() {
         echo
         if service_is_active argo-tunnel; then
             green "【Argo 状态】: ✓ 运行中"
-            local argo_d
-            argo_d=$(cat /etc/s-box/argo.log 2>/dev/null || cat /var/log/argo-tunnel.log 2>/dev/null | grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' | tail -n 1)
+            local argo_d=""
+            if [[ -f /etc/s-box/argo.log ]]; then
+                argo_d=$(head -n 1 /etc/s-box/argo.log 2>/dev/null)
+            elif [[ -f /var/log/argo-tunnel.log ]]; then
+                argo_d=$(grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' /var/log/argo-tunnel.log 2>/dev/null | tail -n 1)
+            fi
             [[ -n "$argo_d" ]] && blue "当前域名: $argo_d"
         else
             yellow "【Argo 状态】: ✗ 未运行"
@@ -2111,7 +2418,7 @@ argo_management_menu() {
 # ==================== 7. 系统运维与日志 ====================
 view_logs_menu() {
     while true; do
-        clear
+        [[ -t 1 ]] && clear 2>/dev/null || true
         echo
         green "============================================================"
         green "  查看系统与服务运行日志"
@@ -2159,8 +2466,8 @@ view_logs_menu() {
 }
 
 # ==================== Cron 自愈守护任务 ====================
-if [[ "$1" == "cron" ]]; then
-    log_file="/etc/s-box/monitor.log"
+run_cron_check() {
+    local log_file="/etc/s-box/monitor.log"
     if [[ -f "$log_file" && $(wc -c < "$log_file") -gt 51200 ]]; then
         : > "$log_file"
     fi
@@ -2184,14 +2491,22 @@ if [[ "$1" == "cron" ]]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Psiphon 主进程未运行，已自动拉起！" >> "$log_file"
         fi
     fi
-    exit 0
-fi
+}
+
+# ==================== 快捷命令同步更新 ====================
+create_sb_tool() {
+    mkdir -p /usr/local/bin "$WORKDIR"
+    cp -f "${BASH_SOURCE[0]:-$0}" "$WORKDIR/install.sh" 2>/dev/null || true
+    cp -f "${BASH_SOURCE[0]:-$0}" /usr/local/bin/sb 2>/dev/null || true
+    chmod +x /usr/local/bin/sb "$WORKDIR/install.sh" 2>/dev/null || true
+}
 
 # ==================== 主菜单 ====================
 menu() {
     auto_migrate_legacy_nodes
+    create_sb_tool
     while true; do
-        clear
+        [[ -t 1 ]] && clear 2>/dev/null || true
         echo
         green "============================================================"
         green "  Sing-box Linux 多协议节点管理脚本 v${SCRIPT_VERSION}"
@@ -2274,7 +2589,7 @@ menu() {
         echo "------------------------------------------------------------"
         purple "  【副节点管理 (平行独立)】"
         echo "------------------------------------------------------------"
-        purple "  5. 【副节点】赛风出站多出口管理 (添加/删除出口组、延迟测试、状态)"
+        purple "  5. Psiphon 赛风综合管理 (出口IP/国家切换/国家测速/多出口节点组)"
         purple "  6. 【副节点】自定义代理出站多出口管理 (添加/修改/删除外部代理出站、测速)"
         echo "------------------------------------------------------------"
         white  "  【综合功能与系统运维】"
@@ -2294,15 +2609,7 @@ menu() {
         echo
 
         case "$choice" in
-            1)
-                if [[ -f /etc/s-box/install.sh ]]; then
-                    bash /etc/s-box/install.sh reconfig
-                elif [[ -f ./install.sh ]]; then
-                    bash ./install.sh reconfig
-                else
-                    curl -sL https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh -o /tmp/install.sh && bash /tmp/install.sh reconfig
-                fi
-                ;;
+            1) configure_main_node_protocols ;;
             2) configure_warp_outbound ;;
             3) argo_management_menu ;;
             4) show_links; echo; reading "按回车继续..." _ ;;
@@ -2359,11 +2666,6 @@ menu() {
     done
 }
 
-menu
-EOF_SB_TOOL
-chmod +x /usr/local/bin/sb
-}
-
 # ==================== 初次安装 / 部署主流程 ====================
 install_singbox_main() {
     log_info "开始安装/更新 Sing-box 环境与依赖..."
@@ -2397,9 +2699,8 @@ install_singbox_main() {
     [[ ! -f "$WORKDIR/short_id.txt" ]] && echo "" > "$WORKDIR/short_id.txt"
 
     get_all_ips >/dev/null 2>&1
-    local IP="${ALL_IPS[0]:-127.0.0.1}"
 
-    # 如果没有现有 sb.json，才重新生成默认端口
+    # 如果没有现有 sb.json，才重新生成默认 6 大协议端口
     if [[ ! -f "$WORKDIR/sb.json" ]]; then
         local PORT_VLESS=$(get_free_port)
         local PORT_VMESS=$(get_free_port)
@@ -2410,7 +2711,6 @@ install_singbox_main() {
         local PORT_LOOPBACK=$(get_free_loopback_port)
 
         local REALITY_PVK=$(cat "$WORKDIR/private_key.txt" 2>/dev/null)
-        local REALITY_PBK=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
 
         cat > "$WORKDIR/sb.json" <<EOF_SB_JSON
 {
@@ -2587,9 +2887,6 @@ EOF_SYSTEMD
     sync_all_secondary_nodes
     service_start sing-box
 
-    cp -f "$0" /etc/s-box/install.sh 2>/dev/null
-    chmod +x /etc/s-box/install.sh 2>/dev/null
-
     if ! crontab -l 2>/dev/null | grep -q "sb cron"; then
         (crontab -l 2>/dev/null; echo "* * * * * /usr/local/bin/sb cron >> /etc/s-box/monitor.log 2>&1") | crontab - 2>/dev/null || true
     fi
@@ -2601,16 +2898,38 @@ EOF_SYSTEMD
     log_info "快捷管理命令: 【 sb 】"
 }
 
-# ==================== 入口调度 ====================
-if [[ "$1" == "reconfig" ]]; then
-    install_singbox_main
-    exit 0
-fi
-
-if [[ -f "$WORKDIR/sb.json" ]]; then
-    create_sb_tool
-    bash /usr/local/bin/sb
-    exit 0
-else
-    install_singbox_main
-fi
+# ==================== 入口调度与 CLI 支持 ====================
+case "$1" in
+    cron)
+        run_cron_check
+        exit 0
+        ;;
+    show|links|info)
+        show_links
+        exit 0
+        ;;
+    all)
+        show_all_nodes_summary
+        exit 0
+        ;;
+    restart)
+        service_restart sing-box
+        sync_all_secondary_nodes
+        apply_changes
+        green "已重启 Sing-box 并同步配置！"
+        exit 0
+        ;;
+    reconfig)
+        configure_main_node_protocols
+        exit 0
+        ;;
+    *)
+        if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+            if [[ ! -f "$WORKDIR/sb.json" ]]; then
+                install_singbox_main
+            else
+                menu
+            fi
+        fi
+        ;;
+esac
