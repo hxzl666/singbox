@@ -313,7 +313,88 @@ download_psiphon_core() {
     fi
 
     green "[+] Psiphon 核心已安装: $WORKDIR/psiphon-tunnel-core"
+    setup_psiphon_systemd_services
     return 0
+}
+
+setup_psiphon_systemd_services() {
+    if [[ -d /etc/systemd/system ]] && ! $IS_DIRECT && ! $IS_OPENRC; then
+        cat > /etc/systemd/system/psiphon-main.service <<'EOF_PSI_MAIN'
+[Unit]
+Description=Psiphon Main Tunnel Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/s-box
+ExecStart=/etc/s-box/psiphon-tunnel-core --config /etc/s-box/psiphon.config
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF_PSI_MAIN
+
+        cat > /etc/systemd/system/psiphon-instance@.service <<'EOF_PSI_INST'
+[Unit]
+Description=Psiphon Secondary Instance for %i
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/s-box/psiphon_instances/%i
+ExecStart=/etc/s-box/psiphon-tunnel-core --config /etc/s-box/psiphon_instances/%i/psiphon.config
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF_PSI_INST
+
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+start_psiphon_instance() {
+    local cc="${1^^}"
+    local idir="${PSI_INSTANCES_DIR}/${cc}"
+    [[ -d "$idir" ]] || return 1
+    setup_psiphon_systemd_services
+    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        systemctl enable --now "psiphon-instance@${cc}" >/dev/null 2>&1 || true
+    else
+        local pid=$(cat "$idir/psiphon.pid" 2>/dev/null)
+        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+            nohup "$WORKDIR/psiphon-tunnel-core" --config "$idir/psiphon.config" >> "$idir/psiphon.log" 2>&1 &
+            echo $! > "$idir/psiphon.pid"
+        fi
+    fi
+}
+
+stop_psiphon_instance() {
+    local cc="${1^^}"
+    local idir="${PSI_INSTANCES_DIR}/${cc}"
+    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        systemctl disable --now "psiphon-instance@${cc}" >/dev/null 2>&1 || true
+    fi
+    local pid=$(cat "$idir/psiphon.pid" 2>/dev/null)
+    [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
+    rm -f "$idir/psiphon.pid"
+}
+
+restart_psiphon_instance() {
+    local cc="${1^^}"
+    local idir="${PSI_INSTANCES_DIR}/${cc}"
+    setup_psiphon_systemd_services
+    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        systemctl restart "psiphon-instance@${cc}" >/dev/null 2>&1 || true
+    else
+        stop_psiphon_instance "$cc"
+        sleep 1
+        start_psiphon_instance "$cc"
+    fi
 }
 
 # ==================== IP 与端口获取 ====================
@@ -634,23 +715,30 @@ EOF_PSI
 
 start_main_psiphon() {
     download_psiphon_core || return 1
-    local psi_pid_file="$WORKDIR/psiphon.pid"
-    if [[ -f "$psi_pid_file" ]] && kill -0 "$(cat "$psi_pid_file" 2>/dev/null)" 2>/dev/null; then
-        return 0
-    fi
+    setup_psiphon_systemd_services
     local region
     region=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
     local socks_port
     socks_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
     write_psiphon_config "$socks_port" "$region" "$WORKDIR/psiphon.config" "$WORKDIR/psiphon-data"
 
-    nohup "$WORKDIR/psiphon-tunnel-core" --config "$WORKDIR/psiphon.config" >> "$WORKDIR/psiphon.log" 2>&1 &
-    echo $! > "$psi_pid_file"
+    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        systemctl enable --now psiphon-main >/dev/null 2>&1 || true
+    else
+        local psi_pid_file="$WORKDIR/psiphon.pid"
+        if [[ ! -f "$psi_pid_file" ]] || ! kill -0 "$(cat "$psi_pid_file" 2>/dev/null)" 2>/dev/null; then
+            nohup "$WORKDIR/psiphon-tunnel-core" --config "$WORKDIR/psiphon.config" >> "$WORKDIR/psiphon.log" 2>&1 &
+            echo $! > "$psi_pid_file"
+        fi
+    fi
     sleep 2
     return 0
 }
 
 stop_main_psiphon() {
+    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        systemctl disable --now psiphon-main >/dev/null 2>&1 || true
+    fi
     local psi_pid_file="$WORKDIR/psiphon.pid"
     if [[ -f "$psi_pid_file" ]]; then
         local pid
@@ -1356,15 +1444,12 @@ ensure_all_psiphon_instances_running() {
     for cc in "${psi_insts[@]}"; do
         [[ -z "$cc" ]] && continue
         local idir="${PSI_INSTANCES_DIR}/${cc}"
-        local pid=$(cat "$idir/psiphon.pid" 2>/dev/null)
-        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
-            local socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
-            [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
-            echo "$socks_p" > "$idir/socks_port.txt"
-            write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data"
-            nohup "$WORKDIR/psiphon-tunnel-core" --config "$idir/psiphon.config" >> "$idir/psiphon.log" 2>&1 &
-            echo $! > "$idir/psiphon.pid"
-        fi
+        local socks_p=$(jq -r '.LocalSocksProxyPort // empty' "$idir/psiphon.config" 2>/dev/null)
+        [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
+        [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
+        echo "$socks_p" > "$idir/socks_port.txt"
+        write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data"
+        start_psiphon_instance "$cc"
     done
 }
 
@@ -2303,10 +2388,8 @@ add_psiphon_instance() {
     local socks_p=$(get_free_loopback_port)
     local cfg_file="$inst_dir/psiphon.config"
     write_psiphon_config "$socks_p" "$cc" "$cfg_file" "$inst_dir/data"
-
-    nohup "$WORKDIR/psiphon-tunnel-core" --config "$cfg_file" >> "$inst_dir/psiphon.log" 2>&1 &
-    echo $! > "$inst_dir/psiphon.pid"
     echo "$socks_p" > "$inst_dir/socks_port.txt"
+    start_psiphon_instance "$cc"
 
     echo
     purple "请选择为该赛风出口搭建的本地入站协议:"
@@ -2447,8 +2530,7 @@ psiphon_multigroup_menu() {
                     reading "请输入要删除的国家码 (如 US): " del_cc
                     del_cc="${del_cc^^}"
                     if [[ -d "${PSI_INSTANCES_DIR}/$del_cc" ]] || grep -qix "$del_cc" "$PSI_INSTANCES_DIR/instances.txt" 2>/dev/null; then
-                        local pid=$(cat "${PSI_INSTANCES_DIR}/$del_cc/psiphon.pid" 2>/dev/null)
-                        [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
+                        stop_psiphon_instance "$del_cc"
                         rm -rf "${PSI_INSTANCES_DIR:?}/$del_cc"
                         sed -i "/^${del_cc}$/Id" "$PSI_INSTANCES_DIR/instances.txt"
                         local tmp_j=$(mktemp)
@@ -2484,13 +2566,9 @@ psiphon_multigroup_menu() {
             4)
                 yellow "正在重启所有赛风实例..."
                 for cc in "${insts[@]}"; do
-                    local idir="${PSI_INSTANCES_DIR}/$cc"
-                    local pid=$(cat "$idir/psiphon.pid" 2>/dev/null)
-                    [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
-                    nohup "$WORKDIR/psiphon-tunnel-core" --config "$idir/psiphon.config" >> "$idir/psiphon.log" 2>&1 &
-                    echo $! > "$idir/psiphon.pid"
+                    restart_psiphon_instance "$cc"
                 done
-                green "赛风实例已重启！"
+                green "所有赛风实例已重启并常驻守护！"
                 ;;
             0) return 0 ;;
             *) red "无效选项" ;;
