@@ -436,26 +436,46 @@ warp_egress_test() {
     purple "正在检测主节点出口 IP (经由当前出站路由)..."
     local loop_port
     loop_port=$(jq -r '.inbounds[]? | select(.tag=="socks-loopback") | .listen_port // empty' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
-    if [[ -z "$loop_port" ]]; then
-        local res
-        res=$(curl -s4m5 https://ip.sb 2>/dev/null || curl -s4m5 https://api.ipify.org 2>/dev/null)
-        green "当前直连出口 IP: ${res:-未知}"
-        return
+
+    local psi_en=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null || echo "false")
+    local warp_en=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null || echo "false")
+    local warp_m=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null || echo "all")
+
+    local ip="" info=""
+
+    if [[ -n "$loop_port" ]]; then
+        ip=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m6 https://api.ipify.org 2>/dev/null || curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m6 https://ip.sb 2>/dev/null)
     fi
 
-    local ip info
-    ip=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m5 https://ip.sb 2>/dev/null || curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m5 https://api.ipify.org 2>/dev/null)
+    if [[ -z "$ip" && "$psi_en" == "true" ]]; then
+        local psi_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
+        ip=$(curl -sx "socks5h://127.0.0.1:${psi_port}" -s4m6 https://api.ipify.org 2>/dev/null || curl -sx "socks5h://127.0.0.1:${psi_port}" -s4m6 https://ip.sb 2>/dev/null)
+    fi
+
     if [[ -n "$ip" ]]; then
-        green "主节点出口 IP: $ip"
-        info=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m5 "https://api.ip.sb/geoip/${ip}" 2>/dev/null)
-        if [[ -n "$info" ]]; then
-            local isp country
-            isp=$(echo "$info" | jq -r '.isp // empty' 2>/dev/null)
-            country=$(echo "$info" | jq -r '.country // empty' 2>/dev/null)
-            blue "归属地区: ${country} | 运营商: ${isp}"
+        green "============================================================"
+        if [[ "$psi_en" == "true" ]]; then
+            green "  [✓] 主节点出口 IP (赛风出站) : $ip"
+        elif [[ "$warp_en" == "true" ]]; then
+            green "  [✓] 主节点出口 IP (WARP 出站) : $ip"
+        else
+            green "  [✓] 主节点出口 IP (直连出站) : $ip"
         fi
+        info=$(curl -s4m5 "https://api.ip.sb/geoip/${ip}" 2>/dev/null)
+        if [[ -n "$info" ]]; then
+            local country=$(echo "$info" | jq -r '.country // empty' 2>/dev/null)
+            local region=$(echo "$info" | jq -r '.region // empty' 2>/dev/null)
+            local city=$(echo "$info" | jq -r '.city // empty' 2>/dev/null)
+            local isp=$(echo "$info" | jq -r '.isp // empty' 2>/dev/null)
+            blue  "      出口国家 / 地区 : ${country} - ${region} ${city}"
+            blue  "      网络运营商 (ISP): ${isp}"
+        fi
+        green "============================================================"
     else
-        yellow "测试超时，请检查 sing-box 服务与出站状态。"
+        local res=$(curl -s4m5 https://ip.sb 2>/dev/null || curl -s4m5 https://api.ipify.org 2>/dev/null)
+        yellow "============================================================"
+        yellow "  [!] 代理出站未响应或超时，当前 VPS 原生 IP: ${res:-未知}"
+        yellow "============================================================"
     fi
 }
 
@@ -1216,6 +1236,11 @@ apply_main_node_outbound() {
       --arg psi_en "$psi_main_enabled" \
       --argjson psi_port "$psi_main_port" \
       '
+      # 确保 socks-loopback 入站存在 (赛风/WARP 出站路由链的关键桥梁)
+      if any(.inbounds[]?; .tag == "socks-loopback") then . else
+        .inbounds += [{"tag":"socks-loopback","type":"socks","listen":"127.0.0.1","listen_port":20080}]
+      end |
+
       .outbounds = (.outbounds // []) |
       if any(.outbounds[]; .tag == "direct") then . else .outbounds += [{"type":"direct","tag":"direct"}] end |
       if any(.outbounds[]; .tag == "block") then . else .outbounds += [{"type":"block","tag":"block"}] end |
