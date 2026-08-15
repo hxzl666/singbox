@@ -48,206 +48,6 @@ log_info() { echo -e "${green}[信息] $1${re}"; }
 log_warn() { echo -e "${yellow}[警告] $1${re}"; }
 log_err() { echo -e "${red}[错误] $1${re}"; }
 
-# 覆写 jq 确保所有提取出来的 JSON 字段都不带 Windows 的 \r 回车符
-jq() {
-    command jq "$@" | tr -d '\r'
-    return ${PIPESTATUS[0]}
-}
-
-b64_no_wrap() {
-    printf '%s' "$1" | base64 -w 0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
-}
-
-url_encode() {
-    local encoded
-    encoded=$(printf '%s' "$1" | command jq -sRr @uri 2>/dev/null) || return $?
-    printf '%s' "$encoded" | tr -d '\r\n'
-}
-
-make_vmess_link() {
-    local json="$1"
-    printf '%s' "$json" | command jq -e . >/dev/null 2>&1 || return 1
-    printf 'vmess://%s' "$(b64_no_wrap "$json")"
-}
-
-# ==================== 工作路径与环境判断 ====================
-WORKDIR="/etc/s-box"
-PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
-PSI_INSTANCES_DIR="${WORKDIR}/psiphon_instances"
-SCRIPT_VERSION="2.0.0"
-
-# 自动检测是否为 OpenRC (Alpine 等) 或 Systemd
-IS_OPENRC=false
-IS_DIRECT=false
-if [[ -x "/sbin/openrc-run" || -x "/sbin/runlevels" ]]; then
-    IS_OPENRC=true
-elif ! pidof systemd >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; then
-    IS_DIRECT=true
-fi
-
-# Nginx 配置目录自适应
-NGINX_CONF_DIR="/etc/nginx/conf.d"
-[[ -d "/etc/nginx/http.d" ]] && NGINX_CONF_DIR="/etc/nginx/http.d"
-
-# 服务控制函数
-service_start() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" start >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        service_stop "$name" 2>/dev/null
-        case "$name" in
-            sing-box)
-                nohup /etc/s-box/sing-box run -c /etc/s-box/sb.json >> /var/log/sing-box.log 2>&1 &
-                echo $! > /etc/s-box/sing-box.pid
-                ;;
-            argo-tunnel)
-                local _cf_args
-                _cf_args=$(
-                    local _am="" _at="" _ap="8401"
-                    [[ -f /etc/s-box/argo.conf ]] && source /etc/s-box/argo.conf
-                    _am="${ARGO_MODE:-temp}"; _at="${ARGO_TOKEN}"; _ap="${ARGO_PORT:-8401}"
-                    if [[ "$_am" == "token" && -n "$_at" ]]; then
-                        echo "tunnel --no-autoupdate run --token $_at"
-                    else
-                        echo "tunnel --url http://127.0.0.1:${_ap}"
-                    fi
-                )
-                nohup /usr/local/bin/cloudflared $_cf_args >> /var/log/argo-tunnel.log 2>&1 &
-                echo $! > /etc/s-box/argo-tunnel.pid
-                ;;
-            nginx)
-                nginx >/dev/null 2>&1
-                ;;
-        esac
-    else
-        systemctl start "$name" >/dev/null 2>&1
-    fi
-}
-
-service_stop() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" stop >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        case "$name" in
-            nginx)
-                nginx -s stop >/dev/null 2>&1
-                ;;
-            *)
-                local pidfile="/etc/s-box/${name}.pid"
-                if [[ -f "$pidfile" ]]; then
-                    local pid
-                    pid=$(cat "$pidfile" 2>/dev/null)
-                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                        kill "$pid" 2>/dev/null
-                        local i; for i in {1..10}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-                        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
-                    fi
-                    rm -f "$pidfile"
-                fi
-                ;;
-        esac
-    else
-        systemctl stop "$name" >/dev/null 2>&1
-    fi
-}
-
-service_restart() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" restart >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        service_stop "$name"
-        sleep 1
-        service_start "$name"
-    else
-        systemctl restart "$name" >/dev/null 2>&1
-    fi
-}
-
-service_enable() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-update add "$name" default >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        :
-    else
-        systemctl enable "$name" >/dev/null 2>&1
-    fi
-}
-
-service_disable() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-update del "$name" default >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        :
-    else
-        systemctl disable "$name" >/dev/null 2>&1
-    fi
-}
-
-service_is_active() {
-    local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" status 2>/dev/null | grep -q "started"
-    elif $IS_DIRECT; then
-        case "$name" in
-            nginx)
-                pgrep -x nginx >/dev/null 2>&1
-                ;;
-            *)
-                local pidfile="/etc/s-box/${name}.pid"
-                if [[ -f "$pidfile" ]]; then
-                    local pid
-                    pid=$(cat "$pidfile" 2>/dev/null)
-                    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
-                else
-                    return 1
-                fi
-                ;;
-        esac
-    else
-        systemctl is-active --quiet "$name"
-    fi
-}
-
-# ==================== 快捷管理脚本写入函数 ====================
-create_sb_tool() {
-mkdir -p /usr/local/bin
-cat > /usr/local/bin/sb <<'EOF_SB_TOOL'
-#!/bin/bash
-# ============================================================================
-# Sing-box 快捷管理工具 sb
-# ============================================================================
-
-# 确保以 root 权限运行
-if [[ $EUID -ne 0 ]]; then
-   echo "错误：必须以 root 权限运行此脚本！"
-   exit 1
-fi
-
-export LANG=en_US.UTF-8
-export LC_ALL=C
-
-# ==================== 颜色定义 ====================
-re="\033[0m"
-red="\033[1;91m"
-green="\e[1;32m"
-yellow="\e[1;33m"
-purple="\e[1;35m"
-blue="\e[1;36m"
-white="\e[1;37m"
-
-red() { echo -e "\e[1;91m$1\033[0m"; }
-green() { echo -e "\e[1;32m$1\033[0m"; }
-yellow() { echo -e "\e[1;33m$1\033[0m"; }
-purple() { echo -e "\e[1;35m$1\033[0m"; }
-blue() { echo -e "\e[1;36m$1\033[0m"; }
-white() { echo -e "\e[1;37m$1\033[0m"; }
-reading() { read -p "$(yellow "$1")" "$2"; }
-
 WORKDIR="/etc/s-box"
 PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
 PSI_INSTANCES_DIR="${WORKDIR}/psiphon_instances"
@@ -273,6 +73,17 @@ make_vmess_link() {
     local json="$1"
     printf '%s' "$json" | command jq -e . >/dev/null 2>&1 || return 1
     printf 'vmess://%s' "$(b64_no_wrap "$json")"
+}
+
+# 架构探测
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l|armv7) echo "armv7" ;;
+        i386|i686|386) echo "386" ;;
+        *) echo "amd64" ;;
+    esac
 }
 
 # 平台与服务自适应
@@ -389,6 +200,314 @@ service_is_active() {
     fi
 }
 
+# ==================== 依赖与核心自动安装 ====================
+install_system_dependencies() {
+    if ! command -v curl >/dev/null 2>&1 || ! command -v wget >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y >/dev/null 2>&1
+            apt-get install -y curl wget tar jq openssl git net-tools cron ca-certificates >/dev/null 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y curl wget tar jq openssl git net-tools cronie ca-certificates >/dev/null 2>&1
+        elif command -v apk >/dev/null 2>&1; then
+            apk update >/dev/null 2>&1
+            apk add curl wget tar jq openssl git net-tools ca-certificates >/dev/null 2>&1
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm curl wget tar jq openssl net-tools cronie ca-certificates >/dev/null 2>&1
+        fi
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        local arch=$(detect_arch)
+        mkdir -p /usr/local/bin
+        curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${arch}" -o /usr/local/bin/jq 2>/dev/null || \
+        curl -fsSL "https://ghproxy.net/https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-${arch}" -o /usr/local/bin/jq 2>/dev/null
+        chmod +x /usr/local/bin/jq 2>/dev/null
+    fi
+}
+
+download_singbox_core() {
+    local arch=$(detect_arch)
+    mkdir -p "$WORKDIR"
+    if [[ ! -x "$WORKDIR/sing-box" ]]; then
+        yellow "[*] 正在下载 Sing-box 核心 (Linux-${arch})..."
+        local sb_ver="1.11.4"
+        local sb_urls=(
+            "https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${arch}.tar.gz"
+            "https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${arch}.tar.gz"
+            "https://raw.githubusercontent.com/hxzl666/singbox/main/sing-box-linux-${arch}"
+        )
+        local tmp_d="/tmp/sb_bin_tmp"
+        mkdir -p "$tmp_d"
+        for url in "${sb_urls[@]}"; do
+            if curl -fsSL "$url" -o "$tmp_d/sb_pkg" 2>/dev/null; then
+                if [[ "$url" == *.tar.gz ]]; then
+                    tar -xzf "$tmp_d/sb_pkg" -C "$tmp_d" 2>/dev/null
+                    local bpath=$(find "$tmp_d" -type f -name "sing-box" | head -n 1)
+                    [[ -n "$bpath" ]] && cp -f "$bpath" "$WORKDIR/sing-box"
+                else
+                    cp -f "$tmp_d/sb_pkg" "$WORKDIR/sing-box"
+                fi
+                [[ -f "$WORKDIR/sing-box" ]] && break
+            fi
+        done
+        rm -rf "$tmp_d"
+        chmod +x "$WORKDIR/sing-box" 2>/dev/null
+    fi
+
+    if [[ ! -x "$WORKDIR/sing-box" ]]; then
+        red "[!] Sing-box 核心程序下载失败，请检查 VPS 网络！"
+        return 1
+    fi
+    return 0
+}
+
+download_cloudflared_core() {
+    local arch=$(detect_arch)
+    local cf_arch="$arch"
+    [[ "$arch" == "armv7" ]] && cf_arch="arm"
+    mkdir -p /usr/local/bin
+    if [[ ! -x "/usr/local/bin/cloudflared" ]]; then
+        yellow "[*] 正在下载 Cloudflared 核心 (Linux-${cf_arch})..."
+        local cf_urls=(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"
+            "https://ghproxy.net/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"
+        )
+        for url in "${cf_urls[@]}"; do
+            if curl -fsSL "$url" -o "/usr/local/bin/cloudflared" 2>/dev/null; then
+                chmod +x "/usr/local/bin/cloudflared"
+                break
+            fi
+        done
+    fi
+}
+
+download_psiphon_core() {
+    local arch=$(detect_arch)
+    local psi_arch="$arch"
+    [[ "$arch" == "armv7" ]] && psi_arch="arm"
+    mkdir -p "$WORKDIR"
+    if [[ -x "$WORKDIR/psiphon-tunnel-core" ]]; then
+        return 0
+    fi
+
+    yellow "[*] 正在下载 Psiphon 赛风核心 (Linux-${psi_arch})..."
+    local psi_urls=(
+        "https://github.com/hxzlplp7/psiphon-tunnel-core/releases/download/v1.0.0/psiphon-tunnel-core-linux-${psi_arch}.tar.gz"
+        "https://ghproxy.net/https://github.com/hxzlplp7/psiphon-tunnel-core/releases/download/v1.0.0/psiphon-tunnel-core-linux-${psi_arch}.tar.gz"
+        "https://github.com/Psiphon-Labs/psiphon-tunnel-core/releases/download/v2.0.28/psiphon-tunnel-core-linux-${psi_arch}"
+        "https://ghproxy.net/https://github.com/Psiphon-Labs/psiphon-tunnel-core/releases/download/v2.0.28/psiphon-tunnel-core-linux-${psi_arch}"
+    )
+
+    local tmp_psi="/tmp/psi_download_tmp"
+    mkdir -p "$tmp_psi"
+    for url in "${psi_urls[@]}"; do
+        if curl -fsSL "$url" -o "$tmp_psi/psi_pkg" 2>/dev/null; then
+            if [[ "$url" == *.tar.gz ]]; then
+                tar -xzf "$tmp_psi/psi_pkg" -C "$tmp_psi" 2>/dev/null
+                local ext_f=$(find "$tmp_psi" -type f -name 'psiphon-tunnel-core*' ! -name '*.tar.gz' | head -n1)
+                [[ -n "$ext_f" ]] && cp -f "$ext_f" "$WORKDIR/psiphon-tunnel-core"
+            else
+                cp -f "$tmp_psi/psi_pkg" "$WORKDIR/psiphon-tunnel-core"
+            fi
+            [[ -f "$WORKDIR/psiphon-tunnel-core" ]] && break
+        fi
+    done
+    rm -rf "$tmp_psi"
+    chmod +x "$WORKDIR/psiphon-tunnel-core" 2>/dev/null
+
+    if [[ ! -x "$WORKDIR/psiphon-tunnel-core" ]]; then
+        log_warn "未下载到 Psiphon 核心，请检查 VPS 对 GitHub 的网络连通性。"
+        return 1
+    fi
+    green "[+] Psiphon 核心已安装: $WORKDIR/psiphon-tunnel-core"
+    return 0
+}
+
+# ==================== 快捷管理脚本写入函数 ====================
+create_sb_tool() {
+mkdir -p /usr/local/bin
+cat > /usr/local/bin/sb <<'EOF_SB_TOOL'
+#!/bin/bash
+# ============================================================================
+# Sing-box 快捷管理工具 sb (全功能无需 Python，纯 jq/bash 高性能运行)
+# ============================================================================
+
+if [[ $EUID -ne 0 ]]; then
+   echo "错误：必须以 root 权限运行此脚本！"
+   exit 1
+fi
+
+export LANG=en_US.UTF-8
+export LC_ALL=C
+
+re="\033[0m"
+red="\033[1;91m"
+green="\e[1;32m"
+yellow="\e[1;33m"
+purple="\e[1;35m"
+blue="\e[1;36m"
+white="\e[1;37m"
+
+red() { echo -e "\e[1;91m$1\033[0m"; }
+green() { echo -e "\e[1;32m$1\033[0m"; }
+yellow() { echo -e "\e[1;33m$1\033[0m"; }
+purple() { echo -e "\e[1;35m$1\033[0m"; }
+blue() { echo -e "\e[1;36m$1\033[0m"; }
+white() { echo -e "\e[1;37m$1\033[0m"; }
+reading() { read -p "$(yellow "$1")" "$2"; }
+
+log_info() { echo -e "${green}[信息] $1${re}"; }
+log_warn() { echo -e "${yellow}[警告] $1${re}"; }
+log_err() { echo -e "${red}[错误] $1${re}"; }
+
+WORKDIR="/etc/s-box"
+PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
+PSI_INSTANCES_DIR="${WORKDIR}/psiphon_instances"
+SCRIPT_VERSION="2.0.0"
+
+jq() {
+    command jq "$@" | tr -d '\r'
+    return ${PIPESTATUS[0]}
+}
+
+b64_no_wrap() {
+    printf '%s' "$1" | base64 -w 0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+url_encode() {
+    local encoded
+    encoded=$(printf '%s' "$1" | command jq -sRr @uri 2>/dev/null) || return $?
+    printf '%s' "$encoded" | tr -d '\r\n'
+}
+
+make_vmess_link() {
+    local json="$1"
+    printf '%s' "$json" | command jq -e . >/dev/null 2>&1 || return 1
+    printf 'vmess://%s' "$(b64_no_wrap "$json")"
+}
+
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l|armv7) echo "armv7" ;;
+        i386|i686|386) echo "386" ;;
+        *) echo "amd64" ;;
+    esac
+}
+
+IS_OPENRC=false
+IS_DIRECT=false
+if [[ -x "/sbin/openrc-run" || -x "/sbin/runlevels" ]]; then
+    IS_OPENRC=true
+elif ! pidof systemd >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; then
+    IS_DIRECT=true
+fi
+
+NGINX_CONF_DIR="/etc/nginx/conf.d"
+[[ -d "/etc/nginx/http.d" ]] && NGINX_CONF_DIR="/etc/nginx/http.d"
+
+service_start() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" start >/dev/null 2>&1
+    elif $IS_DIRECT; then
+        service_stop "$name" 2>/dev/null
+        case "$name" in
+            sing-box)
+                nohup /etc/s-box/sing-box run -c /etc/s-box/sb.json >> /var/log/sing-box.log 2>&1 &
+                echo $! > /etc/s-box/sing-box.pid
+                ;;
+            argo-tunnel)
+                local _cf_args
+                _cf_args=$(
+                    local _am="" _at="" _ap="8401"
+                    [[ -f /etc/s-box/argo.conf ]] && source /etc/s-box/argo.conf
+                    _am="${ARGO_MODE:-temp}"; _at="${ARGO_TOKEN}"; _ap="${ARGO_PORT:-8401}"
+                    if [[ "$_am" == "token" && -n "$_at" ]]; then
+                        echo "tunnel --no-autoupdate run --token $_at"
+                    else
+                        echo "tunnel --url http://127.0.0.1:${_ap}"
+                    fi
+                )
+                nohup /usr/local/bin/cloudflared $_cf_args >> /var/log/argo-tunnel.log 2>&1 &
+                echo $! > /etc/s-box/argo-tunnel.pid
+                ;;
+            nginx)
+                nginx >/dev/null 2>&1
+                ;;
+        esac
+    else
+        systemctl start "$name" >/dev/null 2>&1
+    fi
+}
+
+service_stop() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" stop >/dev/null 2>&1
+    elif $IS_DIRECT; then
+        case "$name" in
+            nginx)
+                nginx -s stop >/dev/null 2>&1
+                ;;
+            *)
+                local pidfile="/etc/s-box/${name}.pid"
+                if [[ -f "$pidfile" ]]; then
+                    local pid
+                    pid=$(cat "$pidfile" 2>/dev/null)
+                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                        kill "$pid" 2>/dev/null
+                        local i; for i in {1..10}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+                        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+                    fi
+                    rm -f "$pidfile"
+                fi
+                ;;
+        esac
+    else
+        systemctl stop "$name" >/dev/null 2>&1
+    fi
+}
+
+service_restart() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" restart >/dev/null 2>&1
+    elif $IS_DIRECT; then
+        service_stop "$name"
+        sleep 1
+        service_start "$name"
+    else
+        systemctl restart "$name" >/dev/null 2>&1
+    fi
+}
+
+service_is_active() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-service "$name" status 2>/dev/null | grep -q "started"
+    elif $IS_DIRECT; then
+        case "$name" in
+            nginx)
+                pgrep -x nginx >/dev/null 2>&1
+                ;;
+            *)
+                local pidfile="/etc/s-box/${name}.pid"
+                if [[ -f "$pidfile" ]]; then
+                    local pid
+                    pid=$(cat "$pidfile" 2>/dev/null)
+                    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+                else
+                    return 1
+                fi
+                ;;
+        esac
+    else
+        systemctl is-active --quiet "$name"
+    fi
+}
+
 # ==================== IP 与系统状态获取 ====================
 ALL_IPS=()
 get_all_ips() {
@@ -398,7 +517,7 @@ get_all_ips() {
     ipv4_list=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -vE '^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)')
     if [[ -z "$ipv4_list" ]]; then
         local pub_ip
-        pub_ip=$(curl -s4m3 https://api.ipify.org || curl -s4m3 https://ip.sb)
+        pub_ip=$(curl -s4m3 https://api.ipify.org 2>/dev/null || curl -s4m3 https://ip.sb 2>/dev/null)
         [[ -n "$pub_ip" ]] && ALL_IPS+=("$pub_ip")
     else
         while read -r ip; do
@@ -406,7 +525,6 @@ get_all_ips() {
         done <<< "$ipv4_list"
     fi
 
-    # 获取公共 IPv6 (若有)
     local ipv6_list
     ipv6_list=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-fA-F:]+' | grep -vE '^(fe80|::1|fd)')
     if [[ -n "$ipv6_list" ]]; then
@@ -417,24 +535,9 @@ get_all_ips() {
 
     [[ ${#ALL_IPS[@]} -eq 0 ]] && ALL_IPS=("$(hostname -I 2>/dev/null | awk '{print $1}')")
     [[ ${#ALL_IPS[@]} -eq 0 || -z "${ALL_IPS[0]}" ]] && ALL_IPS=("127.0.0.1")
-
-    # 缓存
     printf "%s\n" "${ALL_IPS[@]}" > "$WORKDIR/all_ips.txt"
 }
 
-display_ip_list() {
-    mkdir -p "$WORKDIR"
-    for ip in "${ALL_IPS[@]}"; do
-        [[ -z "$ip" ]] && continue
-        # 探测可用性并缓存
-        local status_file="$WORKDIR/ip_status_${ip}.txt"
-        if [ ! -f "$status_file" ]; then
-            echo "Available" > "$status_file"
-        fi
-    done
-}
-
-# ==================== 端口管理与冲突修复 ====================
 get_free_port() {
     local port=$(( (RANDOM % 40000) + 10000 ))
     while ss -tulpn 2>/dev/null | grep -q ":${port} " || netstat -tulpn 2>/dev/null | grep -q ":${port} "; do
@@ -495,9 +598,8 @@ warp_egress_test() {
     echo
     purple "正在检测主节点出口 IP (经由当前出站路由)..."
     local loop_port
-    loop_port=$(jq -r '.inbounds[] | select(.tag=="socks-loopback") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
-    if [[ -z "$loop_port" || "$loop_port" == "null" ]]; then
-        # 临时直接探测系统出口
+    loop_port=$(jq -r '.inbounds[]? | select(.tag=="socks-loopback") | .listen_port // empty' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
+    if [[ -z "$loop_port" ]]; then
         local res
         res=$(curl -s4m5 https://ip.sb 2>/dev/null || curl -s4m5 https://api.ipify.org 2>/dev/null)
         green "当前直连出口 IP: ${res:-未知}"
@@ -549,32 +651,42 @@ show_supported_psiphon_codes() {
     echo "  FR - 法国      IN - 印度      AU - 澳大利亚  AUTO - 自动"
 }
 
-detect_arch_slim() {
-    case "$(uname -m)" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        armv7l|armv7) echo "arm" ;;
-        i386|i686) echo "386" ;;
-        *) echo "amd64" ;;
-    esac
-}
-
-install_psiphon_core() {
+download_psiphon_core() {
+    local arch=$(detect_arch)
+    local psi_arch="$arch"
+    [[ "$arch" == "armv7" ]] && psi_arch="arm"
+    mkdir -p "$WORKDIR"
     if [[ -x "$WORKDIR/psiphon-tunnel-core" ]]; then
         return 0
     fi
-    mkdir -p "$WORKDIR"
-    local arch
-    arch=$(detect_arch_slim)
-    yellow "[*] 正在下载 Psiphon 核心程序 (Linux-${arch})..."
-    local url="https://github.com/Psiphon-Labs/psiphon-tunnel-core/releases/download/v2.0.28/psiphon-tunnel-core-linux-${arch}"
-    if ! curl -fsSL "$url" -o "$WORKDIR/psiphon-tunnel-core" 2>/dev/null; then
-        # 备用下载地址
-        curl -fsSL "https://raw.githubusercontent.com/hxzl666/singbox/main/psiphon-tunnel-core-linux-${arch}" -o "$WORKDIR/psiphon-tunnel-core" 2>/dev/null || true
-    fi
+
+    yellow "[*] 正在下载 Psiphon 赛风核心 (Linux-${psi_arch})..."
+    local psi_urls=(
+        "https://github.com/hxzlplp7/psiphon-tunnel-core/releases/download/v1.0.0/psiphon-tunnel-core-linux-${psi_arch}.tar.gz"
+        "https://ghproxy.net/https://github.com/hxzlplp7/psiphon-tunnel-core/releases/download/v1.0.0/psiphon-tunnel-core-linux-${psi_arch}.tar.gz"
+        "https://github.com/Psiphon-Labs/psiphon-tunnel-core/releases/download/v2.0.28/psiphon-tunnel-core-linux-${psi_arch}"
+        "https://ghproxy.net/https://github.com/Psiphon-Labs/psiphon-tunnel-core/releases/download/v2.0.28/psiphon-tunnel-core-linux-${psi_arch}"
+    )
+
+    local tmp_psi="/tmp/psi_download_tmp"
+    mkdir -p "$tmp_psi"
+    for url in "${psi_urls[@]}"; do
+        if curl -fsSL "$url" -o "$tmp_psi/psi_pkg" 2>/dev/null; then
+            if [[ "$url" == *.tar.gz ]]; then
+                tar -xzf "$tmp_psi/psi_pkg" -C "$tmp_psi" 2>/dev/null
+                local ext_f=$(find "$tmp_psi" -type f -name 'psiphon-tunnel-core*' ! -name '*.tar.gz' | head -n1)
+                [[ -n "$ext_f" ]] && cp -f "$ext_f" "$WORKDIR/psiphon-tunnel-core"
+            else
+                cp -f "$tmp_psi/psi_pkg" "$WORKDIR/psiphon-tunnel-core"
+            fi
+            [[ -f "$WORKDIR/psiphon-tunnel-core" ]] && break
+        fi
+    done
+    rm -rf "$tmp_psi"
     chmod +x "$WORKDIR/psiphon-tunnel-core" 2>/dev/null
+
     if [[ ! -x "$WORKDIR/psiphon-tunnel-core" ]]; then
-        log_warn "未下载到原生 psiphon-tunnel-core，请确保网络通畅。"
+        log_warn "未下载到 Psiphon 核心，请检查 VPS 对 GitHub 的网络连通性。"
         return 1
     fi
     green "[+] Psiphon 核心已安装: $WORKDIR/psiphon-tunnel-core"
@@ -608,7 +720,7 @@ EOF_PSI
 }
 
 start_main_psiphon() {
-    install_psiphon_core || return 1
+    download_psiphon_core || return 1
     local psi_pid_file="$WORKDIR/psiphon.pid"
     if [[ -f "$psi_pid_file" ]] && kill -0 "$(cat "$psi_pid_file" 2>/dev/null)" 2>/dev/null; then
         return 0
@@ -636,7 +748,7 @@ stop_main_psiphon() {
     pkill -9 -f "psiphon.config" 2>/dev/null || true
 }
 
-# ==================== 副节点目录初始化与同步 ====================
+# ==================== 副节点历史旧配置自动迁移 ====================
 init_proxy_groups_dir() {
     mkdir -p "$PROXY_GROUPS_DIR"
     [[ -f "$PROXY_GROUPS_DIR/groups.txt" ]] || touch "$PROXY_GROUPS_DIR/groups.txt"
@@ -667,158 +779,327 @@ get_all_psiphon_instances() {
     fi
 }
 
-# 代理链接解析为 sing-box Outbound JSON (支持 6 种协议)
+# 自动发现并迁移之前旧版本中的自定义出口节点与副节点
+auto_migrate_legacy_nodes() {
+    local cfg="$WORKDIR/sb.json"
+    [[ -f "$cfg" ]] || return 0
+    init_proxy_groups_dir
+    init_psiphon_instances_dir
+
+    local custom_outbound_tags
+    mapfile -t custom_outbound_tags < <(jq -r '.outbounds[]? | select(.tag != "direct" and .tag != "block" and .tag != "warp-out" and .tag != "psiphon-main-out") | .tag' "$cfg" 2>/dev/null)
+
+    for otag in "${custom_outbound_tags[@]}"; do
+        [[ -z "$otag" || "$otag" == "null" ]] && continue
+        
+        # 赛风副节点
+        if [[ "$otag" =~ ^psiphon-([a-zA-Z0-9]+)$ ]]; then
+            local cc="${BASH_REMATCH[1]^^}"
+            local inst_dir="${PSI_INSTANCES_DIR}/${cc}"
+            mkdir -p "$inst_dir"
+            local sport
+            sport=$(jq -r --arg t "$otag" '.outbounds[]? | select(.tag==$t) | .server_port // empty' "$cfg" 2>/dev/null | head -n1)
+            echo "${sport:-0}" > "$inst_dir/socks_port.txt"
+            
+            local hp tp vp
+            hp=$(jq -r --arg t "hy2-psi-${cc,,}-in" '.inbounds[]? | select(.tag==$t or .tag==("hy2-custom-in-" + $t)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+            tp=$(jq -r --arg t "tuic-psi-${cc,,}-in" '.inbounds[]? | select(.tag==$t or .tag==("tuic-custom-in-" + $t)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+            vp=$(jq -r --arg t "vless-psi-${cc,,}-in" '.inbounds[]? | select(.tag==$t or .tag==("vless-custom-in-" + $t)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+            echo "${hp:-0}" > "$inst_dir/hy2_port.txt"
+            echo "${tp:-0}" > "$inst_dir/tuic_port.txt"
+            echo "${vp:-0}" > "$inst_dir/vless_port.txt"
+            if ! grep -qx "$cc" "$PSI_INSTANCES_DIR/instances.txt" 2>/dev/null; then
+                echo "$cc" >> "$PSI_INSTANCES_DIR/instances.txt"
+            fi
+            continue
+        fi
+
+        # 自定义外部代理副节点 (如 outbound-us, proxy-1 等)
+        local gtag="$otag"
+        [[ "$gtag" == *-out ]] && gtag="${gtag%-out}"
+        local gdir="${PROXY_GROUPS_DIR}/${gtag}"
+        mkdir -p "$gdir"
+
+        jq --arg t "$otag" '.outbounds[]? | select(.tag==$t)' "$cfg" > "$gdir/outbound.json" 2>/dev/null
+        [[ ! -f "$gdir/remark.txt" ]] && echo "$gtag" > "$gdir/remark.txt"
+
+        local matched_inbounds
+        mapfile -t matched_inbounds < <(jq -r --arg t "$otag" '.route.rules[]? | select(.outbound==$t) | .inbound[]?' "$cfg" 2>/dev/null)
+
+        local hp="0" tp="0" vp="0"
+        for ib_tag in "${matched_inbounds[@]}"; do
+            [[ -z "$ib_tag" || "$ib_tag" == "null" ]] && continue
+            local p_type p_port
+            p_type=$(jq -r --arg t "$ib_tag" '.inbounds[]? | select(.tag==$t) | .type' "$cfg" 2>/dev/null)
+            p_port=$(jq -r --arg t "$ib_tag" '.inbounds[]? | select(.tag==$t) | .listen_port' "$cfg" 2>/dev/null)
+            if [[ "$p_type" == "hysteria2" ]]; then hp="$p_port"; fi
+            if [[ "$p_type" == "tuic" ]]; then tp="$p_port"; fi
+            if [[ "$p_type" == "vless" ]]; then vp="$p_port"; fi
+        done
+
+        if [[ "$hp" == "0" ]]; then
+            hp=$(jq -r --arg t "$gtag" '.inbounds[]? | select(.tag | (contains($t) and contains("hy2"))) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+        fi
+        if [[ "$tp" == "0" ]]; then
+            tp=$(jq -r --arg t "$gtag" '.inbounds[]? | select(.tag | (contains($t) and contains("tuic"))) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+        fi
+        if [[ "$vp" == "0" ]]; then
+            vp=$(jq -r --arg t "$gtag" '.inbounds[]? | select(.tag | (contains($t) and contains("vless"))) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+        fi
+
+        echo "${hp:-0}" > "$gdir/hy2_port.txt"
+        echo "${tp:-0}" > "$gdir/tuic_port.txt"
+        echo "${vp:-0}" > "$gdir/vless_port.txt"
+
+        if ! grep -qx "$gtag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
+            echo "$gtag" >> "$PROXY_GROUPS_DIR/groups.txt"
+        fi
+    done
+}
+
+# 纯 jq/bash 解析代理链接 (无需 Python3)
 parse_proxy_url_to_json() {
     local url="$1"
     local tag="$2"
-    PROXY_URL="$url" PROXY_TAG="$tag" python3 - <<'PY_PARSER'
-import json, sys, base64, os
-from urllib.parse import urlparse, parse_qs, unquote
+    url=$(echo "$url" | tr -d '\r\n ')
+    [[ -z "$url" ]] && return 1
 
-url = os.environ.get('PROXY_URL', '').strip()
-tag = os.environ.get('PROXY_TAG', 'proxy-out')
+    local proto="${url%%://*}"
+    case "$proto" in
+        vmess)
+            local raw="${url#vmess://}"
+            raw="${raw%%#*}"
+            local decoded_json
+            decoded_json=$(printf '%s' "$raw" | base64 -d 2>/dev/null || printf '%s' "$raw" | base64 -d -i 2>/dev/null)
+            if ! echo "$decoded_json" | jq -e . >/dev/null 2>&1; then
+                echo "ERROR: VMess base64 解析失败"
+                return 1
+            fi
+            echo "$decoded_json" | jq --arg tag "$tag" '
+            {
+                "type": "vmess",
+                "tag": $tag,
+                "server": (.add // ""),
+                "server_port": ((.port // 443) | tostring | tonumber),
+                "uuid": (.id // ""),
+                "alter_id": ((.aid // 0) | tostring | tonumber),
+                "security": (.scy // "auto")
+            } +
+            (if .net == "ws" then {"transport": {"type": "ws", "path": (.path // "/"), "headers": (if .host and .host != "" then {"Host": .host} else {} end)}}
+             elif .net == "grpc" then {"transport": {"type": "grpc", "service_name": (.serviceName // (.path // "") | ltrimstr("/"))}}
+             elif .net == "httpupgrade" or .net == "h1" then {"transport": {"type": "httpupgrade", "path": (.path // "/"), "headers": (if .host and .host != "" then {"Host": .host} else {} end)}}
+             else {} end) +
+            (if .tls == "tls" then {"tls": {"enabled": true, "server_name": (if .sni and .sni != "" then .sni elif .host and .host != "" then .host else .add end)}} else {} end)
+            '
+            ;;
+        vless|trojan|hy2|hysteria2|tuic|ss)
+            local rest="${url#*://}"
+            local fragment="${rest#*#}"
+            [[ "$rest" == *"#"* ]] || fragment=""
+            rest="${rest%%#*}"
+            local query="${rest#*\?}"
+            [[ "$rest" == *"\?"* ]] || query=""
+            local hostpart="${rest%%\?*}"
 
-def b64d(s):
-    s = s.replace('-', '+').replace('_', '/')
-    s += '=' * (4 - len(s) % 4)
-    return base64.b64decode(s).decode('utf-8', errors='replace')
+            local userinfo="" host="" port=""
+            if [[ "$hostpart" == *"@"* ]]; then
+                userinfo="${hostpart%%@*}"
+                hostpart="${hostpart#*@}"
+            fi
 
-def make_tls(params, host, default_sec='tls'):
-    sec   = (params.get('security', [default_sec])[0] or default_sec).lower()
-    sni   = params.get('sni', [host])[0] or host
-    fp    = params.get('fp',  [''])[0]
-    pbk   = params.get('pbk', [''])[0]
-    sid   = params.get('sid', [''])[0]
-    alpn  = [a for a in params.get('alpn', [''])[0].split(',') if a]
-    insec = params.get('insecure', ['0'])[0] == '1' or params.get('allowInsecure', ['0'])[0] == '1'
-    if sec in ('none', ''):
-        return None
-    tls = {'enabled': True, 'server_name': sni}
-    if alpn:  tls['alpn'] = alpn
-    if insec: tls['insecure'] = True
-    if fp:    tls['utls'] = {'enabled': True, 'fingerprint': fp}
-    if sec == 'reality':
-        tls['reality'] = {'enabled': True, 'public_key': pbk, 'short_id': sid}
-    return tls
+            if [[ "$hostpart" =~ ^\[([a-fA-F0-9:]+)\]:([0-9]+)$ ]]; then
+                host="${BASH_REMATCH[1]}"
+                port="${BASH_REMATCH[2]}"
+            elif [[ "$hostpart" =~ ^([a-zA-Z0-9.-]+):([0-9]+)$ ]]; then
+                host="${BASH_REMATCH[1]}"
+                port="${BASH_REMATCH[2]}"
+            else
+                host="$hostpart"
+                port="443"
+            fi
 
-def make_transport(params):
-    net  = params.get('type', ['tcp'])[0].lower()
-    path = params.get('path', ['/'])[0]
-    hdr  = params.get('host', [''])[0]
-    svc  = params.get('serviceName', [''])[0]
-    if net == 'ws':
-        t = {'type': 'ws', 'path': path}
-        if hdr: t['headers'] = {'Host': hdr}
-        return t
-    if net == 'grpc':
-        return {'type': 'grpc', 'service_name': svc or path.lstrip('/')}
-    if net in ('httpupgrade', 'h1'):
-        t = {'type': 'httpupgrade', 'path': path}
-        if hdr: t['headers'] = {'Host': hdr}
-        return t
-    if net == 'h2':
-        t = {'type': 'http', 'path': path}
-        if hdr: t['host'] = [hdr]
-        return t
-    return None
+            local q_sni="" q_security="" q_flow="" q_pbk="" q_sid="" q_fp="" q_insecure="0" q_type="tcp" q_path="/" q_host="" q_serviceName="" q_alpn="" q_obfs="" q_obfs_pass=""
+            if [[ -n "$query" ]]; then
+                local old_ifs="$IFS"
+                IFS='&'
+                for param in $query; do
+                    local k="${param%%=*}"
+                    local v="${param#*=}"
+                    case "$k" in
+                        sni) q_sni="$v" ;;
+                        security) q_security="$v" ;;
+                        flow) q_flow="$v" ;;
+                        pbk) q_pbk="$v" ;;
+                        sid) q_sid="$v" ;;
+                        fp) q_fp="$v" ;;
+                        insecure|allowInsecure) q_insecure="$v" ;;
+                        type) q_type="$v" ;;
+                        path) q_path=$(printf '%b' "${v//%/\\x}") ;;
+                        host) q_host="$v" ;;
+                        serviceName) q_serviceName="$v" ;;
+                        alpn) q_alpn="$v" ;;
+                        obfs) q_obfs="$v" ;;
+                        obfs-password) q_obfs_pass="$v" ;;
+                    esac
+                done
+                IFS="$old_ifs"
+            fi
 
-def parse_vless(url, tag):
-    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
-    out = {'type': 'vless', 'tag': tag, 'server': host, 'server_port': p.port or 443,
-           'uuid': unquote(p.username or '')}
-    flow = params.get('flow', [''])[0]
-    if flow: out['flow'] = flow
-    t = make_transport(params)
-    if t: out['transport'] = t
-    tls = make_tls(params, host)
-    if tls: out['tls'] = tls
-    return out
+            [[ -z "$q_sni" ]] && q_sni="$host"
 
-def parse_vmess(url, tag):
-    raw = url[8:]
-    try:    data = json.loads(b64d(raw))
-    except Exception as e: raise ValueError(f'VMess base64 解码失败: {e}')
-    host = data.get('add',''); port = int(data.get('port', 443))
-    net  = data.get('net','tcp'); tls_s = data.get('tls','')
-    sni  = data.get('sni','') or data.get('host','') or host
-    path = data.get('path','/'); hdr = data.get('host',''); fp = data.get('fp','')
-    out  = {'type': 'vmess', 'tag': tag, 'server': host, 'server_port': port,
-            'uuid': data.get('id',''), 'alter_id': int(data.get('aid',0)),
-            'security': data.get('scy','auto')}
-    if net == 'ws':
-        t = {'type': 'ws', 'path': path}
-        if hdr: t['headers'] = {'Host': hdr}
-        out['transport'] = t
-    elif net == 'grpc':
-        out['transport'] = {'type': 'grpc', 'service_name': data.get('serviceName', path.lstrip('/'))}
-    elif net in ('httpupgrade', 'h1'):
-        t = {'type': 'httpupgrade', 'path': path}
-        if hdr: t['headers'] = {'Host': hdr}
-        out['transport'] = t
-    if tls_s == 'tls':
-        tls = {'enabled': True, 'server_name': sni}
-        if fp: tls['utls'] = {'enabled': True, 'fingerprint': fp}
-        out['tls'] = tls
-    return out
+            case "$proto" in
+                vless)
+                    jq -n \
+                      --arg tag "$tag" \
+                      --arg server "$host" \
+                      --argjson port "$port" \
+                      --arg uuid "$userinfo" \
+                      --arg flow "$q_flow" \
+                      --arg sec "$q_security" \
+                      --arg sni "$q_sni" \
+                      --arg pbk "$q_pbk" \
+                      --arg sid "$q_sid" \
+                      --arg fp "$q_fp" \
+                      --arg net "$q_type" \
+                      --arg path "$q_path" \
+                      --arg hosthdr "$q_host" \
+                      '
+                      {
+                        "type": "vless",
+                        "tag": $tag,
+                        "server": $server,
+                        "server_port": $port,
+                        "uuid": $uuid
+                      } +
+                      (if $flow != "" then {"flow": $flow} else {} end) +
+                      (if $net == "ws" then {"transport": {"type": "ws", "path": $path, "headers": (if $hosthdr != "" then {"Host": $hosthdr} else {} end)}}
+                       elif $net == "grpc" then {"transport": {"type": "grpc", "service_name": $path}}
+                       elif $net == "httpupgrade" then {"transport": {"type": "httpupgrade", "path": $path, "headers": (if $hosthdr != "" then {"Host": $hosthdr} else {} end)}}
+                       else {} end) +
+                      (if $sec == "reality" then {
+                        "tls": {"enabled": true, "server_name": $sni, "utls": {"enabled": true, "fingerprint": (if $fp != "" then $fp else "chrome" end)}, "reality": {"enabled": true, "public_key": $pbk, "short_id": $sid}}
+                      } elif $sec == "tls" then {
+                        "tls": {"enabled": true, "server_name": $sni, "utls": {"enabled": true, "fingerprint": (if $fp != "" then $fp else "chrome" end)}}
+                      } else {} end)
+                      '
+                    ;;
+                trojan)
+                    jq -n \
+                      --arg tag "$tag" \
+                      --arg server "$host" \
+                      --argjson port "$port" \
+                      --arg pass "$userinfo" \
+                      --arg sni "$q_sni" \
+                      --arg net "$q_type" \
+                      --arg path "$q_path" \
+                      --arg hosthdr "$q_host" \
+                      '
+                      {
+                        "type": "trojan",
+                        "tag": $tag,
+                        "server": $server,
+                        "server_port": $port,
+                        "password": $pass,
+                        "tls": {"enabled": true, "server_name": $sni}
+                      } +
+                      (if $net == "ws" then {"transport": {"type": "ws", "path": $path, "headers": (if $hosthdr != "" then {"Host": $hosthdr} else {} end)}}
+                       elif $net == "grpc" then {"transport": {"type": "grpc", "service_name": $path}}
+                       elif $net == "httpupgrade" then {"transport": {"type": "httpupgrade", "path": $path, "headers": (if $hosthdr != "" then {"Host": $hosthdr} else {} end)}}
+                       else {} end)
+                      '
+                    ;;
+                hy2|hysteria2)
+                    local insec_bool="false"
+                    [[ "$q_insecure" == "1" || "$q_insecure" == "true" ]] && insec_bool="true"
+                    jq -n \
+                      --arg tag "$tag" \
+                      --arg server "$host" \
+                      --argjson port "$port" \
+                      --arg pass "$userinfo" \
+                      --arg sni "$q_sni" \
+                      --argjson insec "$insec_bool" \
+                      --arg obfs "$q_obfs" \
+                      --arg obfs_p "$q_obfs_pass" \
+                      '
+                      {
+                        "type": "hysteria2",
+                        "tag": $tag,
+                        "server": $server,
+                        "server_port": $port,
+                        "password": $pass,
+                        "tls": {"enabled": true, "server_name": $sni, "insecure": $insec}
+                      } +
+                      (if $obfs != "" then {"obfs": {"type": $obfs, "password": $obfs_p}} else {} end)
+                      '
+                    ;;
+                tuic)
+                    local tuic_uuid="${userinfo%%:*}"
+                    local tuic_pass="${userinfo#*:}"
+                    [[ "$userinfo" != *":"* ]] && tuic_pass="$tuic_uuid"
+                    local insec_bool="false"
+                    [[ "$q_insecure" == "1" || "$q_insecure" == "true" ]] && insec_bool="true"
+                    local alpn_arr='["h3"]'
+                    [[ -n "$q_alpn" ]] && alpn_arr=$(printf '%s' "$q_alpn" | jq -R 'split(",")')
 
-def parse_trojan(url, tag):
-    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
-    out = {'type': 'trojan', 'tag': tag, 'server': host, 'server_port': p.port or 443,
-           'password': unquote(p.username or '')}
-    t = make_transport(params)
-    if t: out['transport'] = t
-    tls = make_tls(params, host) or {'enabled': True, 'server_name': host}
-    out['tls'] = tls
-    return out
-
-def parse_hy2(url, tag):
-    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
-    pw = unquote(p.username or '') or unquote(p.password or '')
-    sni = params.get('sni', [host])[0] or host
-    insec = params.get('insecure', ['0'])[0] == '1'
-    obfs_t = params.get('obfs', [''])[0]; obfs_p = params.get('obfs-password', [''])[0]
-    out = {'type': 'hysteria2', 'tag': tag, 'server': host, 'server_port': p.port or 443,
-           'password': pw, 'tls': {'enabled': True, 'server_name': sni, 'insecure': insec}}
-    if obfs_t: out['obfs'] = {'type': obfs_t, 'password': obfs_p}
-    return out
-
-def parse_tuic(url, tag):
-    p = urlparse(url); params = parse_qs(p.query); host = p.hostname
-    alpn = [a for a in params.get('alpn', ['h3'])[0].split(',') if a] or ['h3']
-    sni  = params.get('sni', [host])[0] or host
-    insec = params.get('allow_insecure', ['0'])[0] == '1'
-    cc   = params.get('congestion_control', ['bbr'])[0]
-    return {'type': 'tuic', 'tag': tag, 'server': host, 'server_port': p.port or 443,
-            'uuid': unquote(p.username or ''), 'password': unquote(p.password or ''),
-            'congestion_control': cc,
-            'tls': {'enabled': True, 'server_name': sni, 'alpn': alpn, 'insecure': insec}}
-
-def parse_ss(url, tag):
-    p = urlparse(url); host = p.hostname; port = p.port or 8388
-    if p.username and p.password:
-        method = unquote(p.username); password = unquote(p.password)
-    else:
-        userinfo = unquote(p.username or '')
-        try:    method, password = b64d(userinfo).split(':', 1)
-        except: method = 'aes-256-gcm'; password = userinfo
-    return {'type': 'shadowsocks', 'tag': tag, 'server': host, 'server_port': port,
-            'method': method, 'password': password}
-
-try:
-    if   url.startswith('vless://'):                   r = parse_vless(url, tag)
-    elif url.startswith('vmess://'):                   r = parse_vmess(url, tag)
-    elif url.startswith('trojan://'):                  r = parse_trojan(url, tag)
-    elif url.startswith(('hy2://', 'hysteria2://')):   r = parse_hy2(url, tag)
-    elif url.startswith('tuic://'):                    r = parse_tuic(url, tag)
-    elif url.startswith('ss://'):                      r = parse_ss(url, tag)
-    else:
-        print('ERROR: 不支持的协议，支持: vless/vmess/trojan/hy2/tuic/ss')
-        sys.exit(1)
-    print(json.dumps(r, ensure_ascii=False, indent=2))
-except Exception as e:
-    print(f'ERROR: {e}')
-    sys.exit(1)
-PY_PARSER
+                    jq -n \
+                      --arg tag "$tag" \
+                      --arg server "$host" \
+                      --argjson port "$port" \
+                      --arg uuid "$tuic_uuid" \
+                      --arg pass "$tuic_pass" \
+                      --arg sni "$q_sni" \
+                      --argjson insec "$insec_bool" \
+                      --argjson alpn "$alpn_arr" \
+                      '
+                      {
+                        "type": "tuic",
+                        "tag": $tag,
+                        "server": $server,
+                        "server_port": $port,
+                        "uuid": $uuid,
+                        "password": $pass,
+                        "congestion_control": "bbr",
+                        "tls": {"enabled": true, "server_name": $sni, "alpn": $alpn, "insecure": $insec}
+                      }
+                      '
+                    ;;
+                ss)
+                    local method="aes-256-gcm" password="$userinfo"
+                    if [[ "$userinfo" == *":"* ]]; then
+                        method="${userinfo%%:*}"
+                        password="${userinfo#*:}"
+                    else
+                        local dec
+                        dec=$(printf '%s' "$userinfo" | base64 -d 2>/dev/null)
+                        if [[ "$dec" == *":"* ]]; then
+                            method="${dec%%:*}"
+                            password="${dec#*:}"
+                        fi
+                    fi
+                    jq -n \
+                      --arg tag "$tag" \
+                      --arg server "$host" \
+                      --argjson port "$port" \
+                      --arg method "$method" \
+                      --arg pass "$password" \
+                      '
+                      {
+                        "type": "shadowsocks",
+                        "tag": $tag,
+                        "server": $server,
+                        "server_port": $port,
+                        "method": $method,
+                        "password": $pass
+                      }
+                      '
+                    ;;
+            esac
+            ;;
+        *)
+            echo "ERROR: 不支持的协议: $proto"
+            return 1
+            ;;
+    esac
 }
 
 validate_and_parse_proxy_url() {
@@ -832,7 +1113,7 @@ validate_and_parse_proxy_url() {
     return 0
 }
 
-# ==================== 同步自定义代理副节点到 sing-box ====================
+# ==================== 同步自定义代理副节点到 sing-box (纯 jq) ====================
 sync_proxy_group_to_singbox() {
     local group_tag="$1"
     local group_dir="${PROXY_GROUPS_DIR}/${group_tag}"
@@ -842,126 +1123,84 @@ sync_proxy_group_to_singbox() {
     [[ -d "$group_dir" ]] || return 1
     [[ -f "$group_dir/outbound.json" ]] || return 1
 
-    local hy2_port tuic_port vless_port uuid
+    local hy2_port tuic_port vless_port uuid reality_pvk reym
     hy2_port=$(cat "$group_dir/hy2_port.txt" 2>/dev/null || echo "0")
     tuic_port=$(cat "$group_dir/tuic_port.txt" 2>/dev/null || echo "0")
     vless_port=$(cat "$group_dir/vless_port.txt" 2>/dev/null || echo "0")
-    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat "$WORKDIR/uuid.txt" 2>/dev/null)
+    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
+    reality_pvk=$(cat "$WORKDIR/private_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key' "$cfg" 2>/dev/null | head -n1)
+    reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
     local out_tag="${group_tag}-out"
 
-    python3 - \
-        "$cfg" \
-        "$group_tag" \
-        "$out_tag" \
-        "${hy2_port:-0}" \
-        "${tuic_port:-0}" \
-        "${vless_port:-0}" \
-        "$uuid" \
-        "$WORKDIR" \
-        "$group_dir/outbound.json" <<'PY_SYNC_PROXY'
-import json, sys
+    local tmp_json
+    tmp_json=$(mktemp)
 
-cfg_path    = sys.argv[1]
-group_tag   = sys.argv[2]
-out_tag     = sys.argv[3]
-hy2_port    = int(sys.argv[4]) if sys.argv[4] else 0
-tuic_port   = int(sys.argv[5]) if sys.argv[5] else 0
-vless_port  = int(sys.argv[6]) if sys.argv[6] else 0
-uuid        = sys.argv[7]
-workdir     = sys.argv[8]
-outbound_f  = sys.argv[9]
+    jq \
+      --slurpfile ob_file "$group_dir/outbound.json" \
+      --arg group_tag "$group_tag" \
+      --arg out_tag "$out_tag" \
+      --argjson hy2_port "${hy2_port:-0}" \
+      --argjson tuic_port "${tuic_port:-0}" \
+      --argjson vless_port "${vless_port:-0}" \
+      --arg uuid "$uuid" \
+      --arg reality_pvk "$reality_pvk" \
+      --arg reym "$reym" \
+      '
+      .outbounds = ([.outbounds[] | select(.tag != $out_tag)]) + [($ob_file[0] + {"tag": $out_tag})] |
 
-try:
-    with open(outbound_f, 'r', encoding='utf-8') as f:
-        outbound_obj = json.load(f)
-    outbound_obj['tag'] = out_tag
-except Exception as e:
-    sys.exit(1)
+      .inbounds = [.inbounds[] | select(
+        .tag != ("hy2-" + $group_tag + "-in") and
+        .tag != ("tuic-" + $group_tag + "-in") and
+        .tag != ("vless-" + $group_tag + "-in")
+      )] |
 
-try:
-    with open(cfg_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-except Exception as e:
-    sys.exit(1)
+      (
+        [] |
+        if $hy2_port > 0 then . + [{
+          "type": "hysteria2",
+          "tag": ("hy2-" + $group_tag + "-in"),
+          "listen": "::",
+          "listen_port": $hy2_port,
+          "users": [{"password": $uuid}],
+          "masquerade": "https://www.bing.com",
+          "ignore_client_bandwidth": false,
+          "tls": {"enabled": true, "alpn": ["h3"], "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}
+        }] else . end |
+        if $tuic_port > 0 then . + [{
+          "type": "tuic",
+          "tag": ("tuic-" + $group_tag + "-in"),
+          "listen": "::",
+          "listen_port": $tuic_port,
+          "users": [{"uuid": $uuid, "password": $uuid}],
+          "congestion_control": "bbr",
+          "tls": {"enabled": true, "alpn": ["h3"], "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}
+        }] else . end |
+        if $vless_port > 0 then . + [{
+          "type": "vless",
+          "tag": ("vless-" + $group_tag + "-in"),
+          "listen": "::",
+          "listen_port": $vless_port,
+          "users": [{"uuid": $uuid, "flow": "xtls-rprx-vision"}],
+          "tls": {
+            "enabled": true,
+            "server_name": $reym,
+            "reality": {"enabled": true, "handshake": {"server": $reym, "server_port": 443}, "private_key": $reality_pvk, "short_id": [""]}
+          }
+        }] else . end
+      ) as $new_inbounds |
+      .inbounds += $new_inbounds |
 
-inbounds  = data.setdefault('inbounds',  [])
-outbounds = data.setdefault('outbounds', [])
-route     = data.setdefault('route',     {})
-rules     = route.setdefault('rules',    [])
+      ($new_inbounds | map(.tag)) as $inbound_tags |
 
-# 1. 更新 outbound
-outbounds[:] = [o for o in outbounds if o.get('tag') != out_tag]
-outbounds.append(outbound_obj)
-
-# 2. 移除旧的专属 inbound
-def is_mine(ib):
-    t = ib.get('tag', '')
-    return t == f'hy2-{group_tag}-in' or t == f'tuic-{group_tag}-in' or t == f'vless-{group_tag}-in'
-
-inbounds[:] = [ib for ib in inbounds if not is_mine(ib)]
-
-cert = f'{workdir}/cert.pem'
-key  = f'{workdir}/private.key'
-inbound_tags = []
-
-if hy2_port > 0:
-    t = f'hy2-{group_tag}-in'
-    inbound_tags.append(t)
-    inbounds.append({
-        'type': 'hysteria2', 'tag': t,
-        'listen': '::', 'listen_port': hy2_port,
-        'users': [{'password': uuid}],
-        'masquerade': 'https://www.bing.com',
-        'ignore_client_bandwidth': False,
-        'tls': {'enabled': True, 'alpn': ['h3'], 'certificate_path': cert, 'key_path': key}
-    })
-
-if tuic_port > 0:
-    t = f'tuic-{group_tag}-in'
-    inbound_tags.append(t)
-    inbounds.append({
-        'type': 'tuic', 'tag': t,
-        'listen': '::', 'listen_port': tuic_port,
-        'users': [{'uuid': uuid, 'password': uuid}],
-        'congestion_control': 'bbr',
-        'tls': {'enabled': True, 'alpn': ['h3'], 'certificate_path': cert, 'key_path': key}
-    })
-
-if vless_port > 0:
-    t = f'vless-{group_tag}-in'
-    inbound_tags.append(t)
-    reality_pvk = ""
-    reym = "apple.com"
-    try:
-        with open(f'{workdir}/private_key.txt', 'r') as f: reality_pvk = f.read().strip()
-        with open(f'{workdir}/reym.txt', 'r') as f: reym = f.read().strip()
-    except: pass
-    inbounds.append({
-        'type': 'vless', 'tag': t,
-        'listen': '::', 'listen_port': vless_port,
-        'users': [{'uuid': uuid, 'flow': 'xtls-rprx-vision'}],
-        'tls': {
-            'enabled': True, 'server_name': reym,
-            'reality': {'enabled': True, 'handshake': {'server': reym, 'server_port': 443},
-                        'private_key': reality_pvk, 'short_id': ['']}
-        }
-    })
-
-# 3. 更新路由规则：在最前插入专属规则，确保副节点无论何时都走自己的外部代理出口
-rules[:] = [r for r in rules if r.get('outbound') != out_tag]
-if inbound_tags:
-    rules.insert(0, {'inbound': inbound_tags, 'outbound': out_tag})
-
-try:
-    with open(cfg_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-except Exception as e:
-    sys.exit(1)
-PY_SYNC_PROXY
+      .route.rules = ([.route.rules[] | select(.outbound != $out_tag)]) |
+      if ($inbound_tags | length) > 0 then
+        .route.rules = ([{"inbound": $inbound_tags, "outbound": $out_tag}] + .route.rules)
+      else . end
+      ' "$cfg" > "$tmp_json" && mv -f "$tmp_json" "$cfg"
     return $?
 }
 
-# ==================== 同步赛风副节点到 sing-box ====================
+# ==================== 同步赛风副节点到 sing-box (纯 jq) ====================
 sync_psiphon_instance_to_singbox() {
     local cc="${1^^}"
     local inst_dir="${PSI_INSTANCES_DIR}/${cc}"
@@ -970,124 +1209,92 @@ sync_psiphon_instance_to_singbox() {
     [[ -f "$cfg" ]] || return 1
     [[ -d "$inst_dir" ]] || return 1
 
-    local hy2_port tuic_port vless_port socks_port uuid
+    local hy2_port tuic_port vless_port socks_port uuid reality_pvk reym
     hy2_port=$(cat "$inst_dir/hy2_port.txt" 2>/dev/null || echo "0")
     tuic_port=$(cat "$inst_dir/tuic_port.txt" 2>/dev/null || echo "0")
     vless_port=$(cat "$inst_dir/vless_port.txt" 2>/dev/null || echo "0")
     socks_port=$(cat "$inst_dir/socks_port.txt" 2>/dev/null || echo "0")
-    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat "$WORKDIR/uuid.txt" 2>/dev/null)
-    local out_tag="psiphon-${cc,,}"
+    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
+    reality_pvk=$(cat "$WORKDIR/private_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key' "$cfg" 2>/dev/null | head -n1)
+    reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
+    local cc_lower=$(echo "$cc" | tr '[:upper:]' '[:lower:]')
+    local out_tag="psiphon-${cc_lower}"
 
-    python3 - \
-        "$cfg" \
-        "$cc" \
-        "$out_tag" \
-        "${socks_port:-0}" \
-        "${hy2_port:-0}" \
-        "${tuic_port:-0}" \
-        "${vless_port:-0}" \
-        "$uuid" \
-        "$WORKDIR" <<'PY_SYNC_PSI'
-import json, sys
+    local tmp_json
+    tmp_json=$(mktemp)
 
-cfg_path    = sys.argv[1]
-cc          = sys.argv[2].lower()
-out_tag     = sys.argv[3]
-socks_port  = int(sys.argv[4]) if sys.argv[4] else 0
-hy2_port    = int(sys.argv[5]) if sys.argv[5] else 0
-tuic_port   = int(sys.argv[6]) if sys.argv[6] else 0
-vless_port  = int(sys.argv[7]) if sys.argv[7] else 0
-uuid        = sys.argv[8]
-workdir     = sys.argv[9]
+    jq \
+      --arg cc "$cc_lower" \
+      --arg out_tag "$out_tag" \
+      --argjson socks_port "${socks_port:-0}" \
+      --argjson hy2_port "${hy2_port:-0}" \
+      --argjson tuic_port "${tuic_port:-0}" \
+      --argjson vless_port "${vless_port:-0}" \
+      --arg uuid "$uuid" \
+      --arg reality_pvk "$reality_pvk" \
+      --arg reym "$reym" \
+      '
+      .outbounds = [.outbounds[] | select(.tag != $out_tag)] |
+      if $socks_port > 0 then
+        .outbounds += [{
+          "type": "socks",
+          "tag": $out_tag,
+          "server": "127.0.0.1",
+          "server_port": $socks_port,
+          "version": "5",
+          "network": "tcp"
+        }]
+      else . end |
 
-try:
-    with open(cfg_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-except Exception as e:
-    sys.exit(1)
+      .inbounds = [.inbounds[] | select(
+        .tag != ("hy2-psi-" + $cc + "-in") and
+        .tag != ("tuic-psi-" + $cc + "-in") and
+        .tag != ("vless-psi-" + $cc + "-in")
+      )] |
 
-inbounds  = data.setdefault('inbounds',  [])
-outbounds = data.setdefault('outbounds', [])
-route     = data.setdefault('route',     {})
-rules     = route.setdefault('rules',    [])
+      (
+        [] |
+        if $hy2_port > 0 then . + [{
+          "type": "hysteria2",
+          "tag": ("hy2-psi-" + $cc + "-in"),
+          "listen": "::",
+          "listen_port": $hy2_port,
+          "users": [{"password": $uuid}],
+          "masquerade": "https://www.bing.com",
+          "ignore_client_bandwidth": false,
+          "tls": {"enabled": true, "alpn": ["h3"], "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}
+        }] else . end |
+        if $tuic_port > 0 then . + [{
+          "type": "tuic",
+          "tag": ("tuic-psi-" + $cc + "-in"),
+          "listen": "::",
+          "listen_port": $tuic_port,
+          "users": [{"uuid": $uuid, "password": $uuid}],
+          "congestion_control": "bbr",
+          "tls": {"enabled": true, "alpn": ["h3"], "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}
+        }] else . end |
+        if $vless_port > 0 then . + [{
+          "type": "vless",
+          "tag": ("vless-psi-" + $cc + "-in"),
+          "listen": "::",
+          "listen_port": $vless_port,
+          "users": [{"uuid": $uuid, "flow": "xtls-rprx-vision"}],
+          "tls": {
+            "enabled": true,
+            "server_name": $reym,
+            "reality": {"enabled": true, "handshake": {"server": $reym, "server_port": 443}, "private_key": $reality_pvk, "short_id": [""]}
+          }
+        }] else . end
+      ) as $new_inbounds |
+      .inbounds += $new_inbounds |
 
-# 1. 更新 outbound
-outbounds[:] = [o for o in outbounds if o.get('tag') != out_tag]
-if socks_port > 0:
-    outbounds.append({
-        'type': 'socks',
-        'tag': out_tag,
-        'server': '127.0.0.1',
-        'server_port': socks_port,
-        'version': '5',
-        'network': 'tcp'
-    })
+      ($new_inbounds | map(.tag)) as $inbound_tags |
 
-# 2. 移除旧专属 inbound
-def is_mine(ib):
-    t = ib.get('tag', '')
-    return t == f'hy2-psi-{cc}-in' or t == f'tuic-psi-{cc}-in' or t == f'vless-psi-{cc}-in'
-
-inbounds[:] = [ib for ib in inbounds if not is_mine(ib)]
-
-cert = f'{workdir}/cert.pem'
-key  = f'{workdir}/private.key'
-inbound_tags = []
-
-if hy2_port > 0:
-    t = f'hy2-psi-{cc}-in'
-    inbound_tags.append(t)
-    inbounds.append({
-        'type': 'hysteria2', 'tag': t,
-        'listen': '::', 'listen_port': hy2_port,
-        'users': [{'password': uuid}],
-        'masquerade': 'https://www.bing.com',
-        'ignore_client_bandwidth': False,
-        'tls': {'enabled': True, 'alpn': ['h3'], 'certificate_path': cert, 'key_path': key}
-    })
-
-if tuic_port > 0:
-    t = f'tuic-psi-{cc}-in'
-    inbound_tags.append(t)
-    inbounds.append({
-        'type': 'tuic', 'tag': t,
-        'listen': '::', 'listen_port': tuic_port,
-        'users': [{'uuid': uuid, 'password': uuid}],
-        'congestion_control': 'bbr',
-        'tls': {'enabled': True, 'alpn': ['h3'], 'certificate_path': cert, 'key_path': key}
-    })
-
-if vless_port > 0:
-    t = f'vless-psi-{cc}-in'
-    inbound_tags.append(t)
-    reality_pvk = ""
-    reym = "apple.com"
-    try:
-        with open(f'{workdir}/private_key.txt', 'r') as f: reality_pvk = f.read().strip()
-        with open(f'{workdir}/reym.txt', 'r') as f: reym = f.read().strip()
-    except: pass
-    inbounds.append({
-        'type': 'vless', 'tag': t,
-        'listen': '::', 'listen_port': vless_port,
-        'users': [{'uuid': uuid, 'flow': 'xtls-rprx-vision'}],
-        'tls': {
-            'enabled': True, 'server_name': reym,
-            'reality': {'enabled': True, 'handshake': {'server': reym, 'server_port': 443},
-                        'private_key': reality_pvk, 'short_id': ['']}
-        }
-    })
-
-# 3. 插入专属路由规则到最前
-rules[:] = [r for r in rules if r.get('outbound') != out_tag]
-if inbound_tags and socks_port > 0:
-    rules.insert(0, {'inbound': inbound_tags, 'outbound': out_tag})
-
-try:
-    with open(cfg_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-except Exception as e:
-    sys.exit(1)
-PY_SYNC_PSI
+      .route.rules = ([.route.rules[] | select(.outbound != $out_tag)]) |
+      if ($inbound_tags | length) > 0 and $socks_port > 0 then
+        .route.rules = ([{"inbound": $inbound_tags, "outbound": $out_tag}] + .route.rules)
+      else . end
+      ' "$cfg" > "$tmp_json" && mv -f "$tmp_json" "$cfg"
     return $?
 }
 
@@ -1095,15 +1302,14 @@ PY_SYNC_PSI
 sync_all_secondary_nodes() {
     local cfg="$WORKDIR/sb.json"
     [[ -f "$cfg" ]] || return 0
+    auto_migrate_legacy_nodes
 
-    # 1. 恢复同步所有赛风副节点实例
     local psi_insts
     mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
     for cc in "${psi_insts[@]}"; do
         [[ -n "$cc" ]] && sync_psiphon_instance_to_singbox "$cc" >/dev/null 2>&1 || true
     done
 
-    # 2. 恢复同步所有自定义代理副节点组
     local proxy_tags
     mapfile -t proxy_tags < <(get_all_proxy_groups 2>/dev/null)
     for tag in "${proxy_tags[@]}"; do
@@ -1111,7 +1317,7 @@ sync_all_secondary_nodes() {
     done
 }
 
-# ==================== 主节点出站应用函数 ====================
+# ==================== 主节点出站应用函数 (纯 jq) ====================
 apply_main_node_outbound() {
     local cfg="$WORKDIR/sb.json"
     [[ -f "$cfg" ]] || return 1
@@ -1129,133 +1335,86 @@ apply_main_node_outbound() {
     psi_main_enabled=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null || echo "false")
     psi_main_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
 
-    python3 - \
-        "$cfg" \
-        "$warp_enabled" \
-        "$warp_mode" \
-        "$warp_endpoint" \
-        "$warp_port" \
-        "$warp_pvk" \
-        "$warp_ipv6" \
-        "$warp_res" \
-        "$psi_main_enabled" \
-        "$psi_main_port" <<'PY_APPLY_MAIN'
-import json, sys
+    local tmp_json
+    tmp_json=$(mktemp)
 
-cfg_path         = sys.argv[1]
-warp_enabled     = sys.argv[2].lower() == 'true'
-warp_mode        = sys.argv[3]
-warp_endpoint    = sys.argv[4]
-warp_port        = int(sys.argv[5]) if sys.argv[5] else 2408
-warp_pvk         = sys.argv[6]
-warp_ipv6        = sys.argv[7]
-warp_res_raw     = sys.argv[8]
-psi_main_enabled = sys.argv[9].lower() == 'true'
-psi_main_port    = int(sys.argv[10]) if sys.argv[10] else 20800
+    jq \
+      --arg warp_en "$warp_enabled" \
+      --arg warp_mode "$warp_mode" \
+      --arg warp_ep "$warp_endpoint" \
+      --argjson warp_port "$warp_port" \
+      --arg warp_pvk "$warp_pvk" \
+      --arg warp_ipv6 "$warp_ipv6" \
+      --argjson warp_res "$warp_res" \
+      --arg psi_en "$psi_main_enabled" \
+      --argjson psi_port "$psi_main_port" \
+      '
+      .outbounds = (.outbounds // []) |
+      if any(.tag == "direct") then . else . + [{"type":"direct","tag":"direct"}] end |
+      if any(.tag == "block") then . else . + [{"type":"block","tag":"block"}] end |
+      
+      .outbounds = [.outbounds[] | select(.tag != "warp-out" and .tag != "psiphon-main-out")] |
+      
+      .route.rules = [(.route.rules // [])[] | select(
+        if .outbound == "warp-out" or .outbound == "psiphon-main-out" then
+          if .inbound == ["socks-loopback"] or .geosite != null or .domain_suffix != null then false else true end
+        else true end
+      )] |
+      
+      if $warp_en == "true" and $warp_mode == "all" then
+        .outbounds += [{
+          "type": "wireguard",
+          "tag": "warp-out",
+          "server": $warp_ep,
+          "server_port": $warp_port,
+          "local_address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
+          "private_key": $warp_pvk,
+          "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+          "reserved": $warp_res
+        }] |
+        .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
+        .route.final = "warp-out"
+      elif $warp_en == "true" and $warp_mode == "google" then
+        .outbounds += [{
+          "type": "wireguard",
+          "tag": "warp-out",
+          "server": $warp_ep,
+          "server_port": $warp_port,
+          "local_address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
+          "private_key": $warp_pvk,
+          "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+          "reserved": $warp_res
+        }] |
+        .route.rules += [
+          {"inbound": ["socks-loopback"], "outbound": "warp-out"},
+          {
+            "geosite": ["google", "youtube", "netflix", "openai"],
+            "domain_suffix": ["google.com", "googlevideo.com", "youtube.com", "netflix.com", "openai.com", "chatgpt.com"],
+            "outbound": "warp-out"
+          }
+        ] |
+        .route.final = "direct"
+      elif $psi_en == "true" then
+        .outbounds += [{
+          "type": "socks",
+          "tag": "psiphon-main-out",
+          "server": "127.0.0.1",
+          "server_port": $psi_port,
+          "version": "5",
+          "network": "tcp"
+        }] |
+        .route.rules += [{"inbound": ["socks-loopback"], "outbound": "psiphon-main-out"}] |
+        .route.final = "psiphon-main-out"
+      else
+        .route.rules += [{"inbound": ["socks-loopback"], "outbound": "direct"}] |
+        .route.final = "direct"
+      end
+      ' "$cfg" > "$tmp_json" && mv -f "$tmp_json" "$cfg"
 
-try:
-    warp_res = json.loads(warp_res_raw)
-except:
-    warp_res = [215, 69, 233]
-
-try:
-    with open(cfg_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-except Exception as e:
-    sys.exit(1)
-
-outbounds = data.setdefault('outbounds', [])
-route     = data.setdefault('route', {})
-rules     = route.setdefault('rules', [])
-
-# 确保 direct 与 block 出站存在
-if not any(o.get('tag') == 'direct' for o in outbounds):
-    outbounds.append({'type': 'direct', 'tag': 'direct'})
-if not any(o.get('tag') == 'block' for o in outbounds):
-    outbounds.append({'type': 'block', 'tag': 'block'})
-
-# 清理旧的主出站对象
-outbounds[:] = [o for o in outbounds if o.get('tag') not in ('warp-out', 'psiphon-main-out')]
-
-# 清理旧的主分流规则 (保留副节点的规则)
-def is_main_rule(r):
-    out = r.get('outbound', '')
-    if out in ('warp-out', 'psiphon-main-out'):
-        # 如果是 loopback 测试规则或 geosite 分流规则
-        inb = r.get('inbound', [])
-        if inb == ['socks-loopback'] or 'geosite' in r or 'domain_suffix' in r:
-            return True
-    return False
-
-rules[:] = [r for r in rules if not is_main_rule(r)]
-
-# 根据主节点出站模式配置
-if warp_enabled and warp_mode == 'all':
-    # 1. WARP 全局出站
-    outbounds.append({
-        'type': 'wireguard',
-        'tag': 'warp-out',
-        'server': warp_endpoint,
-        'server_port': warp_port,
-        'local_address': ['172.16.0.2/32', f'{warp_ipv6}/128'],
-        'private_key': warp_pvk,
-        'peer_public_key': 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
-        'reserved': warp_res
-    })
-    rules.append({'inbound': ['socks-loopback'], 'outbound': 'warp-out'})
-    route['final'] = 'warp-out'
-
-elif warp_enabled and warp_mode == 'google':
-    # 2. WARP 分流出站
-    outbounds.append({
-        'type': 'wireguard',
-        'tag': 'warp-out',
-        'server': warp_endpoint,
-        'server_port': warp_port,
-        'local_address': ['172.16.0.2/32', f'{warp_ipv6}/128'],
-        'private_key': warp_pvk,
-        'peer_public_key': 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
-        'reserved': warp_res
-    })
-    rules.append({'inbound': ['socks-loopback'], 'outbound': 'warp-out'})
-    rules.append({
-        'geosite': ['google', 'youtube', 'netflix', 'openai'],
-        'domain_suffix': ['google.com', 'googlevideo.com', 'youtube.com', 'netflix.com', 'openai.com', 'chatgpt.com'],
-        'outbound': 'warp-out'
-    })
-    route['final'] = 'direct'
-
-elif psi_main_enabled:
-    # 3. 赛风出站
-    outbounds.append({
-        'type': 'socks',
-        'tag': 'psiphon-main-out',
-        'server': '127.0.0.1',
-        'server_port': psi_main_port,
-        'version': '5',
-        'network': 'tcp'
-    })
-    rules.append({'inbound': ['socks-loopback'], 'outbound': 'psiphon-main-out'})
-    route['final'] = 'psiphon-main-out'
-
-else:
-    # 4. 原生直连出站
-    rules.append({'inbound': ['socks-loopback'], 'outbound': 'direct'})
-    route['final'] = 'direct'
-
-try:
-    with open(cfg_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-except Exception as e:
-    sys.exit(1)
-PY_APPLY_MAIN
-
-    # 关键：无论主节点出站怎么变，重新把副节点完整挂回最前，确保副节点绝不受干扰！
     sync_all_secondary_nodes
     return 0
 }
 
-# 校验并应用配置重启
 apply_changes() {
     if [[ ! -f /etc/s-box/sb.json ]]; then
         log_err "配置文件不存在！"
@@ -1365,7 +1524,6 @@ configure_warp_outbound() {
         4)
             yellow "正在测试最优 WARP Endpoint..."
             local best_ep="162.159.192.1"
-            # 候选 IP 测试
             local candidates=("162.159.192.1" "162.159.193.10" "162.159.195.2" "188.114.96.1" "188.114.97.1")
             for ep in "${candidates[@]}"; do
                 if ping -c 1 -W 1 "$ep" >/dev/null 2>&1; then
@@ -1435,7 +1593,6 @@ add_proxy_egress_group() {
         return 1
     fi
 
-    # 选择本地副节点入站协议
     echo
     purple "请选择为该代理出口搭建的本地入站协议 (支持多选或默认):"
     echo "  1. Hysteria2 入站 (UDP高加速)"
@@ -1453,7 +1610,6 @@ add_proxy_egress_group() {
         *) hy2_p=$(get_free_port); tuic_p=$(get_free_port) ;;
     esac
 
-    # 保存副节点目录
     local gdir="${PROXY_GROUPS_DIR}/${group_tag}"
     mkdir -p "$gdir"
     echo "$remark" > "$gdir/remark.txt"
@@ -1464,7 +1620,6 @@ add_proxy_egress_group() {
     echo "$vless_p" > "$gdir/vless_port.txt"
     echo "$group_tag" >> "$PROXY_GROUPS_DIR/groups.txt"
 
-    # 同步并应用
     sync_proxy_group_to_singbox "$group_tag"
     apply_changes
 
@@ -1482,7 +1637,7 @@ generate_proxy_group_links() {
     hy2_p=$(cat "$gdir/hy2_port.txt" 2>/dev/null || echo "0")
     tuic_p=$(cat "$gdir/tuic_port.txt" 2>/dev/null || echo "0")
     vless_p=$(cat "$gdir/vless_port.txt" 2>/dev/null || echo "0")
-    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat "$WORKDIR/uuid.txt" 2>/dev/null)
+    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
     ip="${ALL_IPS[0]:-127.0.0.1}"
 
     echo
@@ -1500,7 +1655,7 @@ generate_proxy_group_links() {
         echo "   $tuic_link"
     fi
     if [[ "$vless_p" -gt 0 ]]; then
-        local pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
+        local pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.public_key != null) | .tls.reality.public_key' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
         local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
         local vless_link="vless://${uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=#${remark}-Reality"
         green "3. VLESS-Reality 节点链接:"
@@ -1510,6 +1665,7 @@ generate_proxy_group_links() {
 }
 
 proxy_egress_menu() {
+    auto_migrate_legacy_nodes
     while true; do
         clear
         echo
@@ -1589,16 +1745,12 @@ proxy_egress_menu() {
                     if proxy_group_exists "$del_tag"; then
                         rm -rf "${PROXY_GROUPS_DIR:?}/$del_tag"
                         sed -i "/^${del_tag}$/d" "$PROXY_GROUPS_DIR/groups.txt"
-                        # 从 sb.json 中移除
-                        python3 -c "
-import json
-with open('$WORKDIR/sb.json') as f: d=json.load(f)
-d['outbounds']=[o for o in d.get('outbounds',[]) if o.get('tag')!='${del_tag}-out']
-d['inbounds']=[i for i in d.get('inbounds',[]) if '${del_tag}' not in i.get('tag','')]
-d.setdefault('route',{}).setdefault('rules',[])
-d['route']['rules']=[r for r in d['route']['rules'] if r.get('outbound')!='${del_tag}-out']
-with open('$WORKDIR/sb.json','w') as f: json.dump(d,f,indent=2)
-"
+                        local tmp_j=$(mktemp)
+                        jq --arg dt "$del_tag" '
+                        .outbounds = [.outbounds[] | select(.tag != ($dt + "-out"))] |
+                        .inbounds = [.inbounds[] | select(.tag | contains($dt) | not)] |
+                        .route.rules = [.route.rules[] | select(.outbound != ($dt + "-out"))]
+                        ' "$WORKDIR/sb.json" > "$tmp_j" && mv -f "$tmp_j" "$WORKDIR/sb.json"
                         apply_changes
                         green "已删除代理节点组: $del_tag"
                     fi
@@ -1619,7 +1771,7 @@ with open('$WORKDIR/sb.json','w') as f: json.dump(d,f,indent=2)
 
 # ==================== 3. 副节点 - 赛风多出口管理 ====================
 add_psiphon_instance() {
-    install_psiphon_core || return 1
+    download_psiphon_core || return 1
     init_psiphon_instances_dir
     echo
     green "==== 添加赛风国家出口组 (副节点) ===="
@@ -1636,12 +1788,10 @@ add_psiphon_instance() {
     local cfg_file="$inst_dir/psiphon.config"
     write_psiphon_config "$socks_p" "$cc" "$cfg_file" "$inst_dir/data"
 
-    # 启动专属实例
     nohup "$WORKDIR/psiphon-tunnel-core" --config "$cfg_file" >> "$inst_dir/psiphon.log" 2>&1 &
     echo $! > "$inst_dir/psiphon.pid"
     echo "$socks_p" > "$inst_dir/socks_port.txt"
 
-    # 选择本地入站
     echo
     purple "请选择为该赛风出口搭建的本地入站协议:"
     echo "  1. Hysteria2 入站 (UDP高加速)"
@@ -1680,7 +1830,7 @@ generate_psiphon_instance_links() {
     hy2_p=$(cat "$inst_dir/hy2_port.txt" 2>/dev/null || echo "0")
     tuic_p=$(cat "$inst_dir/tuic_port.txt" 2>/dev/null || echo "0")
     vless_p=$(cat "$inst_dir/vless_port.txt" 2>/dev/null || echo "0")
-    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat "$WORKDIR/uuid.txt" 2>/dev/null)
+    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
     ip="${ALL_IPS[0]:-127.0.0.1}"
     cname=$(get_country_name "$cc")
 
@@ -1699,7 +1849,7 @@ generate_psiphon_instance_links() {
         echo "   $tuic_link"
     fi
     if [[ "$vless_p" -gt 0 ]]; then
-        local pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
+        local pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.public_key != null) | .tls.reality.public_key' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
         local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
         local vless_link="vless://${uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=#Psi-${cc}-Reality"
         green "3. VLESS-Reality 节点链接:"
@@ -1709,6 +1859,7 @@ generate_psiphon_instance_links() {
 }
 
 psiphon_management_menu() {
+    auto_migrate_legacy_nodes
     while true; do
         clear
         echo
@@ -1769,16 +1920,12 @@ psiphon_management_menu() {
                         [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
                         rm -rf "${PSI_INSTANCES_DIR:?}/$del_cc"
                         sed -i "/^${del_cc}$/d" "$PSI_INSTANCES_DIR/instances.txt"
-                        # 从 sb.json 中移除
-                        python3 -c "
-import json
-with open('$WORKDIR/sb.json') as f: d=json.load(f)
-d['outbounds']=[o for o in d.get('outbounds',[]) if o.get('tag')!='psiphon-${del_cc,,}']
-d['inbounds']=[i for i in d.get('inbounds',[]) if '${del_cc,,}' not in i.get('tag','')]
-d.setdefault('route',{}).setdefault('rules',[])
-d['route']['rules']=[r for r in d['route']['rules'] if r.get('outbound')!='psiphon-${del_cc,,}']
-with open('$WORKDIR/sb.json','w') as f: json.dump(d,f,indent=2)
-"
+                        local tmp_j=$(mktemp)
+                        jq --arg cc "${del_cc,,}" '
+                        .outbounds = [.outbounds[] | select(.tag != ("psiphon-" + $cc))] |
+                        .inbounds = [.inbounds[] | select(.tag | contains($cc) | not)] |
+                        .route.rules = [.route.rules[] | select(.outbound != ("psiphon-" + $cc))]
+                        ' "$WORKDIR/sb.json" > "$tmp_j" && mv -f "$tmp_j" "$WORKDIR/sb.json"
                         apply_changes
                         green "已删除赛风出口组: $del_cc"
                     fi
@@ -1805,40 +1952,58 @@ with open('$WORKDIR/sb.json','w') as f: json.dump(d,f,indent=2)
 
 # ==================== 4. 查看主节点信息与全部汇总 ====================
 show_links() {
-    if [[ -f /etc/s-box/info.log ]]; then
-        cat /etc/s-box/info.log
-    else
-        yellow "未找到 /etc/s-box/info.log，正在尝试重新生成..."
-        # 直接输出主节点信息
-        local uuid ip pbk sid reym
-        uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat "$WORKDIR/uuid.txt" 2>/dev/null)
-        ip="${ALL_IPS[0]:-127.0.0.1}"
-        pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
-        sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null)
-        reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
+    auto_migrate_legacy_nodes
+    local cfg="$WORKDIR/sb.json"
+    local uuid ip pbk sid reym
+    uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
+    [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$cfg" 2>/dev/null | head -n1)
+    ip="${ALL_IPS[0]:-127.0.0.1}"
+    pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.public_key != null) | .tls.reality.public_key' "$cfg" 2>/dev/null | head -n1)
+    sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.short_id != null) | .tls.reality.short_id[0] // empty' "$cfg" 2>/dev/null | head -n1)
+    reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.handshake.server != null) | .tls.reality.handshake.server' "$cfg" 2>/dev/null | head -n1)
+    [[ -z "$reym" ]] && reym="apple.com"
 
-        green "=================================================="
-        green "         Sing-box 主节点信息"
-        green "=================================================="
-        echo "UUID / Password: $uuid"
+    green "=================================================="
+    green "         Sing-box 主节点信息"
+    green "=================================================="
+    echo "UUID / Password: $uuid"
+    echo
+
+    # 兼容历史各种主入站 tag 命名
+    local vless_p=$(jq -r '.inbounds[]? | select((.tag=="vless-in" or .tag=="vless-reality-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    local vmess_p=$(jq -r '.inbounds[]? | select((.tag=="vmess-in" or .tag=="vmess-ws-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    local vmess_path=$(jq -r '.inbounds[]? | select((.tag=="vmess-in" or .tag=="vmess-ws-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .transport.path // empty' "$cfg" 2>/dev/null | head -n1)
+    [[ -z "$vmess_path" ]] && vmess_path="/${uuid}-vm"
+    local trojan_p=$(jq -r '.inbounds[]? | select((.tag=="trojan-tls-in" or .tag=="trojan-ws-in" or .tag=="trojan-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    local trojan_path=$(jq -r '.inbounds[]? | select((.tag=="trojan-tls-in" or .tag=="trojan-ws-in" or .tag=="trojan-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .transport.path // empty' "$cfg" 2>/dev/null | head -n1)
+    [[ -z "$trojan_path" ]] && trojan_path="/${uuid}-tr"
+    local hy2_p=$(jq -r '.inbounds[]? | select((.tag=="hy2-in" or .tag=="hysteria2-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    local tuic_p=$(jq -r '.inbounds[]? | select((.tag=="tuic-in" or .tag=="tuic-in-1") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    local anytls_p=$(jq -r '.inbounds[]? | select((.tag=="anytls-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+
+    [[ -n "$vless_p" ]] && echo "1. VLESS-Reality: vless://${uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#SB-VLESS-Reality"
+    [[ -n "$vmess_p" ]] && echo "2. VMess-WS: $(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess\",\"add\":\"${ip}\",\"port\":\"${vmess_p}\",\"id\":\"${uuid}\",\"net\":\"ws\",\"path\":\"${vmess_path}\"}")"
+    [[ -n "$trojan_p" ]] && echo "3. Trojan-WS-TLS: trojan://${uuid}@${ip}:${trojan_p}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=$(url_encode "${trojan_path}")#SB-Trojan-TLS"
+    [[ -n "$hy2_p" ]] && echo "4. Hysteria2: hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&sni=www.bing.com#SB-Hysteria2"
+    [[ -n "$tuic_p" ]] && echo "5. TUIC v5: tuic://${uuid}:${uuid}@${ip}:${tuic_p}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5"
+    [[ -n "$anytls_p" ]] && echo "6. AnyTLS: anytls://${uuid}@${ip}:${anytls_p}?security=tls&sni=www.bing.com&allowInsecure=1#SB-AnyTLS"
+
+    # 检查 Argo
+    local argo_d
+    argo_d=$(cat /etc/s-box/argo.log 2>/dev/null || cat /var/log/argo-tunnel.log 2>/dev/null | grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' | tail -n 1)
+    if [[ -n "$argo_d" ]]; then
         echo
-        local vless_p=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
-        local vmess_p=$(jq -r '.inbounds[] | select(.tag=="vmess-ws-in") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
-        local trojan_p=$(jq -r '.inbounds[] | select(.tag=="trojan-ws-in") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
-        local hy2_p=$(jq -r '.inbounds[] | select(.tag=="hy2-in") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
-        local tuic_p=$(jq -r '.inbounds[] | select(.tag=="tuic-in") | .listen_port' "$WORKDIR/sb.json" 2>/dev/null)
-
-        [[ -n "$vless_p" && "$vless_p" != "null" ]] && echo "1. VLESS-Reality: vless://${uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#SB-VLESS-Reality"
-        [[ -n "$vmess_p" && "$vmess_p" != "null" ]] && echo "2. VMess-WS: $(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess\",\"add\":\"${ip}\",\"port\":\"${vmess_p}\",\"id\":\"${uuid}\",\"net\":\"ws\",\"path\":\"/${uuid}-vm\"}")"
-        [[ -n "$trojan_p" && "$trojan_p" != "null" ]] && echo "3. Trojan-WS-TLS: trojan://${uuid}@${ip}:${trojan_p}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=%2F${uuid}-tr#SB-Trojan-TLS"
-        [[ -n "$hy2_p" && "$hy2_p" != "null" ]] && echo "4. Hysteria2: hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&sni=www.bing.com#SB-Hysteria2"
-        [[ -n "$tuic_p" && "$tuic_p" != "null" ]] && echo "5. TUIC v5: tuic://${uuid}:${uuid}@${ip}:${tuic_p}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5"
-        green "=================================================="
+        purple "--- Argo 隧道穿透节点 ---"
+        echo "Argo 域名: $argo_d"
+        echo "Argo VMess (80): $(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess-Argo-80\",\"add\":\"${argo_d}\",\"port\":\"80\",\"id\":\"${uuid}\",\"net\":\"ws\",\"host\":\"${argo_d}\",\"path\":\"${vmess_path}\"}")"
+        echo "Argo VMess (443/TLS): $(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess-Argo-443\",\"add\":\"${argo_d}\",\"port\":\"443\",\"id\":\"${uuid}\",\"net\":\"ws\",\"tls\":\"tls\",\"sni\":\"${argo_d}\",\"host\":\"${argo_d}\",\"path\":\"${vmess_path}\"}")"
     fi
+    green "=================================================="
 }
 
 show_all_nodes_summary() {
     clear
+    auto_migrate_legacy_nodes
     echo
     green "============================================================"
     green "  全部节点信息总览 (主节点与副节点分类汇总)"
@@ -1872,7 +2037,6 @@ show_all_nodes_summary() {
     green "============================================================"
 }
 
-# ==================== 5. 自定义节点组合推送 ====================
 custom_push_nodes() {
     clear
     echo
@@ -2013,7 +2177,6 @@ if [[ "$1" == "cron" ]]; then
         fi
     fi
 
-    # 检查赛风主实例
     if [[ -f "$WORKDIR/psiphon_main_enabled.txt" && "$(cat "$WORKDIR/psiphon_main_enabled.txt")" == "true" ]]; then
         local pid=$(cat "$WORKDIR/psiphon.pid" 2>/dev/null)
         if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
@@ -2026,6 +2189,7 @@ fi
 
 # ==================== 主菜单 ====================
 menu() {
+    auto_migrate_legacy_nodes
     while true; do
         clear
         echo
@@ -2035,7 +2199,6 @@ menu() {
         purple "  支持协议: Argo, VLESS-Reality, VMess, Trojan, Hy2, TUIC, AnyTLS"
         echo "============================================================"
 
-        # 加载 IP
         if [ ${#ALL_IPS[@]} -eq 0 ]; then
             if [ -f "$WORKDIR/all_ips.txt" ]; then
                 mapfile -t ALL_IPS < "$WORKDIR/all_ips.txt"
@@ -2053,7 +2216,6 @@ menu() {
         echo "============================================================"
         echo
 
-        # 检查安装状态与各模块状态
         if [ -f "$WORKDIR/sb.json" ]; then
             if service_is_active sing-box; then
                 green "【主节点状态】: ✓ 已安装并运行中"
@@ -2061,7 +2223,6 @@ menu() {
                 yellow "【主节点状态】: ⚠ 已安装但未运行"
             fi
 
-            # 主节点出站
             local warp_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
             local warp_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
             local psi_main=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null)
@@ -2077,7 +2238,6 @@ menu() {
                 green "【主节点出站】: ✓ 直连出站 (Direct 原生网络直连)"
             fi
 
-            # 副节点 - 赛风
             local psi_insts
             mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
             if [[ ${#psi_insts[@]} -gt 0 ]]; then
@@ -2086,7 +2246,6 @@ menu() {
                 purple "【副节点-赛风】: ✗ 未配置"
             fi
 
-            # 副节点 - 代理
             local proxy_tags
             mapfile -t proxy_tags < <(get_all_proxy_groups 2>/dev/null)
             if [[ ${#proxy_tags[@]} -gt 0 ]]; then
@@ -2095,7 +2254,6 @@ menu() {
                 purple "【副节点-代理】: ✗ 未配置"
             fi
 
-            # Argo
             if service_is_active argo-tunnel; then
                 green "【Argo 隧道】 : ✓ 运行中"
             else
@@ -2208,49 +2366,18 @@ chmod +x /usr/local/bin/sb
 
 # ==================== 初次安装 / 部署主流程 ====================
 install_singbox_main() {
-    log_info "开始安装/更新 Sing-box 环境依赖..."
+    log_info "开始安装/更新 Sing-box 环境与依赖..."
 
-    # 安装系统依赖
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y >/dev/null 2>&1
-        apt-get install -y curl wget tar jq openssl git net-tools cron >/dev/null 2>&1
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl wget tar jq openssl git net-tools cronie >/dev/null 2>&1
-    elif command -v apk >/dev/null 2>&1; then
-        apk update >/dev/null 2>&1
-        apk add curl wget tar jq openssl git net-tools >/dev/null 2>&1
-    fi
-
+    install_system_dependencies
     mkdir -p "$WORKDIR" "$PROXY_GROUPS_DIR" "$PSI_INSTANCES_DIR"
 
-    # 获取系统架构并下载 sing-box
-    local arch
-    case "$(uname -m)" in
-        x86_64|amd64) arch="amd64" ;;
-        aarch64|arm64) arch="arm64" ;;
-        armv7l|armv7) arch="armv7" ;;
-        *) arch="amd64" ;;
-    esac
+    download_singbox_core || { red "Sing-box 核心下载失败"; exit 1; }
+    download_cloudflared_core
+    download_psiphon_core
 
-    if [[ ! -x "$WORKDIR/sing-box" ]]; then
-        log_info "正在下载最新 Sing-box 核心 (Linux-${arch})..."
-        local sb_ver="1.11.4"
-        local sb_url="https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${arch}.tar.gz"
-        local tmp_sb_dir="/tmp/sb_download"
-        mkdir -p "$tmp_sb_dir"
-        if curl -fsSL "$sb_url" -o "$tmp_sb_dir/sb.tar.gz" 2>/dev/null; then
-            tar -xzf "$tmp_sb_dir/sb.tar.gz" -C "$tmp_sb_dir"
-            local bin_path=$(find "$tmp_sb_dir" -type f -name "sing-box" | head -n 1)
-            [[ -n "$bin_path" ]] && cp -f "$bin_path" "$WORKDIR/sing-box"
-        fi
-        rm -rf "$tmp_sb_dir"
-        chmod +x "$WORKDIR/sing-box" 2>/dev/null
-    fi
-
-    # 生成基础 UUID、Reality 证书与密钥
     local UUID
-    UUID=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null)
-    [[ -z "$UUID" ]] && UUID="a3b8c2d1-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+    UUID=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
+    [[ -z "$UUID" || "$UUID" == "null" ]] && UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "a3b8c2d1-e5f6-4a7b-8c9d-0e1f2a3b4c5d")
     echo "$UUID" > "$WORKDIR/UUID.txt"
 
     if [[ ! -f "$WORKDIR/cert.pem" || ! -f "$WORKDIR/private.key" ]]; then
@@ -2266,27 +2393,26 @@ install_singbox_main() {
             echo "$pbk" > "$WORKDIR/public_key.txt"
         fi
     fi
-    echo "apple.com" > "$WORKDIR/reym.txt"
-    echo "" > "$WORKDIR/short_id.txt"
+    [[ ! -f "$WORKDIR/reym.txt" ]] && echo "apple.com" > "$WORKDIR/reym.txt"
+    [[ ! -f "$WORKDIR/short_id.txt" ]] && echo "" > "$WORKDIR/short_id.txt"
 
-    # 获取 IP
     get_all_ips >/dev/null 2>&1
     local IP="${ALL_IPS[0]:-127.0.0.1}"
 
-    # 默认端口分配
-    local PORT_VLESS=$(get_free_port)
-    local PORT_VMESS=$(get_free_port)
-    local PORT_TROJAN_TLS=$(get_free_port)
-    local PORT_HY2=$(get_free_port)
-    local PORT_TUIC=$(get_free_port)
-    local PORT_ANYTLS=$(get_free_port)
-    local PORT_LOOPBACK=$(get_free_loopback_port)
+    # 如果没有现有 sb.json，才重新生成默认端口
+    if [[ ! -f "$WORKDIR/sb.json" ]]; then
+        local PORT_VLESS=$(get_free_port)
+        local PORT_VMESS=$(get_free_port)
+        local PORT_TROJAN_TLS=$(get_free_port)
+        local PORT_HY2=$(get_free_port)
+        local PORT_TUIC=$(get_free_port)
+        local PORT_ANYTLS=$(get_free_port)
+        local PORT_LOOPBACK=$(get_free_loopback_port)
 
-    # 生成主 sing-box 配置
-    local REALITY_PVK=$(cat "$WORKDIR/private_key.txt" 2>/dev/null)
-    local REALITY_PBK=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
+        local REALITY_PVK=$(cat "$WORKDIR/private_key.txt" 2>/dev/null)
+        local REALITY_PBK=$(cat "$WORKDIR/public_key.txt" 2>/dev/null)
 
-    cat > "$WORKDIR/sb.json" <<EOF_SB_JSON
+        cat > "$WORKDIR/sb.json" <<EOF_SB_JSON
 {
   "log": {
     "disabled": false,
@@ -2420,8 +2546,8 @@ install_singbox_main() {
   }
 }
 EOF_SB_JSON
+    fi
 
-    # 注册 systemd 或 openrc 服务
     if $IS_OPENRC; then
         cat > /etc/init.d/sing-box <<'EOF_INIT'
 #!/sbin/openrc-run
@@ -2456,55 +2582,21 @@ EOF_SYSTEMD
         systemctl enable sing-box >/dev/null 2>&1
     fi
 
-    # 生成 info.log
-    cat > "$WORKDIR/info.log" <<EOF_INFO
-==================================================
-        Sing-box 多协议部署成功
-==================================================
-通用密码/UUID: ${UUID}
-
-------------------【主节点列表】--------------------
-1. VLESS-Reality:
-vless://${UUID}@${IP}:${PORT_VLESS}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=apple.com&fp=chrome&pbk=${REALITY_PBK}&sid=#SB-VLESS-Reality
-
-2. VMess-WS:
-$(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess\",\"add\":\"${IP}\",\"port\":\"${PORT_VMESS}\",\"id\":\"${UUID}\",\"net\":\"ws\",\"path\":\"/${UUID}-vm\"}")
-
-3. Trojan-WS-TLS:
-trojan://${UUID}@${IP}:${PORT_TROJAN_TLS}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=%2F${UUID}-tr#SB-Trojan-TLS
-
-4. Hysteria2:
-hysteria2://${UUID}@${IP}:${PORT_HY2}?insecure=1&sni=www.bing.com#SB-Hysteria2
-
-5. TUIC v5:
-tuic://${UUID}:${UUID}@${IP}:${PORT_TUIC}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5
-
-6. AnyTLS:
-anytls://${UUID}@${IP}:${PORT_ANYTLS}?security=tls&sni=www.bing.com&allowInsecure=1#SB-AnyTLS
-==================================================
-EOF_INFO
-
-    # 自动挂载所有副节点（若已有）
+    create_sb_tool
+    auto_migrate_legacy_nodes
     sync_all_secondary_nodes
-
-    # 启动 sing-box 服务
     service_start sing-box
 
-    # 生成快捷工具
-    create_sb_tool
-
-    # 备份当前脚本至 /etc/s-box/install.sh
     cp -f "$0" /etc/s-box/install.sh 2>/dev/null
     chmod +x /etc/s-box/install.sh 2>/dev/null
 
-    # 写入 cron 守护任务
     if ! crontab -l 2>/dev/null | grep -q "sb cron"; then
         (crontab -l 2>/dev/null; echo "* * * * * /usr/local/bin/sb cron >> /etc/s-box/monitor.log 2>&1") | crontab - 2>/dev/null || true
     fi
 
     log_info "Sing-box 安装与部署完成！"
     echo
-    cat "$WORKDIR/info.log"
+    show_links
     echo
     log_info "快捷管理命令: 【 sb 】"
 }
