@@ -289,9 +289,22 @@ download_psiphon_core() {
     chmod +x "$WORKDIR/psiphon-tunnel-core" 2>/dev/null
 
     if [[ ! -x "$WORKDIR/psiphon-tunnel-core" ]]; then
-        log_warn "未下载到 Psiphon 核心，请检查 VPS 对 GitHub 的网络连通性。"
+        yellow "未下载到 Psiphon 核心，请检查 VPS 对 GitHub 的网络连通性。"
         return 1
     fi
+
+    # 预载 Psiphon 种子服务器列表
+    if [[ ! -f "$WORKDIR/server_list_compressed" ]]; then
+        local s_urls=(
+            "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed"
+            "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
+            "https://ghproxy.net/https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
+        )
+        for surl in "${s_urls[@]}"; do
+            curl -fsSL "$surl" -o "$WORKDIR/server_list_compressed" 2>/dev/null && break
+        done
+    fi
+
     green "[+] Psiphon 核心已安装: $WORKDIR/psiphon-tunnel-core"
     return 0
 }
@@ -454,6 +467,8 @@ get_country_name() {
         JP) echo "日本 (Japan)" ;;
         SG) echo "新加坡 (Singapore)" ;;
         HK) echo "中国香港 (Hong Kong)" ;;
+        KR) echo "韩国 (South Korea)" ;;
+        TW) echo "中国台湾 (Taiwan)" ;;
         GB) echo "英国 (United Kingdom)" ;;
         DE) echo "德国 (Germany)" ;;
         CA) echo "加拿大 (Canada)" ;;
@@ -461,18 +476,38 @@ get_country_name() {
         FR) echo "法国 (France)" ;;
         IN) echo "印度 (India)" ;;
         AU) echo "澳大利亚 (Australia)" ;;
-        KR) echo "韩国 (South Korea)" ;;
-        TW) echo "中国台湾 (Taiwan)" ;;
-        AUTO|"") echo "智能自动选择" ;;
+        CH) echo "瑞士 (Switzerland)" ;;
+        SE) echo "瑞典 (Sweden)" ;;
+        IT) echo "意大利 (Italy)" ;;
+        ES) echo "西班牙 (Spain)" ;;
+        PL) echo "波兰 (Poland)" ;;
+        AT) echo "奥地利 (Austria)" ;;
+        BE) echo "比利时 (Belgium)" ;;
+        DK) echo "丹麦 (Denmark)" ;;
+        NO) echo "挪威 (Norway)" ;;
+        RO) echo "罗马尼亚 (Romania)" ;;
+        CZ) echo "捷克 (Czech Republic)" ;;
+        HU) echo "匈牙利 (Hungary)" ;;
+        BG) echo "保加利亚 (Bulgaria)" ;;
+        IE) echo "爱尔兰 (Ireland)" ;;
+        FI) echo "芬兰 (Finland)" ;;
+        AUTO|"") echo "智能自动优选" ;;
         *) echo "$code" ;;
     esac
 }
 
 show_supported_psiphon_codes() {
-    yellow "支持的常用 Psiphon 出口国家代码:"
-    echo "  US - 美国      JP - 日本      SG - 新加坡    HK - 中国香港"
-    echo "  GB - 英国      DE - 德国      CA - 加拿大    NL - 荷兰"
-    echo "  FR - 法国      IN - 印度      AU - 澳大利亚  AUTO - 自动"
+    yellow "Psiphon 赛风支持的出口国家代码列表:"
+    echo "  [热门国家]:"
+    echo "    US - 美国      JP - 日本      SG - 新加坡    HK - 中国香港"
+    echo "    KR - 韩国      TW - 中国台湾  GB - 英国      DE - 德国"
+    echo "    CA - 加拿大    NL - 荷兰      FR - 法国      IN - 印度      AU - 澳大利亚"
+    echo "  [欧洲及其他国家]:"
+    echo "    CH - 瑞士      SE - 瑞典      IT - 意大利    ES - 西班牙    PL - 波兰"
+    echo "    AT - 奥地利    BE - 比利时    DK - 丹麦      NO - 挪威      RO - 罗马尼亚"
+    echo "    CZ - 捷克      HU - 匈牙利    BG - 保加利亚  IE - 爱尔兰    FI - 芬兰"
+    echo "  [自动策略]:"
+    echo "    AUTO - 智能自动优选最佳出口"
 }
 
 write_psiphon_config() {
@@ -484,6 +519,25 @@ write_psiphon_config() {
     mkdir -p "$data_dir" 2>/dev/null
     [[ "${region^^}" == "AUTO" ]] && region=""
 
+    # 部署种子服务器列表至实例目录
+    if [[ -f "$WORKDIR/server_list_compressed" ]]; then
+        cp -f "$WORKDIR/server_list_compressed" "$data_dir/server_list_compressed" 2>/dev/null
+        cp -f "$WORKDIR/server_list_compressed" "$data_dir/remote_server_list" 2>/dev/null
+    else
+        local s_urls=(
+            "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed"
+            "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
+            "https://ghproxy.net/https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
+        )
+        for surl in "${s_urls[@]}"; do
+            if curl -fsSL "$surl" -o "$data_dir/server_list_compressed" 2>/dev/null; then
+                cp -f "$data_dir/server_list_compressed" "$data_dir/remote_server_list" 2>/dev/null
+                cp -f "$data_dir/server_list_compressed" "$WORKDIR/server_list_compressed" 2>/dev/null
+                break
+            fi
+        done
+    fi
+
     cat > "$cfg_file" <<EOF_PSI
 {
   "DataRootDirectory": "${data_dir}",
@@ -494,8 +548,9 @@ write_psiphon_config() {
   "DisableLocalHTTPProxy": true,
   "LocalHttpProxyPort": 0,
   "EgressRegion": "${region}",
-  "PropagationChannelId": "FFFFFFFFFFFFFFFF",
-  "SponsorId": "FFFFFFFFFFFFFFFF",
+  "PropagationChannelId": "942A979F7F8F757D",
+  "SponsorId": "65163155F375F114",
+  "RemoteServerListUrl": "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed",
   "UseIndistinguishableTLS": true
 }
 EOF_PSI
@@ -1902,29 +1957,14 @@ test_single_psiphon_country() {
     mkdir -p "$test_dir/data"
 
     local cfg_file="$test_dir/psiphon.config"
-    local reg="$cc"
-    [[ "$reg" == "AUTO" ]] && reg=""
-    cat > "$cfg_file" <<EOF_TEST
-{
-  "DataRootDirectory": "${test_dir}/data",
-  "EmitDiagnosticNotices": false,
-  "EmitDiagnosticNetworkParameters": false,
-  "EmitServerAlerts": false,
-  "LocalSocksProxyPort": ${test_port},
-  "DisableLocalHTTPProxy": true,
-  "LocalHttpProxyPort": 0,
-  "EgressRegion": "${reg}",
-  "PropagationChannelId": "FFFFFFFFFFFFFFFF",
-  "SponsorId": "FFFFFFFFFFFFFFFF",
-  "UseIndistinguishableTLS": true
-}
-EOF_TEST
+    write_psiphon_config "$test_port" "$cc" "$cfg_file" "$test_dir/data"
 
     nohup "$WORKDIR/psiphon-tunnel-core" --config "$cfg_file" > "$test_dir/test.log" 2>&1 &
     local test_pid=$!
+    disown "$test_pid" 2>/dev/null || true
 
     local egress_ip="" is_ok=false
-    for i in {1..14}; do
+    for i in {1..16}; do
         sleep 0.5
         if curl -sx "socks5h://127.0.0.1:${test_port}" -s4m2 https://api.ipify.org >/dev/null 2>&1 || \
            curl -sx "socks5h://127.0.0.1:${test_port}" -s4m2 https://ip.sb >/dev/null 2>&1; then
@@ -1962,9 +2002,13 @@ psiphon_quick_test() {
 psiphon_test_all() {
     echo
     green "==== 测试所有支持的 Psiphon 出口国家 ===="
-    yellow "[*] 正在逐个检测国家可用性与出口 IP..."
+    yellow "[*] 正在逐个检测国家可用性与出口 IP (共 28 个出口国家)..."
     echo
-    local all_list=("US" "JP" "SG" "HK" "GB" "DE" "CA" "NL" "FR" "IN" "AU" "KR" "TW")
+    local all_list=(
+        "US" "JP" "SG" "HK" "KR" "TW"
+        "GB" "DE" "CA" "NL" "FR" "IN" "AU"
+        "CH" "SE" "IT" "ES" "PL" "AT" "BE" "DK" "NO" "RO" "CZ" "HU" "BG" "IE" "FI"
+    )
     for cc in "${all_list[@]}"; do
         test_single_psiphon_country "$cc"
     done
