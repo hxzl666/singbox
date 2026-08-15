@@ -924,7 +924,7 @@ parse_proxy_url_to_json() {
                         pbk) q_pbk="$v" ;;
                         sid) q_sid="$v" ;;
                         fp) q_fp="$v" ;;
-                        insecure|allowInsecure) q_insecure="$v" ;;
+                        insecure|allowInsecure|allow_insecure|allow_insecure_cert|insecure_cert) q_insecure="$v" ;;
                         type) q_type="$v" ;;
                         path) q_path=$(printf '%b' "${v//%/\\x}") ;;
                         host) q_host="$v" ;;
@@ -937,12 +937,16 @@ parse_proxy_url_to_json() {
                 IFS="$old_ifs"
             fi
 
-            [[ -z "$q_sni" ]] && q_sni="$host"
+            local insec_bool="false"
+            if [[ "$q_insecure" == "1" || "$q_insecure" == "true" ]]; then
+                insec_bool="true"
+            elif [[ "$host" =~ ^[0-9.]+$ || "$host" =~ ^[a-fA-F0-9:]+$ ]]; then
+                # 裸 IP 出站默认跳过证书校验以兼容自签与非 IP-SAN 证书
+                insec_bool="true"
+            fi
 
             case "$proto" in
                 vless)
-                    local insec_bool="false"
-                    [[ "$q_insecure" == "1" || "$q_insecure" == "true" ]] && insec_bool="true"
                     jq -n \
                       --arg tag "$tag" \
                       --arg server "$host" \
@@ -974,13 +978,11 @@ parse_proxy_url_to_json() {
                       (if $sec == "reality" then {
                         "tls": {"enabled": true, "server_name": $sni, "utls": {"enabled": true, "fingerprint": (if $fp != "" then $fp else "chrome" end)}, "reality": {"enabled": true, "public_key": $pbk, "short_id": $sid}}
                       } elif $sec == "tls" then {
-                        "tls": {"enabled": true, "server_name": $sni, "insecure": $insec, "utls": {"enabled": true, "fingerprint": (if $fp != "" then $fp else "chrome" end)}}
+                        "tls": ({"enabled": true, "insecure": $insec, "utls": {"enabled": true, "fingerprint": (if $fp != "" then $fp else "chrome" end)}} + (if $sni != "" and ($sni | test("^[0-9.]+$|^[a-fA-F0-9:]+$") | not) then {"server_name": $sni} else {} end))
                       } else {} end)
                       '
                     ;;
                 trojan)
-                    local insec_bool="false"
-                    [[ "$q_insecure" == "1" || "$q_insecure" == "true" ]] && insec_bool="true"
                     jq -n \
                       --arg tag "$tag" \
                       --arg server "$host" \
@@ -998,7 +1000,7 @@ parse_proxy_url_to_json() {
                         "server": $server,
                         "server_port": $port,
                         "password": $pass,
-                        "tls": {"enabled": true, "server_name": $sni, "insecure": $insec}
+                        "tls": ({"enabled": true, "insecure": $insec} + (if $sni != "" and ($sni | test("^[0-9.]+$|^[a-fA-F0-9:]+$") | not) then {"server_name": $sni} else {} end))
                       } +
                       (if $net == "ws" then {"transport": {"type": "ws", "path": $path, "headers": (if $hosthdr != "" then {"Host": $hosthdr} else {} end)}}
                        elif $net == "grpc" then {"transport": {"type": "grpc", "service_name": $path}}
@@ -1007,8 +1009,6 @@ parse_proxy_url_to_json() {
                       '
                     ;;
                 hy2|hysteria2)
-                    local insec_bool="false"
-                    [[ "$q_insecure" == "1" || "$q_insecure" == "true" ]] && insec_bool="true"
                     jq -n \
                       --arg tag "$tag" \
                       --arg server "$host" \
@@ -1025,7 +1025,7 @@ parse_proxy_url_to_json() {
                         "server": $server,
                         "server_port": $port,
                         "password": $pass,
-                        "tls": {"enabled": true, "server_name": $sni, "insecure": $insec}
+                        "tls": ({"enabled": true, "insecure": $insec} + (if $sni != "" and ($sni | test("^[0-9.]+$|^[a-fA-F0-9:]+$") | not) then {"server_name": $sni} else {} end))
                       } +
                       (if $obfs != "" then {"obfs": {"type": $obfs, "password": $obfs_p}} else {} end)
                       '
@@ -1034,8 +1034,6 @@ parse_proxy_url_to_json() {
                     local tuic_uuid="${userinfo%%:*}"
                     local tuic_pass="${userinfo#*:}"
                     [[ "$userinfo" != *":"* ]] && tuic_pass="$tuic_uuid"
-                    local insec_bool="false"
-                    [[ "$q_insecure" == "1" || "$q_insecure" == "true" ]] && insec_bool="true"
                     local alpn_arr='["h3"]'
                     [[ -n "$q_alpn" ]] && alpn_arr=$(printf '%s' "$q_alpn" | jq -R 'split(",")')
 
@@ -1057,7 +1055,7 @@ parse_proxy_url_to_json() {
                         "uuid": $uuid,
                         "password": $pass,
                         "congestion_control": "bbr",
-                        "tls": {"enabled": true, "server_name": $sni, "alpn": $alpn, "insecure": $insec}
+                        "tls": ({"enabled": true, "alpn": $alpn, "insecure": $insec} + (if $sni != "" and ($sni | test("^[0-9.]+$|^[a-fA-F0-9:]+$") | not) then {"server_name": $sni} else {} end))
                       }
                       '
                     ;;
@@ -2773,9 +2771,28 @@ run_cron_check() {
 # ==================== 快捷命令同步更新 ====================
 create_sb_tool() {
     mkdir -p /usr/local/bin "$WORKDIR"
-    cp -f "${BASH_SOURCE[0]:-$0}" "$WORKDIR/install.sh" 2>/dev/null || true
-    cp -f "${BASH_SOURCE[0]:-$0}" /usr/local/bin/sb 2>/dev/null || true
-    chmod +x /usr/local/bin/sb "$WORKDIR/install.sh" 2>/dev/null || true
+    local current_src="${BASH_SOURCE[0]:-$0}"
+    if [[ -f "$current_src" && -s "$current_src" && $(wc -c < "$current_src" 2>/dev/null || echo 0) -gt 1000 ]]; then
+        cp -f "$current_src" "$WORKDIR/install.sh" 2>/dev/null || true
+    fi
+
+    if [[ ! -s "$WORKDIR/install.sh" || $(wc -c < "$WORKDIR/install.sh" 2>/dev/null || echo 0) -lt 1000 ]]; then
+        curl -fsSL https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh -o "$WORKDIR/install.sh" 2>/dev/null || \
+        wget -qO "$WORKDIR/install.sh" https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh 2>/dev/null || true
+    fi
+    chmod +x "$WORKDIR/install.sh" 2>/dev/null || true
+
+    cat > /usr/local/bin/sb << 'EOF_SB'
+#!/usr/bin/env bash
+WORKDIR="/etc/s-box"
+if [[ ! -s "$WORKDIR/install.sh" || $(wc -c < "$WORKDIR/install.sh" 2>/dev/null || echo 0) -lt 1000 ]]; then
+    curl -fsSL https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh -o "$WORKDIR/install.sh" 2>/dev/null || \
+    wget -qO "$WORKDIR/install.sh" https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh 2>/dev/null || true
+    chmod +x "$WORKDIR/install.sh" 2>/dev/null || true
+fi
+exec bash "$WORKDIR/install.sh" "$@"
+EOF_SB
+    chmod +x /usr/local/bin/sb 2>/dev/null || true
 }
 
 # ==================== 主菜单 ====================
