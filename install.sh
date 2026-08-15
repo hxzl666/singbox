@@ -1575,6 +1575,19 @@ apply_main_node_outbound() {
       --arg psi_en "$psi_main_enabled" \
       --argjson psi_port "$psi_main_port" \
       '
+      # 确保 route.default_domain_resolver 存在 (适配 Sing-box 1.12.0+ 规范)
+      .route = (.route // {}) |
+      .route.default_domain_resolver = (.route.default_domain_resolver // "dns-direct") |
+      .dns = (.dns // {
+        "servers": [
+          {"type": "local", "tag": "dns-direct"},
+          {"type": "local", "tag": "local"},
+          {"type": "udp", "tag": "dns-remote", "server": "8.8.8.8"},
+          {"type": "udp", "tag": "remote-dns", "server": "8.8.8.8"}
+        ],
+        "final": "dns-direct"
+      }) |
+
       # 确保 socks-loopback 入站存在 (赛风/WARP 出站路由链的关键桥梁)
       if any(.inbounds[]?; .tag == "socks-loopback") then . else
         .inbounds += [{"tag":"socks-loopback","type":"socks","listen":"127.0.0.1","listen_port":20080}]
@@ -1651,8 +1664,28 @@ apply_changes() {
         log_err "配置文件 /etc/s-box/sb.json 不存在！"
         return 1
     fi
+
+    # 规范化补全 route.default_domain_resolver 与 dns 配置 (适配 Sing-box 1.12.0+ / 1.13.0+ 强校验要求)
+    if command -v jq >/dev/null 2>&1; then
+        local tmp_fix=$(mktemp)
+        jq '
+          .dns = (.dns // {
+            "servers": [
+              {"type": "local", "tag": "dns-direct"},
+              {"type": "local", "tag": "local"},
+              {"type": "udp", "tag": "dns-remote", "server": "8.8.8.8"},
+              {"type": "udp", "tag": "remote-dns", "server": "8.8.8.8"}
+            ],
+            "final": "dns-direct"
+          }) |
+          .route = (.route // {}) |
+          .route.default_domain_resolver = (.route.default_domain_resolver // "dns-direct")
+        ' /etc/s-box/sb.json > "$tmp_fix" 2>/dev/null && mv -f "$tmp_fix" /etc/s-box/sb.json
+    fi
+
     if [[ -x /etc/s-box/sing-box ]]; then
         local check_out
+        export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true
         if ! check_out=$(/etc/s-box/sing-box check -c /etc/s-box/sb.json 2>&1); then
             # 若因旧版本核心不支持 AnyTLS 导致报错，自动触发升级至最新核心
             if echo "$check_out" | grep -qi "anytls"; then
@@ -1816,6 +1849,39 @@ build_and_apply_main_inbounds() {
 
     if [[ ! -f "$WORKDIR/cert.pem" || ! -f "$WORKDIR/private.key" ]]; then
         openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$WORKDIR/private.key" -out "$WORKDIR/cert.pem" -days 3650 -subj "/CN=www.bing.com" >/dev/null 2>&1
+    fi
+
+    if [[ ! -f "$cfg" ]]; then
+        cat > "$cfg" << 'EOF_BLANK'
+{
+  "log": {
+    "disabled": false,
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {"type": "local", "tag": "dns-direct"},
+      {"type": "local", "tag": "local"},
+      {"type": "udp", "tag": "dns-remote", "server": "8.8.8.8"},
+      {"type": "udp", "tag": "remote-dns", "server": "8.8.8.8"}
+    ],
+    "final": "dns-direct"
+  },
+  "inbounds": [],
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "block", "tag": "block"}
+  ],
+  "route": {
+    "default_domain_resolver": "dns-direct",
+    "rules": [
+      {"inbound": ["socks-loopback"], "outbound": "direct"}
+    ],
+    "final": "direct"
+  }
+}
+EOF_BLANK
     fi
 
     local tmp_json=$(mktemp)
@@ -3203,167 +3269,65 @@ install_singbox_main() {
 
     get_all_ips >/dev/null 2>&1
 
-    log_info "【步骤 5/5】生成服务端协议配置与系统服务..."
-    # 如果没有现有 sb.json，才重新生成默认 6 大协议端口
+    log_info "【步骤 5/5】配置主节点入站协议与端口..."
     if [[ ! -f "$WORKDIR/sb.json" ]]; then
-        local PORT_VLESS=$(get_free_port)
-        local PORT_VMESS=$(get_free_port)
-        local PORT_TROJAN_TLS=$(get_free_port)
-        local PORT_HY2=$(get_free_port)
-        local PORT_TUIC=$(get_free_port)
-        local PORT_ANYTLS=$(get_free_port)
-        local PORT_LOOPBACK=$(get_free_loopback_port)
+        echo
+        echo -e "${green}======================================================${re}"
+        echo -e "${green}              主节点协议与端口配置                    ${re}"
+        echo -e "${green}======================================================${re}"
+        echo -e "  1. ${green}一键极速安装全部 6 大主节点协议${re} (自动分配随机安全端口) [默认/推荐]"
+        echo -e "  2. ${yellow}自定义选择协议与端口${re} (自由开启/关闭各协议，手动指定端口)"
+        echo -e "${green}======================================================${re}"
+        reading "请选择配置模式 [1-2, 默认 1]: " inst_mode
+        [[ -z "$inst_mode" ]] && inst_mode=1
 
-        local REALITY_PVK=$(cat "$WORKDIR/private_key.txt" 2>/dev/null)
+        local p_vless p_vmess p_trojan p_hy2 p_tuic p_anytls
+        if [[ "$inst_mode" == "2" ]]; then
+            echo
+            yellow "提示：输入所需端口(1-65535)，直接回车由系统随机分配，输入 0 或 n 禁用该协议"
+            echo
 
-        cat > "$WORKDIR/sb.json" <<EOF_SB_JSON
-{
-  "log": {
-    "disabled": false,
-    "level": "info",
-    "timestamp": true
-  },
-  "dns": {
-    "servers": [
-      {
-        "type": "local",
-        "tag": "dns-direct"
-      },
-      {
-        "type": "local",
-        "tag": "local"
-      },
-      {
-        "type": "udp",
-        "tag": "dns-remote",
-        "server": "8.8.8.8"
-      },
-      {
-        "type": "udp",
-        "tag": "remote-dns",
-        "server": "8.8.8.8"
-      }
-    ],
-    "final": "dns-direct"
-  },
-  "inbounds": [
-    {
-      "tag": "vless-reality-in",
-      "type": "vless",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${PORT_VLESS},
-      "users": [{"uuid": "${UUID}", "flow": "xtls-rprx-vision"}],
-      "tls": {
-        "enabled": true,
-        "server_name": "apple.com",
-        "reality": {
-          "enabled": true,
-          "handshake": {"server": "apple.com", "server_port": 443},
-          "private_key": "${REALITY_PVK}",
-          "short_id": [""]
-        }
-      }
-    },
-    {
-      "tag": "vmess-ws-in",
-      "type": "vmess",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${PORT_VMESS},
-      "users": [{"uuid": "${UUID}"}],
-      "transport": {
-        "type": "ws",
-        "path": "/${UUID}-vm"
-      }
-    },
-    {
-      "tag": "trojan-ws-in",
-      "type": "trojan",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${PORT_TROJAN_TLS},
-      "users": [{"password": "${UUID}"}],
-      "transport": {
-        "type": "ws",
-        "path": "/${UUID}-tr"
-      },
-      "tls": {
-        "enabled": true,
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      }
-    },
-    {
-      "tag": "hy2-in",
-      "type": "hysteria2",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${PORT_HY2},
-      "users": [{"password": "${UUID}"}],
-      "masquerade": {
-        "type": "proxy",
-        "url": "https://www.bing.com"
-      },
-      "ignore_client_bandwidth": false,
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      }
-    },
-    {
-      "tag": "tuic-in",
-      "type": "tuic",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${PORT_TUIC},
-      "users": [{"uuid": "${UUID}", "password": "${UUID}"}],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      }
-    },
-    {
-      "tag": "anytls-in",
-      "type": "anytls",
-      "listen": "${LISTEN_ADDR}",
-      "listen_port": ${PORT_ANYTLS},
-      "users": [{"name": "default", "password": "${UUID}"}],
-      "tls": {
-        "enabled": true,
-        "server_name": "www.bing.com",
-        "certificate_path": "/etc/s-box/cert.pem",
-        "key_path": "/etc/s-box/private.key"
-      }
-    },
-    {
-      "tag": "socks-loopback",
-      "type": "socks",
-      "listen": "127.0.0.1",
-      "listen_port": ${PORT_LOOPBACK}
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    }
-  ],
-  "route": {
-    "rules": [
-      {
-        "inbound": ["socks-loopback"],
-        "outbound": "direct"
-      }
-    ],
-    "final": "direct"
-  }
-}
-EOF_SB_JSON
+            reading "开启 VLESS-Reality? [回车随机/端口/0禁用]: " inp_vless
+            [[ -z "$inp_vless" || "$inp_vless" == "y" || "$inp_vless" == "Y" ]] && p_vless=$(get_free_port)
+            [[ "$inp_vless" =~ ^[0-9]+$ && "$inp_vless" -gt 0 ]] && p_vless="$inp_vless"
+            [[ "$inp_vless" == "0" || "$inp_vless" == "n" || "$inp_vless" == "N" ]] && p_vless=0
+
+            reading "开启 VMess-WS?      [回车随机/端口/0禁用]: " inp_vmess
+            [[ -z "$inp_vmess" || "$inp_vmess" == "y" || "$inp_vmess" == "Y" ]] && p_vmess=$(get_free_port)
+            [[ "$inp_vmess" =~ ^[0-9]+$ && "$inp_vmess" -gt 0 ]] && p_vmess="$inp_vmess"
+            [[ "$inp_vmess" == "0" || "$inp_vmess" == "n" || "$inp_vmess" == "N" ]] && p_vmess=0
+
+            reading "开启 Trojan-WS-TLS? [回车随机/端口/0禁用]: " inp_trojan
+            [[ -z "$inp_trojan" || "$inp_trojan" == "y" || "$inp_trojan" == "Y" ]] && p_trojan=$(get_free_port)
+            [[ "$inp_trojan" =~ ^[0-9]+$ && "$inp_trojan" -gt 0 ]] && p_trojan="$inp_trojan"
+            [[ "$inp_trojan" == "0" || "$inp_trojan" == "n" || "$inp_trojan" == "N" ]] && p_trojan=0
+
+            reading "开启 Hysteria2?     [回车随机/端口/0禁用]: " inp_hy2
+            [[ -z "$inp_hy2" || "$inp_hy2" == "y" || "$inp_hy2" == "Y" ]] && p_hy2=$(get_free_port)
+            [[ "$inp_hy2" =~ ^[0-9]+$ && "$inp_hy2" -gt 0 ]] && p_hy2="$inp_hy2"
+            [[ "$inp_hy2" == "0" || "$inp_hy2" == "n" || "$inp_hy2" == "N" ]] && p_hy2=0
+
+            reading "开启 TUIC v5?       [回车随机/端口/0禁用]: " inp_tuic
+            [[ -z "$inp_tuic" || "$inp_tuic" == "y" || "$inp_tuic" == "Y" ]] && p_tuic=$(get_free_port)
+            [[ "$inp_tuic" =~ ^[0-9]+$ && "$inp_tuic" -gt 0 ]] && p_tuic="$inp_tuic"
+            [[ "$inp_tuic" == "0" || "$inp_tuic" == "n" || "$inp_tuic" == "N" ]] && p_tuic=0
+
+            reading "开启 AnyTLS?        [回车随机/端口/0禁用]: " inp_anytls
+            [[ -z "$inp_anytls" || "$inp_anytls" == "y" || "$inp_anytls" == "Y" ]] && p_anytls=$(get_free_port)
+            [[ "$inp_anytls" =~ ^[0-9]+$ && "$inp_anytls" -gt 0 ]] && p_anytls="$inp_anytls"
+            [[ "$inp_anytls" == "0" || "$inp_anytls" == "n" || "$inp_anytls" == "N" ]] && p_anytls=0
+        else
+            p_vless=$(get_free_port)
+            p_vmess=$(get_free_port)
+            p_trojan=$(get_free_port)
+            p_hy2=$(get_free_port)
+            p_tuic=$(get_free_port)
+            p_anytls=$(get_free_port)
+        fi
+
+        local p_loop=$(get_free_loopback_port)
+        build_and_apply_main_inbounds "$p_vless" "$p_vmess" "$p_trojan" "$p_hy2" "$p_tuic" "$p_anytls" "$p_loop"
+        apply_main_node_outbound
     fi
 
     if $IS_OPENRC; then
@@ -3388,6 +3352,7 @@ After=network.target nss-lookup.target
 [Service]
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+Environment="ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 ExecStart=/etc/s-box/sing-box run -c /etc/s-box/sb.json
 Restart=always
 RestartSec=3
