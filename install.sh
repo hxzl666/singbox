@@ -1246,7 +1246,13 @@ sync_psiphon_instance_to_singbox() {
     hy2_port=$(cat "$inst_dir/hy2_port.txt" 2>/dev/null || echo "0")
     tuic_port=$(cat "$inst_dir/tuic_port.txt" 2>/dev/null || echo "0")
     vless_port=$(cat "$inst_dir/vless_port.txt" 2>/dev/null || echo "0")
-    socks_port=$(cat "$inst_dir/socks_port.txt" 2>/dev/null || echo "0")
+    local cfg_socks_port=$(jq -r '.LocalSocksProxyPort // empty' "$inst_dir/psiphon.config" 2>/dev/null)
+    if [[ -n "$cfg_socks_port" && "$cfg_socks_port" -gt 0 ]]; then
+        socks_port="$cfg_socks_port"
+        echo "$socks_port" > "$inst_dir/socks_port.txt"
+    else
+        socks_port=$(cat "$inst_dir/socks_port.txt" 2>/dev/null || echo "0")
+    fi
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
     [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$cfg" 2>/dev/null | head -n1)
     reality_pvk=$(cat "$WORKDIR/private_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key' "$cfg" 2>/dev/null | head -n1)
