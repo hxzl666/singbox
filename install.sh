@@ -2456,6 +2456,11 @@ cleanup_psiphon_test_garbage() {
 test_single_psiphon_country() {
     local cc="${1^^}"
     local cname=$(get_country_name "$cc")
+    
+    # 每次测试前，强杀上一个国家可能残留的测试进程，保证绝对干净的环境
+    cleanup_psiphon_test_garbage
+    sleep 0.2
+
     local test_port=$(get_free_loopback_port)
     local test_dir="/tmp/psi_test_${cc}_${$}_${RANDOM}"
     mkdir -p "$test_dir/data" 2>/dev/null
@@ -2469,7 +2474,7 @@ test_single_psiphon_country() {
         return 1
     fi
 
-    # 启动后台临时测试进程 (不使用 disown，保留作业控制以便进程结束时回收 wait)
+    # 启动后台临时测试进程
     "$WORKDIR/psiphon-tunnel-core" --config "$cfg_file" > "$test_dir/test.log" 2>&1 &
     local test_pid=$!
 
@@ -2482,12 +2487,16 @@ test_single_psiphon_country() {
         elapsed=$(( elapsed + 1 ))
         printf "\r  [*] [%s] %-14s -> 正在握手测试中 (%ds/%ds)..." "$cc" "$cname" "$elapsed" "$max_try"
 
-        # 交替探测端点，避免单轮多次叠加超时
-        local probe_url="https://api.ipify.org"
-        [[ $((i % 2)) -eq 0 ]] && probe_url="https://ip.sb"
+        # 交替探测端点 (采用纯 HTTP 免去 TLS 握手慢的问题，并用 timeout 2 秒硬性熔断保护防止 curl hang 住)
+        local probe_url="http://api.ipify.org"
+        [[ $((i % 2)) -eq 0 ]] && probe_url="http://icanhazip.com"
 
         local res
-        res=$(curl -sx "socks5h://127.0.0.1:${test_port}" -s4 --connect-timeout 1 --max-time 1.5 "$probe_url" 2>/dev/null)
+        if command -v timeout >/dev/null 2>&1; then
+            res=$(timeout 2 curl -sx "socks5h://127.0.0.1:${test_port}" -s4 --connect-timeout 1 -m 1.5 "$probe_url" 2>/dev/null | tr -d ' \r\n')
+        else
+            res=$(curl -sx "socks5h://127.0.0.1:${test_port}" -s4 --connect-timeout 1 -m 1.5 "$probe_url" 2>/dev/null | tr -d ' \r\n')
+        fi
 
         if [[ -n "$res" && "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             egress_ip="$res"
@@ -2496,14 +2505,15 @@ test_single_psiphon_country() {
         fi
     done
 
-    # 彻底终止测试进程并回收，杜绝产生僵尸进程 (Defunct/Zombie)
+    # 彻底终止当前测试进程并回收，杜绝产生僵尸进程 (Defunct/Zombie)
     if [[ -n "$test_pid" ]] && kill -0 "$test_pid" 2>/dev/null; then
-        kill -TERM "$test_pid" 2>/dev/null
-        kill -KILL "$test_pid" 2>/dev/null || true
+        kill -9 "$test_pid" 2>/dev/null || true
         wait "$test_pid" 2>/dev/null || true
     fi
     pkill -9 -f "$cfg_file" 2>/dev/null || true
+    pkill -9 -f "$test_dir" 2>/dev/null || true
     rm -rf "$test_dir" 2>/dev/null || true
+    sleep 0.1
 
     if $is_ok; then
         printf "\r\033[K"
@@ -3510,6 +3520,30 @@ EOF_SYSTEMD
     log_info "快捷管理命令: 【 sb 】"
 }
 
+update_script_self() {
+    yellow "正在强制更新 Sing-box 脚本至最新版本..."
+    local rurls=(
+        "https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh"
+        "https://ghproxy.net/https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh"
+    )
+    local done_u=false
+    for u in "${rurls[@]}"; do
+        if curl -fsSL --connect-timeout 5 --max-time 15 "$u" -o "$WORKDIR/install.sh.tmp" 2>/dev/null && [[ -s "$WORKDIR/install.sh.tmp" ]]; then
+            mv -f "$WORKDIR/install.sh.tmp" "$WORKDIR/install.sh"
+            chmod +x "$WORKDIR/install.sh"
+            done_u=true
+            break
+        fi
+    done
+    rm -f "$WORKDIR/install.sh.tmp" 2>/dev/null || true
+    if $done_u; then
+        create_sb_tool
+        green "脚本已成功强制更新至最新版本！"
+    else
+        red "更新失败，请检查网络！"
+    fi
+}
+
 # ==================== 入口调度与 CLI 支持 ====================
 case "$1" in
     cron)
@@ -3536,27 +3570,7 @@ case "$1" in
         exit 0
         ;;
     update)
-        yellow "正在强制更新 Sing-box 脚本至最新版本..."
-        local rurls=(
-            "https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh"
-            "https://ghproxy.net/https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh"
-        )
-        local done_u=false
-        for u in "${rurls[@]}"; do
-            if curl -fsSL --connect-timeout 5 --max-time 15 "$u" -o "$WORKDIR/install.sh.tmp" 2>/dev/null && [[ -s "$WORKDIR/install.sh.tmp" ]]; then
-                mv -f "$WORKDIR/install.sh.tmp" "$WORKDIR/install.sh"
-                chmod +x "$WORKDIR/install.sh"
-                done_u=true
-                break
-            fi
-        done
-        rm -f "$WORKDIR/install.sh.tmp" 2>/dev/null || true
-        if $done_u; then
-            create_sb_tool
-            green "脚本已成功强制更新至最新版本！"
-        else
-            red "更新失败，请检查网络！"
-        fi
+        update_script_self
         exit 0
         ;;
     *)
