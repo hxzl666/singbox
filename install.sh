@@ -753,7 +753,7 @@ write_psiphon_config() {
             "https://ghproxy.net/https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
         )
         for surl in "${s_urls[@]}"; do
-            if curl -fsSL "$surl" -o "$data_dir/server_list_compressed" 2>/dev/null; then
+            if curl -fsSL --connect-timeout 5 --max-time 15 "$surl" -o "$data_dir/server_list_compressed" 2>/dev/null; then
                 cp -f "$data_dir/server_list_compressed" "$data_dir/remote_server_list" 2>/dev/null
                 cp -f "$data_dir/server_list_compressed" "$WORKDIR/server_list_compressed" 2>/dev/null
                 break
@@ -1757,9 +1757,9 @@ configure_main_node_protocols() {
     echo "============================================================"
 
     echo
-    echo "  1. 一键开启/更新全部 6 大主节点协议 (自动分配安全空闲端口)"
-    echo "  2. 自定义选择开启/关闭各协议与指定端口"
-    echo "  3. 重新生成 UUID 与 Reality 密钥对"
+    echo "  1. 一键启用全部协议"
+    echo "  2. 自定义选择协议与端口"
+    echo "  3. 重新生成 UUID 与密钥"
     echo "------------------------------------------------------------"
     echo "  0. 返回主菜单"
     echo "============================================================"
@@ -2003,10 +2003,10 @@ configure_warp_outbound() {
     [[ -t 1 ]] && clear 2>/dev/null || true
     echo
     green "============================================================"
-    green "  主节点出站管理 (直连出站 / WARP 出站 / 赛风出站)"
+    green "  主节点出站管理"
     green "============================================================"
     yellow "  说明: 本设置仅作用于【主节点】入站流量"
-    yellow "        副节点(自定义代理出站、赛风出站)为独立平行系统，不受影响"
+    yellow "        副节点(外部代理出站、赛风副节点)为独立系统，不受影响"
     echo "============================================================"
     
     if [ ! -f "$WORKDIR/sb.json" ]; then
@@ -2021,32 +2021,34 @@ configure_warp_outbound() {
     current_psi=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null || echo "false")
 
     echo
-    purple "当前主节点出站状态:"
+    purple "【主节点当前出站状态】"
     if [[ "$current_status" == "true" ]]; then
         if [[ "$current_mode" == "all" ]]; then
-            blue "  主节点出站模式: ✓ WARP 全局出站 (全部主节点流量走 WARP)"
+            blue   "  出站类型 : WARP 全局出站"
         else
-            blue "  主节点出站模式: ✓ WARP 分流出站 (Google/YouTube/Netflix/OpenAI 走 WARP)"
+            blue   "  出站类型 : WARP 规则分流"
         fi
         local ep=$(get_warp_endpoint)
-        green "  WARP Endpoint: $ep"
+        green  "  接入节点 : $ep"
     elif [[ "$current_psi" == "true" ]]; then
-        blue "  主节点出站模式: ✓ 赛风出站 (全部主节点流量走本地 Psiphon)"
+        local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
+        blue   "  出站类型 : Psiphon 赛风出站"
+        blue   "  出口国家 : $cur_reg - $(get_country_name "$cur_reg")"
     else
-        green "  主节点出站模式: ✓ 直连出站 (Direct 原生网络直连)"
+        green  "  出站类型 : 原生直连出站"
     fi
 
     echo
     echo "------------------------------------------------------------"
-    yellow "  0. 主节点 - 直连出站 (Direct, 恢复原生直连)"
-    yellow "  1. 主节点 - WARP 全局出站 (全部主节点流量走 WARP)"
-    yellow "  2. 主节点 - WARP 分流出站 (仅 Google/YouTube/Netflix/OpenAI)"
-    yellow "  3. 主节点 - 赛风出站 (主节点流量走本地 Psiphon 核心)"
+    yellow "  0. 切换为直连出站"
+    yellow "  1. 切换为 WARP 全局出站"
+    yellow "  2. 切换为 WARP 规则分流"
+    yellow "  3. 切换为赛风出站"
     echo "------------------------------------------------------------"
-    green  "  4. 优选 WARP Endpoint IP (优化连接质量与延迟)"
-    blue   "  5. 恢复 Cloudflare 默认 Endpoint"
-    blue   "  6. 重新获取勇哥 WARP API 配置凭证"
-    green  "  7. 检测主节点当前出口 IP"
+    green  "  4. 优选 WARP 接入节点"
+    blue   "  5. 恢复默认 WARP 节点"
+    blue   "  6. 重置 WARP 注册凭证"
+    green  "  7. 检测主节点出口 IP"
     echo "------------------------------------------------------------"
     red    "  q. 返回主菜单"
     echo "============================================================"
@@ -2162,11 +2164,11 @@ add_proxy_egress_group() {
     fi
 
     echo
-    purple "请选择为该代理出口搭建的本地入站协议 (支持多选或默认):"
-    echo "  1. Hysteria2 入站 (UDP高加速)"
-    echo "  2. TUIC v5 入站 (QUIC高性能)"
-    echo "  3. VLESS-Reality 入站 (TCP抗封锁)"
-    echo "  4. 同时开启 Hy2 + TUIC"
+    purple "请选择本地入站协议:"
+    echo "  1. Hysteria2 入站"
+    echo "  2. TUIC v5 入站"
+    echo "  3. VLESS-Reality 入站"
+    echo "  4. 同时开启 Hy2 与 TUIC"
     reading "请选择 [1-4, 默认4]: " proto_sel
     [[ -z "$proto_sel" ]] && proto_sel="4"
 
@@ -2257,17 +2259,17 @@ proxy_egress_menu() {
         [[ -t 1 ]] && clear 2>/dev/null || true
         echo
         green "============================================================"
-        green "  【副节点】自定义代理出站多出口路由管理"
+        green "  自定义代理出站管理"
         green "============================================================"
-        yellow "  说明: 副节点拥有独立入站端口与专属路由，出站直接转发至外部代理"
-        yellow "        与主节点(直连/WARP/赛风)完全平行独立，互不干扰"
+        yellow "  说明: 副节点拥有独立入站端口与专属路由，出站转发至外部代理"
+        yellow "        与主节点完全平行独立，互不干扰"
         green "============================================================"
         echo
 
         local groups
         mapfile -t groups < <(get_all_proxy_groups)
 
-        purple "当前代理节点组 (共 ${#groups[@]} 个):"
+        purple "【当前已配置代理组】 (共 ${#groups[@]} 组):"
         if [[ ${#groups[@]} -gt 0 ]]; then
             local idx=1
             for t in "${groups[@]}"; do
@@ -2279,7 +2281,8 @@ proxy_egress_menu() {
                 [[ "$hp" -gt 0 ]] && p_info="${p_info}Hy2:$hp "
                 [[ "$tp" -gt 0 ]] && p_info="${p_info}TUIC:$tp "
                 [[ "$vp" -gt 0 ]] && p_info="${p_info}VLESS:$vp "
-                green "  [$idx] [$t] $r  ->  入站端口: [ ${p_info:-无} ]"
+                green "  [$idx] $t - $r"
+                blue  "      入站端口: [ ${p_info:-无} ]"
                 ((idx++))
             done
         else
@@ -2288,11 +2291,11 @@ proxy_egress_menu() {
 
         echo
         echo "------------------------------------------------------------"
-        green  "  1. 添加新代理节点组 (导入外部代理链接)"
-        green  "  2. 查看所有代理组节点链接"
-        yellow "  3. 修改代理组出站链接"
+        green  "  1. 添加代理节点组"
+        green  "  2. 查看代理节点链接"
+        yellow "  3. 修改代理出站链接"
         red    "  4. 删除代理节点组"
-        blue   "  5. 重新同步全部代理配置并重启"
+        blue   "  5. 重新同步代理配置"
         echo "------------------------------------------------------------"
         red    "  0. 返回主菜单"
         echo "============================================================"
@@ -2445,84 +2448,162 @@ psiphon_switch_manual() {
     psiphon_check_current_ip
 }
 
+cleanup_psiphon_test_garbage() {
+    pkill -9 -f "/tmp/psi_test_" 2>/dev/null || true
+    rm -rf /tmp/psi_test_* 2>/dev/null || true
+}
+
 test_single_psiphon_country() {
     local cc="${1^^}"
     local cname=$(get_country_name "$cc")
     local test_port=$(get_free_loopback_port)
-    local test_dir="/tmp/psi_test_${cc}_$$"
-    mkdir -p "$test_dir/data"
+    local test_dir="/tmp/psi_test_${cc}_${$}_${RANDOM}"
+    mkdir -p "$test_dir/data" 2>/dev/null
 
     local cfg_file="$test_dir/psiphon.config"
     write_psiphon_config "$test_port" "$cc" "$cfg_file" "$test_dir/data"
 
-    nohup "$WORKDIR/psiphon-tunnel-core" --config "$cfg_file" > "$test_dir/test.log" 2>&1 &
+    if [[ ! -x "$WORKDIR/psiphon-tunnel-core" ]]; then
+        red "  [!] Psiphon 核心程序不存在或无执行权限: $WORKDIR/psiphon-tunnel-core"
+        rm -rf "$test_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    # 启动后台临时测试进程 (不使用 disown，保留作业控制以便进程结束时回收 wait)
+    "$WORKDIR/psiphon-tunnel-core" --config "$cfg_file" > "$test_dir/test.log" 2>&1 &
     local test_pid=$!
-    disown "$test_pid" 2>/dev/null || true
 
     local egress_ip="" is_ok=false
-    for i in {1..16}; do
-        sleep 0.5
-        if curl -sx "socks5h://127.0.0.1:${test_port}" -s4m2 https://api.ipify.org >/dev/null 2>&1 || \
-           curl -sx "socks5h://127.0.0.1:${test_port}" -s4m2 https://ip.sb >/dev/null 2>&1; then
-            egress_ip=$(curl -sx "socks5h://127.0.0.1:${test_port}" -s4m3 https://api.ipify.org 2>/dev/null || curl -sx "socks5h://127.0.0.1:${test_port}" -s4m3 https://ip.sb 2>/dev/null)
+    local max_try=10
+    local elapsed=0
+
+    for ((i=1; i<=max_try; i++)); do
+        sleep 0.6
+        elapsed=$(( elapsed + 1 ))
+        printf "\r  [*] [%s] %-14s -> 正在握手测试中 (%ds/%ds)..." "$cc" "$cname" "$elapsed" "$max_try"
+
+        # 交替探测端点，避免单轮多次叠加超时
+        local probe_url="https://api.ipify.org"
+        [[ $((i % 2)) -eq 0 ]] && probe_url="https://ip.sb"
+
+        local res
+        res=$(curl -sx "socks5h://127.0.0.1:${test_port}" -s4 --connect-timeout 1 --max-time 1.5 "$probe_url" 2>/dev/null)
+
+        if [[ -n "$res" && "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            egress_ip="$res"
             is_ok=true
             break
         fi
     done
 
-    kill -9 "$test_pid" 2>/dev/null || true
-    rm -rf "$test_dir"
+    # 彻底终止测试进程并回收，杜绝产生僵尸进程 (Defunct/Zombie)
+    if [[ -n "$test_pid" ]] && kill -0 "$test_pid" 2>/dev/null; then
+        kill -TERM "$test_pid" 2>/dev/null
+        kill -KILL "$test_pid" 2>/dev/null || true
+        wait "$test_pid" 2>/dev/null || true
+    fi
+    pkill -9 -f "$cfg_file" 2>/dev/null || true
+    rm -rf "$test_dir" 2>/dev/null || true
 
     if $is_ok; then
-        green "  [✓] [$cc] $cname -> 出口 IP: ${egress_ip} (连接可用)"
+        printf "\r\033[K"
+        green "  [✓] [$cc] $cname -> 出口 IP: ${egress_ip} (耗时约 ${elapsed}s)"
         return 0
     else
-        yellow "  [✗] [$cc] $cname -> 连接超时或未通"
+        printf "\r\033[K"
+        yellow "  [✗] [$cc] $cname -> 连接超时或未通 (已探测 ${elapsed}s)"
         return 1
     fi
 }
 
 psiphon_quick_test() {
+    download_psiphon_core || return 1
+    cleanup_psiphon_test_garbage
+    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; return 1' INT TERM
+
     echo
-    green "==== 快速测试常用国家 (US / JP / SG / HK) ===="
-    yellow "[*] 正在建立测试隧道，请稍候..."
+    green "============================================================"
+    green "  【快速测试常用国家】 (US / JP / SG / HK)"
+    green "============================================================"
+    yellow "[*] 正在逐个建立轻量级测试隧道并探测连通性..."
     echo
     local quick_list=("US" "JP" "SG" "HK")
+    local ok_cnt=0 fail_cnt=0
     for cc in "${quick_list[@]}"; do
-        test_single_psiphon_country "$cc"
+        if test_single_psiphon_country "$cc"; then
+            ((ok_cnt++))
+        else
+            ((fail_cnt++))
+        fi
     done
+    cleanup_psiphon_test_garbage
+    trap - INT TERM
     echo
-    green "[✓] 快速测试完毕！"
+    green "============================================================"
+    green "  快速测试完毕！共测试 4 个国家: 可用 [$ok_cnt] / 不可用 [$fail_cnt]"
+    green "============================================================"
 }
 
 psiphon_test_all() {
+    download_psiphon_core || return 1
+    cleanup_psiphon_test_garbage
+    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; return 1' INT TERM
+
     echo
-    green "==== 测试所有支持的 Psiphon 出口国家 ===="
-    yellow "[*] 正在逐个检测国家可用性与出口 IP (共 28 个出口国家)..."
+    green "============================================================"
+    green "  【测试所有支持的 Psiphon 出口国家】 (共 28 个国家)"
+    green "============================================================"
+    yellow "[*] 正在逐个检测国家可用性与出口 IP (按 Ctrl+C 可随时安全中断)..."
     echo
     local all_list=(
         "US" "JP" "SG" "HK" "KR" "TW"
         "GB" "DE" "CA" "NL" "FR" "IN" "AU"
         "CH" "SE" "IT" "ES" "PL" "AT" "BE" "DK" "NO" "RO" "CZ" "HU" "BG" "IE" "FI"
     )
+    local idx=1
+    local total=${#all_list[@]}
+    local ok_cnt=0 fail_cnt=0
     for cc in "${all_list[@]}"; do
-        test_single_psiphon_country "$cc"
+        echo -ne "${blue}[${idx}/${total}]${re} "
+        if test_single_psiphon_country "$cc"; then
+            ((ok_cnt++))
+        else
+            ((fail_cnt++))
+        fi
+        ((idx++))
     done
+    cleanup_psiphon_test_garbage
+    trap - INT TERM
     echo
-    green "[✓] 全部国家测试完毕！"
+    green "============================================================"
+    green "  全部国家测试完毕！共测试 ${total} 个国家: 可用 [$ok_cnt] / 不可用 [$fail_cnt]"
+    green "============================================================"
 }
 
 psiphon_custom_test() {
+    download_psiphon_core || return 1
+    cleanup_psiphon_test_garbage
+    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; return 1' INT TERM
+
     echo
-    green "==== 自定义测试 Psiphon 出口国家 ===="
+    green "============================================================"
+    green "  【自定义测试 Psiphon 出口国家】"
+    green "============================================================"
     show_supported_psiphon_codes
     echo
-    reading "请输入要测试的国家代码 (如 KR, TW, NL, DE 等): " custom_cc
-    custom_cc="${custom_cc^^}"
-    [[ -z "$custom_cc" ]] && { red "[!] 国家代码不能为空"; return 1; }
+    reading "请输入要测试的国家代码 (支持多个用空格隔开，如 KR TW NL DE): " custom_input
+    custom_input="${custom_input^^}"
+    [[ -z "$custom_input" ]] && { red "[!] 国家代码不能为空"; trap - INT TERM; return 1; }
     echo
-    yellow "[*] 正在测试 [$custom_cc]..."
-    test_single_psiphon_country "$custom_cc"
+    yellow "[*] 正在测试指定国家 [$custom_input]..."
+    echo
+    for cc in $custom_input; do
+        test_single_psiphon_country "$cc"
+    done
+    cleanup_psiphon_test_garbage
+    trap - INT TERM
+    echo
+    green "[✓] 自定义测试完毕！"
 }
 
 psiphon_view_log() {
@@ -2569,11 +2650,11 @@ add_psiphon_instance() {
     start_psiphon_instance "$cc"
 
     echo
-    purple "请选择为该赛风出口搭建的本地入站协议:"
-    echo "  1. Hysteria2 入站 (UDP高加速)"
-    echo "  2. TUIC v5 入站 (QUIC高性能)"
+    purple "请选择本地入站协议:"
+    echo "  1. Hysteria2 入站"
+    echo "  2. TUIC v5 入站"
     echo "  3. VLESS-Reality 入站"
-    echo "  4. 同时开启 Hy2 + TUIC"
+    echo "  4. 同时开启 Hy2 与 TUIC"
     reading "请选择 [1-4, 默认4]: " proto_sel
     [[ -z "$proto_sel" ]] && proto_sel="4"
 
@@ -2654,7 +2735,7 @@ psiphon_multigroup_menu() {
         [[ -t 1 ]] && clear 2>/dev/null || true
         echo
         green "============================================================"
-        green "  【副节点】Psiphon 赛风多出口节点组管理"
+        green "  副节点 - 赛风多出口组管理"
         green "============================================================"
         yellow "  说明: 副节点拥有独立入站端口与专属路由，出站走赛风对应国家"
         yellow "        与主节点完全平行独立，互不干扰"
@@ -2664,7 +2745,7 @@ psiphon_multigroup_menu() {
         local insts
         mapfile -t insts < <(get_all_psiphon_instances)
 
-        purple "当前赛风出口组 (共 ${#insts[@]} 个):"
+        purple "【当前已配置赛风出口组】 (共 ${#insts[@]} 组):"
         if [[ ${#insts[@]} -gt 0 ]]; then
             local idx=1
             for cc in "${insts[@]}"; do
@@ -2677,7 +2758,8 @@ psiphon_multigroup_menu() {
                 [[ "$hp" -gt 0 ]] && p_info="${p_info}Hy2:$hp "
                 [[ "$tp" -gt 0 ]] && p_info="${p_info}TUIC:$tp "
                 [[ "$vp" -gt 0 ]] && p_info="${p_info}VLESS:$vp "
-                green "  [$idx] [$cc] $cname  ->  入站端口: [ ${p_info:-无} ]"
+                green "  [$idx] [$cc] $cname"
+                blue  "      入站端口: [ ${p_info:-无} ]"
                 ((idx++))
             done
         else
@@ -2686,9 +2768,9 @@ psiphon_multigroup_menu() {
 
         echo
         echo "------------------------------------------------------------"
-        green  "  1. 添加赛风国家出口组 (支持自定义入站端口)"
-        green  "  2. 查看所有赛风出口组节点链接"
-        red    "  3. 删除赛风国家出口组"
+        green  "  1. 添加赛风出口组"
+        green  "  2. 查看赛风出口组链接"
+        red    "  3. 删除赛风出口组"
         blue   "  4. 重启所有赛风实例"
         echo "------------------------------------------------------------"
         red    "  0. 返回上一级菜单"
@@ -2760,29 +2842,31 @@ psiphon_management_menu() {
         [[ -t 1 ]] && clear 2>/dev/null || true
         echo
         green "============================================================"
-        green "  【Psiphon 赛风综合管理】"
+        green "  Psiphon 赛风综合管理"
         green "============================================================"
         local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
         local cur_sport=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
 
         if is_main_psiphon_running; then
-            green "  状态: [✓ 运行中] | 当前国家: [$cur_reg - $(get_country_name "$cur_reg")] | 本地Socks端口: [$cur_sport]"
+            green  "  主进程状态 : ✓ 运行中"
         else
-            yellow "  状态: [✗ 未运行] | 预设国家: [$cur_reg - $(get_country_name "$cur_reg")] | 本地Socks端口: [$cur_sport]"
+            yellow "  主进程状态 : ✗ 未运行"
         fi
+        blue   "  主出口国家 : $cur_reg - $(get_country_name "$cur_reg")"
+        purple "  Socks5端口 : $cur_sport"
         green "============================================================"
         echo
         echo "  1. 查看当前出口 IP"
-        echo "  2. 智能切换出口国家 (自动优选)"
+        echo "  2. 智能优选出口国家"
         echo "  3. 手动切换出口国家"
         echo "------------------------------------------------------------"
-        echo "  4. 快速测试国家 (US/JP/SG/HK)"
-        echo "  5. 测试所有支持国家"
+        echo "  4. 快速测试常用国家"
+        echo "  5. 测试全部支持国家"
         echo "  6. 自定义测试国家"
         echo "------------------------------------------------------------"
         echo "  7. 查看 Psiphon 日志"
-        echo "  8. 重启 Psiphon"
-        echo "  9. 多出口节点组管理 (独立入站副节点管理)"
+        echo "  8. 重启 Psiphon 主服务"
+        echo "  9. 副节点赛风出口组管理"
         echo "------------------------------------------------------------"
         red  "  0. 返回主菜单"
         echo "============================================================"
@@ -2915,27 +2999,27 @@ argo_management_menu() {
         [[ -t 1 ]] && clear 2>/dev/null || true
         echo
         green "============================================================"
-        green "  主节点 Argo 隧道管理 (Cloudflare Tunnel)"
+        green "  主节点 Argo 隧道管理"
         green "============================================================"
-        echo
         if service_is_active argo-tunnel; then
-            green "【Argo 状态】: ✓ 运行中"
+            green "  隧道状态 : ✓ 运行中"
             local argo_d=""
             if [[ -f /etc/s-box/argo.log ]]; then
                 argo_d=$(head -n 1 /etc/s-box/argo.log 2>/dev/null)
             elif [[ -f /var/log/argo-tunnel.log ]]; then
                 argo_d=$(grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' /var/log/argo-tunnel.log 2>/dev/null | tail -n 1)
             fi
-            [[ -n "$argo_d" ]] && blue "当前域名: $argo_d"
+            blue  "  分配域名 : ${argo_d:-获取中...}"
         else
-            yellow "【Argo 状态】: ✗ 未运行"
+            yellow "  隧道状态 : ✗ 未运行"
         fi
+        green "============================================================"
         echo
         echo "------------------------------------------------------------"
-        green  "  1. 启动 / 重启 Argo 隧道"
-        red    "  2. 停止 Argo 隧道"
-        blue   "  3. 查看 Argo 实时日志与域名"
-        yellow "  4. 重置/重新抓取临时域名"
+        green  "  1. 启动 / 重启隧道"
+        red    "  2. 停止隧道"
+        blue   "  3. 查看隧道实时日志"
+        yellow "  4. 重新抓取临时域名"
         echo "------------------------------------------------------------"
         red    "  0. 返回主菜单"
         echo "============================================================"
@@ -2981,12 +3065,12 @@ view_logs_menu() {
         green "  查看系统与服务运行日志"
         green "============================================================"
         echo
-        echo "  1. 查看 Sing-box 核心日志 (最近 30 行)"
-        echo "  2. 查看 Argo 隧道日志 (最近 30 行)"
-        echo "  3. 查看 Psiphon 赛风日志 (最近 30 行)"
-        echo "  4. 查看自愈守护 monitor.log"
+        echo "  1. 查看 Sing-box 日志"
+        echo "  2. 查看 Argo 隧道日志"
+        echo "  3. 查看 Psiphon 赛风日志"
+        echo "  4. 查看自愈守护日志"
         echo "------------------------------------------------------------"
-        echo "  0. 返回主菜单"
+        red  "  0. 返回主菜单"
         echo "============================================================"
         reading "请选择 [0-4]: " choice
         case "$choice" in
@@ -3099,20 +3183,20 @@ menu() {
             fi
         fi
 
-        purple "  本机 IP 列表:"
+        purple "【本机网络环境】"
         local idx=1
         for ip in "${ALL_IPS[@]}"; do
-            [[ -n "$ip" ]] && green "    [$idx] $ip  ->  [可用]"
+            [[ -n "$ip" ]] && echo -e "  IP 地址 [$idx]  : ${green}$ip${re}"
             ((idx++))
         done
-        echo "============================================================"
-        echo
+        echo "------------------------------------------------------------"
 
+        purple "【核心服务状态】"
         if [ -f "$WORKDIR/sb.json" ]; then
             if service_is_active sing-box; then
-                green "【主节点状态】: ✓ 已安装并运行中"
+                echo -e "  Sing-box 核心 : ${green}✓ 运行中${re}"
             else
-                yellow "【主节点状态】: ⚠ 已安装但未运行"
+                echo -e "  Sing-box 核心 : ${yellow}⚠ 已安装但未运行${re}"
             fi
 
             local warp_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null)
@@ -3120,64 +3204,73 @@ menu() {
             local psi_main=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null)
             if [[ "$warp_status" == "true" ]]; then
                 if [[ "$warp_mode" == "all" ]]; then
-                    blue "【主节点出站】: ✓ WARP 全局出站 (全部主节点流量走 WARP)"
+                    echo -e "  主节点出站模式: ${blue}WARP 全局出站${re}"
                 else
-                    blue "【主节点出站】: ✓ WARP 分流出站 (Google/YouTube/Netflix/OpenAI)"
+                    echo -e "  主节点出站模式: ${blue}WARP 规则分流${re}"
                 fi
             elif [[ "$psi_main" == "true" ]]; then
-                blue "【主节点出站】: ✓ 赛风出站 (Psiphon 节点出站)"
+                local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
+                echo -e "  主节点出站模式: ${blue}赛风出站 [${cur_reg}]${re}"
             else
-                green "【主节点出站】: ✓ 直连出站 (Direct 原生网络直连)"
-            fi
-
-            local psi_insts
-            mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
-            if [[ ${#psi_insts[@]} -gt 0 ]]; then
-                purple "【副节点-赛风】: ✓ 已配置 ${#psi_insts[@]} 个国家出口组 (${psi_insts[*]})"
-            else
-                purple "【副节点-赛风】: ✗ 未配置"
-            fi
-
-            local proxy_tags
-            mapfile -t proxy_tags < <(get_all_proxy_groups 2>/dev/null)
-            if [[ ${#proxy_tags[@]} -gt 0 ]]; then
-                purple "【副节点-代理】: ✓ 已配置 ${#proxy_tags[@]} 个代理出口组 (${proxy_tags[*]})"
-            else
-                purple "【副节点-代理】: ✗ 未配置"
+                echo -e "  主节点出站模式: ${green}原生直连出站${re}"
             fi
 
             if service_is_active argo-tunnel; then
-                green "【Argo 隧道】 : ✓ 运行中"
+                local argo_d=""
+                if [[ -f /etc/s-box/argo.log ]]; then
+                    argo_d=$(head -n 1 /etc/s-box/argo.log 2>/dev/null)
+                elif [[ -f /var/log/argo-tunnel.log ]]; then
+                    argo_d=$(grep -oE '[a-zA-Z0-9.-]+\.trycloudflare\.com' /var/log/argo-tunnel.log 2>/dev/null | tail -n 1)
+                fi
+                echo -e "  Argo 隧道状态 : ${green}✓ 运行中${re} ${blue}[${argo_d:-获取中}]${re}"
             else
-                yellow "【Argo 隧道】 : ✗ 未运行/未启用"
+                echo -e "  Argo 隧道状态 : ${yellow}✗ 未运行${re}"
             fi
         else
-            yellow "【主节点状态】: ✗ 未安装"
+            echo -e "  Sing-box 核心 : ${red}✗ 未安装${re}"
+        fi
+        echo "------------------------------------------------------------"
+
+        purple "【副节点出口状态】"
+        local psi_insts
+        mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
+        if [[ ${#psi_insts[@]} -gt 0 ]]; then
+            echo -e "  赛风出口副节点: ${green}✓ 已配置 ${#psi_insts[@]} 组${re} [ ${psi_insts[*]} ]"
+        else
+            echo -e "  赛风出口副节点: ${yellow}✗ 未配置${re}"
         fi
 
-        echo
+        local proxy_tags
+        mapfile -t proxy_tags < <(get_all_proxy_groups 2>/dev/null)
+        if [[ ${#proxy_tags[@]} -gt 0 ]]; then
+            echo -e "  代理出口副节点: ${green}✓ 已配置 ${#proxy_tags[@]} 组${re} [ ${proxy_tags[*]} ]"
+        else
+            echo -e "  代理出口副节点: ${yellow}✗ 未配置${re}"
+        fi
         echo "============================================================"
+
+        echo
         blue   "  【主节点管理】"
         echo "------------------------------------------------------------"
-        green  "  1. 一键重新配置/安装主节点 (多协议: Reality/VMess/Trojan/Hy2/TUIC/AnyTLS)"
-        green  "  2. 主节点出站管理 (直连出站 / WARP 全局出站 / WARP 分流出站 / 赛风出站)"
-        green  "  3. 主节点 Argo 隧道管理 (开关/重置/固定与临时隧道)"
-        green  "  4. 查看主节点信息与订阅 (含各协议链接及主节点出站状态)"
+        green  "  1. 重新配置主节点协议"
+        green  "  2. 主节点出站管理"
+        green  "  3. 主节点 Argo 隧道管理"
+        green  "  4. 查看主节点信息与链接"
         echo "------------------------------------------------------------"
-        purple "  【副节点管理 (平行独立)】"
+        purple "  【副节点管理】"
         echo "------------------------------------------------------------"
-        purple "  5. Psiphon 赛风综合管理 (出口IP/国家切换/国家测速/多出口节点组)"
-        purple "  6. 【副节点】自定义代理出站多出口管理 (添加/修改/删除外部代理出站、测速)"
+        purple "  5. 赛风综合管理"
+        purple "  6. 自定义代理出站管理"
         echo "------------------------------------------------------------"
         white  "  【综合功能与系统运维】"
         echo "------------------------------------------------------------"
-        blue   "  7. 自定义节点组合推送 (自由勾选主/副节点生成专属订阅)"
-        blue   "  8. 查看全部节点信息总览 (主节点 + 副节点分类汇总)"
-        green  "  9. 重启所有服务 (主节点 + 赛风多实例 + 自定义代理完整同步)"
-        yellow " 10. 诊断 / 端口管理与冲突修复"
-        blue   " 11. 查看运行日志 (sing-box / Argo / Psiphon / 自愈守护)"
-        yellow " 12. 开启/关闭服务自愈守护定时任务"
-        red    " 13. 卸载删除主节点与服务"
+        blue   "  7. 自定义节点组合推送"
+        blue   "  8. 查看全部节点信息总览"
+        green  "  9. 重启所有服务"
+        yellow " 10. 系统诊断与配置修复"
+        blue   " 11. 查看运行日志"
+        yellow " 12. 开启 / 关闭服务自愈守护"
+        red    " 13. 彻底卸载 Sing-box 环境"
         echo "------------------------------------------------------------"
         red    "  0. 退出脚本"
         echo "============================================================"
@@ -3292,8 +3385,8 @@ install_singbox_main() {
         echo -e "${green}======================================================${re}"
         echo -e "${green}              主节点协议与端口配置                    ${re}"
         echo -e "${green}======================================================${re}"
-        echo -e "  1. ${green}一键极速安装全部 6 大主节点协议${re} (自动分配随机安全端口) [默认/推荐]"
-        echo -e "  2. ${yellow}自定义选择协议与端口${re} (自由开启/关闭各协议，手动指定端口)"
+        echo -e "  1. ${green}一键启用全部 6 大协议${re} [默认推荐]"
+        echo -e "  2. ${yellow}自定义选择协议与端口${re}"
         echo -e "${green}======================================================${re}"
         reading "请选择配置模式 [1-2, 默认 1]: " inst_mode
         [[ -z "$inst_mode" ]] && inst_mode=1
