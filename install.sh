@@ -31,14 +31,16 @@ red="\033[1;91m"
 green="\e[1;32m"
 yellow="\e[1;33m"
 purple="\e[1;35m"
-blue="\e[1;36m"
+blue="\e[1;34m"
+cyan="\e[1;36m"
 white="\e[1;37m"
 
 red() { echo -e "\e[1;91m$1\033[0m"; }
 green() { echo -e "\e[1;32m$1\033[0m"; }
 yellow() { echo -e "\e[1;33m$1\033[0m"; }
 purple() { echo -e "\e[1;35m$1\033[0m"; }
-blue() { echo -e "\e[1;36m$1\033[0m"; }
+blue() { echo -e "\e[1;34m$1\033[0m"; }
+cyan() { echo -e "\e[1;36m$1\033[0m"; }
 white() { echo -e "\e[1;37m$1\033[0m"; }
 reading() { read -p "$(yellow "$1")" "$2"; }
 
