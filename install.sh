@@ -821,19 +821,22 @@ start_main_psiphon() {
     region=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
     local socks_port
     socks_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
-    write_psiphon_config "$socks_port" "$region" "$WORKDIR/psiphon.config" "$WORKDIR/psiphon-data"
+    local data_dir="$WORKDIR/psiphon-data/${region:-AUTO}"
+    mkdir -p "$data_dir"
+    write_psiphon_config "$socks_port" "$region" "$WORKDIR/psiphon.config" "$data_dir"
 
     if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
-        systemctl enable --now psiphon-main >/dev/null 2>&1 || true
-        systemctl restart psiphon-main >/dev/null 2>&1 || true
+        systemctl stop psiphon-main >/dev/null 2>&1 || true
+        systemctl enable psiphon-main >/dev/null 2>&1 || true
+        systemctl start psiphon-main >/dev/null 2>&1 || true
     else
+        stop_main_psiphon
         local psi_pid_file="$WORKDIR/psiphon.pid"
         if [[ ! -f "$psi_pid_file" ]] || ! kill -0 "$(cat "$psi_pid_file" 2>/dev/null)" 2>/dev/null; then
             nohup "$WORKDIR/psiphon-tunnel-core" --config "$WORKDIR/psiphon.config" >> "$WORKDIR/psiphon.log" 2>&1 &
             echo $! > "$psi_pid_file"
         fi
     fi
-    sleep 2
     return 0
 }
 
@@ -2792,11 +2795,12 @@ psiphon_view_log() {
 
 psiphon_restart() {
     echo
-    yellow "[*] 正在重启 Psiphon 主进程..."
+    yellow "[*] 正在深度重启与自愈 Psiphon 主进程..."
+    local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
     stop_main_psiphon
+    rm -rf "$WORKDIR/psiphon-data/${cur_reg:-AUTO}" 2>/dev/null || true
     start_main_psiphon
-    green "[✓] Psiphon 主进程已重启！"
-    sleep 2
+    green "[✓] Psiphon 主进程已重启并载入种子服务器！"
     psiphon_check_current_ip
 }
 
