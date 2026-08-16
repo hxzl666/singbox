@@ -3139,21 +3139,40 @@ run_cron_check() {
 create_sb_tool() {
     mkdir -p /usr/local/bin "$WORKDIR"
     local current_src="${BASH_SOURCE[0]:-$0}"
-    if [[ -f "$current_src" && -s "$current_src" && $(wc -c < "$current_src" 2>/dev/null || echo 0) -gt 1000 ]]; then
-        cp -f "$current_src" "$WORKDIR/install.sh" 2>/dev/null || true
+    local is_updated=false
+
+    # 1. 如果当前是从本地普通脚本文件执行，直接强制覆盖至 /etc/s-box/install.sh
+    if [[ -f "$current_src" && "$current_src" != "$WORKDIR/install.sh" && "$current_src" != /dev/fd/* && "$current_src" != /proc/* ]]; then
+        if cp -f "$current_src" "$WORKDIR/install.sh" 2>/dev/null && [[ -s "$WORKDIR/install.sh" ]]; then
+            is_updated=true
+        fi
     fi
 
-    if [[ ! -s "$WORKDIR/install.sh" || $(wc -c < "$WORKDIR/install.sh" 2>/dev/null || echo 0) -lt 1000 ]]; then
-        curl -fsSL https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh -o "$WORKDIR/install.sh" 2>/dev/null || \
-        wget -qO "$WORKDIR/install.sh" https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh 2>/dev/null || true
+    # 2. 如果是从管道/远程加载执行 (如 bash <(curl...))，或本地覆盖未发生，强制拉取最新脚本覆盖
+    if ! $is_updated; then
+        local remote_urls=(
+            "https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh"
+            "https://ghproxy.net/https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh"
+        )
+        for rurl in "${remote_urls[@]}"; do
+            if curl -fsSL --connect-timeout 5 --max-time 15 "$rurl" -o "$WORKDIR/install.sh.tmp" 2>/dev/null && [[ -s "$WORKDIR/install.sh.tmp" ]]; then
+                mv -f "$WORKDIR/install.sh.tmp" "$WORKDIR/install.sh"
+                is_updated=true
+                break
+            fi
+        done
+        rm -f "$WORKDIR/install.sh.tmp" 2>/dev/null || true
     fi
+
     chmod +x "$WORKDIR/install.sh" 2>/dev/null || true
 
+    # 3. 部署 /usr/local/bin/sb 快捷管理入口 (确保始终调用最新 /etc/s-box/install.sh)
     cat > /usr/local/bin/sb << 'EOF_SB'
 #!/usr/bin/env bash
 WORKDIR="/etc/s-box"
 if [[ ! -s "$WORKDIR/install.sh" || $(wc -c < "$WORKDIR/install.sh" 2>/dev/null || echo 0) -lt 1000 ]]; then
     curl -fsSL https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh -o "$WORKDIR/install.sh" 2>/dev/null || \
+    curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh -o "$WORKDIR/install.sh" 2>/dev/null || \
     wget -qO "$WORKDIR/install.sh" https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh 2>/dev/null || true
     chmod +x "$WORKDIR/install.sh" 2>/dev/null || true
 fi
@@ -3514,6 +3533,30 @@ case "$1" in
         ;;
     reconfig)
         configure_main_node_protocols
+        exit 0
+        ;;
+    update)
+        yellow "正在强制更新 Sing-box 脚本至最新版本..."
+        local rurls=(
+            "https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh"
+            "https://ghproxy.net/https://raw.githubusercontent.com/hxzl666/singbox/main/install.sh"
+        )
+        local done_u=false
+        for u in "${rurls[@]}"; do
+            if curl -fsSL --connect-timeout 5 --max-time 15 "$u" -o "$WORKDIR/install.sh.tmp" 2>/dev/null && [[ -s "$WORKDIR/install.sh.tmp" ]]; then
+                mv -f "$WORKDIR/install.sh.tmp" "$WORKDIR/install.sh"
+                chmod +x "$WORKDIR/install.sh"
+                done_u=true
+                break
+            fi
+        done
+        rm -f "$WORKDIR/install.sh.tmp" 2>/dev/null || true
+        if $done_u; then
+            create_sb_tool
+            green "脚本已成功强制更新至最新版本！"
+        else
+            red "更新失败，请检查网络！"
+        fi
         exit 0
         ;;
     *)
