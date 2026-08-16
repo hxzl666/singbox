@@ -445,11 +445,30 @@ stop_psiphon_instance() {
     local cc="${1^^}"
     local idir="${PSI_INSTANCES_DIR}/${cc}"
     if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        systemctl stop "psiphon-instance@${cc}" >/dev/null 2>&1 || true
         systemctl disable --now "psiphon-instance@${cc}" >/dev/null 2>&1 || true
     fi
     local pid=$(cat "$idir/psiphon.pid" 2>/dev/null)
-    [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null
+    [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null || true
+    pkill -9 -f "psiphon-tunnel-core.*psiphon_instances/${cc}" 2>/dev/null || true
     rm -f "$idir/psiphon.pid"
+}
+
+is_psiphon_instance_running() {
+    local cc="${1^^}"
+    local idir="${PSI_INSTANCES_DIR}/${cc}"
+    [[ -d "$idir" ]] || return 1
+    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        systemctl is-active "psiphon-instance@${cc}" >/dev/null 2>&1 && return 0
+    fi
+    local pid=$(cat "$idir/psiphon.pid" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    if pgrep -f "psiphon-tunnel-core.*psiphon_instances/${cc}" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
 }
 
 restart_psiphon_instance() {
@@ -2388,6 +2407,7 @@ psiphon_check_current_ip() {
     purple "[*] 正在检测当前 Psiphon 赛风出口网络状态..."
     local socks_port
     socks_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
+    local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
 
     if ! is_main_psiphon_running; then
         yellow "[!] Psiphon 主进程未运行，正在启动..."
@@ -2395,24 +2415,47 @@ psiphon_check_current_ip() {
         sleep 2
     fi
 
-    local ip info
-    ip=$(curl -sx "socks5h://127.0.0.1:${socks_port}" -s4m6 https://api.ipify.org 2>/dev/null || curl -sx "socks5h://127.0.0.1:${socks_port}" -s4m6 https://ip.sb 2>/dev/null)
+    local ip=""
+    local max_wait=10
+    local elapsed=0
+
+    # 动态握手轮询探测 (最多等待 10 秒，握手成功立即返回)
+    for ((i=1; i<=max_wait; i++)); do
+        printf "\r  [*] 正在建立加密隧道并探测出口 IP (%ds/%ds)..." "$i" "$max_wait"
+        local res=""
+        res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks_port}" -s4 --connect-timeout 2 -m 2 "http://api.ipify.org" 2>/dev/null | tr -d ' \r\n')
+        [[ -z "$res" || ! "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks_port}" -s4 --connect-timeout 2 -m 2 "http://ipv4.icanhazip.com" 2>/dev/null | tr -d ' \r\n')
+        [[ -z "$res" || ! "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks_port}" -s4 --connect-timeout 2 -m 2 "https://api.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+
+        if [[ -n "$res" && "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ip="$res"
+            elapsed=$i
+            break
+        fi
+        sleep 1
+    done
+    printf "\r\033[K"
+
     if [[ -n "$ip" ]]; then
         green "============================================================"
-        green "  [✓] Psiphon 当前出口 IP : $ip"
-        info=$(curl -sx "socks5h://127.0.0.1:${socks_port}" -s4m5 "https://api.ip.sb/geoip/${ip}" 2>/dev/null)
+        green "  [✓] Psiphon 当前出口已就绪！ (握手耗时: 约 ${elapsed}s)"
+        green "============================================================"
+        green "  出口公网 IP : $ip"
+        local info
+        info=$(curl -s4m4 "http://ip-api.com/json/${ip}?lang=zh-CN" 2>/dev/null)
         if [[ -n "$info" ]]; then
             local country region city isp
             country=$(echo "$info" | jq -r '.country // empty' 2>/dev/null)
-            region=$(echo "$info" | jq -r '.region // empty' 2>/dev/null)
+            region=$(echo "$info" | jq -r '.regionName // empty' 2>/dev/null)
             city=$(echo "$info" | jq -r '.city // empty' 2>/dev/null)
             isp=$(echo "$info" | jq -r '.isp // empty' 2>/dev/null)
-            blue  "      出口国家 / 地区 : ${country} - ${region} ${city}"
-            blue  "      网络运营商 (ISP): ${isp}"
+            blue  "  国家 / 地区 : ${country:-未知} - ${region} ${city}"
+            blue  "  运营商(ISP) : ${isp:-未知}"
         fi
         green "============================================================"
     else
-        red "[!] 检测超时或 Psiphon 连接尚未建立就绪，请稍后重试或查看日志。"
+        red "[!] 检测超时：Psiphon 远端加密隧道建立耗时较长或目标地区节点负载较高。"
+        yellow "    提示: Psiphon 守护服务已在后台持续重试握手，请稍候 5~10 秒再次查看即可。"
     fi
 }
 
@@ -2421,11 +2464,11 @@ psiphon_switch_auto() {
     yellow "[*] 正在切换 Psiphon 为智能自动选择 (AUTO 优选)..."
     echo "AUTO" > "$WORKDIR/psiphon_main_region.txt"
     stop_main_psiphon
+    rm -f "$WORKDIR/psiphon-data/remote_server_list" 2>/dev/null || true
     start_main_psiphon
     apply_main_node_outbound
     apply_changes
     green "[✓] 已切换为智能自动选择！正在获取新出口 IP..."
-    sleep 3
     psiphon_check_current_ip
 }
 
@@ -2440,11 +2483,11 @@ psiphon_switch_manual() {
 
     echo "$target_cc" > "$WORKDIR/psiphon_main_region.txt"
     stop_main_psiphon
+    rm -f "$WORKDIR/psiphon-data/remote_server_list" 2>/dev/null || true
     start_main_psiphon
     apply_main_node_outbound
     apply_changes
     green "[✓] 已切换出口国家为 [$target_cc - $(get_country_name "$target_cc")]！"
-    sleep 3
     psiphon_check_current_ip
 }
 
@@ -2452,13 +2495,30 @@ cleanup_psiphon_test_garbage() {
     # 清理测试专用的临时进程和目录
     pkill -9 -f "/tmp/psi_test_" 2>/dev/null || true
     pkill -9 -f "psiphon-tunnel-core.*--config.*/tmp/" 2>/dev/null || true
+    pkill -9 -f "curl.*socks5h://127.0.0.1:21999" 2>/dev/null || true
     wait 2>/dev/null || true
     rm -rf /tmp/psi_test_* 2>/dev/null || true
+}
+
+PSI_TEST_INTERRUPTED=0
+psi_test_sigint_handler() {
+    PSI_TEST_INTERRUPTED=1
+    cleanup_psiphon_test_garbage
+    echo
+    red "[!] 测试已手动中断并清理残留进程"
+    echo
+    yellow "[*] 正在恢复赛风服务..."
+    if is_main_psiphon_running 2>/dev/null || [[ -n "$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null)" ]]; then
+        start_main_psiphon 2>/dev/null
+    fi
+    ensure_all_psiphon_instances_running 2>/dev/null
+    green "[✓] 赛风服务已恢复"
 }
 
 # 单进程复用架构：stop → 改配置 → start → 探测出口 IP → stop
 # 不再为每个国家单独 fork 临时进程，彻底杜绝进程累积耗尽系统资源
 test_single_psiphon_country() {
+    [[ $PSI_TEST_INTERRUPTED -eq 1 ]] && return 130
     local cc="${1^^}"
     local cname=$(get_country_name "$cc")
     local test_port=21999
@@ -2477,6 +2537,7 @@ test_single_psiphon_country() {
     fi
     cleanup_psiphon_test_garbage
     sleep 0.5
+    [[ $PSI_TEST_INTERRUPTED -eq 1 ]] && return 130
 
     # 2. 写入当前国家的配置文件并启动单个测试进程
     rm -rf "$test_dir" 2>/dev/null || true
@@ -2500,12 +2561,14 @@ test_single_psiphon_country() {
     local elapsed=0
 
     for ((i=1; i<=max_wait; i++)); do
+        [[ $PSI_TEST_INTERRUPTED -eq 1 ]] && break
         # 如果进程已自行退出，无需继续
         if ! kill -0 "$test_pid" 2>/dev/null; then
             elapsed=$i
             break
         fi
         sleep 1
+        [[ $PSI_TEST_INTERRUPTED -eq 1 ]] && break
         elapsed=$i
         printf "\r  [*] [%s] %-14s -> 正在握手测试中 (%ds/%ds)..." "$cc" "$cname" "$elapsed" "$max_wait"
 
@@ -2533,6 +2596,12 @@ test_single_psiphon_country() {
     done
     wait 2>/dev/null || true
     rm -rf "$test_dir" 2>/dev/null || true
+
+    if [[ $PSI_TEST_INTERRUPTED -eq 1 ]]; then
+        printf "\r\033[K"
+        return 130
+    fi
+
     # 冷却等待：给系统时间回收 TCP 连接和文件描述符
     sleep 1
 
@@ -2550,7 +2619,8 @@ test_single_psiphon_country() {
 psiphon_quick_test() {
     download_psiphon_core || return 1
     cleanup_psiphon_test_garbage
-    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; start_main_psiphon 2>/dev/null; ensure_all_psiphon_instances_running 2>/dev/null; green "[✓] 赛风服务已恢复"; return 1' INT TERM
+    PSI_TEST_INTERRUPTED=0
+    trap 'psi_test_sigint_handler' INT TERM
 
     echo
     green "============================================================"
@@ -2561,32 +2631,43 @@ psiphon_quick_test() {
     local quick_list=("US" "JP" "SG" "HK")
     local ok_cnt=0 fail_cnt=0
     for cc in "${quick_list[@]}"; do
-        if test_single_psiphon_country "$cc"; then
+        [[ $PSI_TEST_INTERRUPTED -eq 1 ]] && break
+        test_single_psiphon_country "$cc"
+        local ret=$?
+        if [[ $PSI_TEST_INTERRUPTED -eq 1 || $ret -eq 130 ]]; then
+            PSI_TEST_INTERRUPTED=1
+            break
+        fi
+        if [[ $ret -eq 0 ]]; then
             ((ok_cnt++))
         else
             ((fail_cnt++))
         fi
     done
-    cleanup_psiphon_test_garbage
     trap - INT TERM
-    echo
-    green "============================================================"
-    green "  快速测试完毕！共测试 4 个国家: 可用 [$ok_cnt] / 不可用 [$fail_cnt]"
-    green "============================================================"
-    # 恢复主赛风进程和副节点赛风实例
-    echo
-    yellow "[*] 正在恢复赛风服务..."
-    if is_main_psiphon_running 2>/dev/null || [[ "$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null)" ]]; then
-        start_main_psiphon 2>/dev/null
+
+    if [[ $PSI_TEST_INTERRUPTED -eq 0 ]]; then
+        cleanup_psiphon_test_garbage
+        echo
+        green "============================================================"
+        green "  快速测试完毕！共测试 4 个国家: 可用 [$ok_cnt] / 不可用 [$fail_cnt]"
+        green "============================================================"
+        # 恢复主赛风进程和副节点赛风实例
+        echo
+        yellow "[*] 正在恢复赛风服务..."
+        if is_main_psiphon_running 2>/dev/null || [[ -n "$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null)" ]]; then
+            start_main_psiphon 2>/dev/null
+        fi
+        ensure_all_psiphon_instances_running 2>/dev/null
+        green "[✓] 赛风服务已恢复"
     fi
-    ensure_all_psiphon_instances_running 2>/dev/null
-    green "[✓] 赛风服务已恢复"
 }
 
 psiphon_test_all() {
     download_psiphon_core || return 1
     cleanup_psiphon_test_garbage
-    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; start_main_psiphon 2>/dev/null; ensure_all_psiphon_instances_running 2>/dev/null; green "[✓] 赛风服务已恢复"; return 1' INT TERM
+    PSI_TEST_INTERRUPTED=0
+    trap 'psi_test_sigint_handler' INT TERM
 
     echo
     green "============================================================"
@@ -2603,6 +2684,7 @@ psiphon_test_all() {
     local total=${#all_list[@]}
     local ok_cnt=0 fail_cnt=0
     for cc in "${all_list[@]}"; do
+        [[ $PSI_TEST_INTERRUPTED -eq 1 ]] && break
         # 系统资源安全熔断：当进程数超过系统上限 80% 时立即中止
         if [[ -f /proc/sys/kernel/pid_max ]]; then
             local cur_pids=$(find /proc -maxdepth 1 -name '[0-9]*' -type d 2>/dev/null | wc -l)
@@ -2615,33 +2697,43 @@ psiphon_test_all() {
             fi
         fi
         echo -ne "${blue}[${idx}/${total}]${re} "
-        if test_single_psiphon_country "$cc"; then
+        test_single_psiphon_country "$cc"
+        local ret=$?
+        if [[ $PSI_TEST_INTERRUPTED -eq 1 || $ret -eq 130 ]]; then
+            PSI_TEST_INTERRUPTED=1
+            break
+        fi
+        if [[ $ret -eq 0 ]]; then
             ((ok_cnt++))
         else
             ((fail_cnt++))
         fi
         ((idx++))
     done
-    cleanup_psiphon_test_garbage
     trap - INT TERM
-    echo
-    green "============================================================"
-    green "  全部国家测试完毕！共测试 ${total} 个国家: 可用 [$ok_cnt] / 不可用 [$fail_cnt]"
-    green "============================================================"
-    # 恢复主赛风进程和副节点赛风实例
-    echo
-    yellow "[*] 正在恢复赛风服务..."
-    if is_main_psiphon_running 2>/dev/null || [[ "$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null)" ]]; then
-        start_main_psiphon 2>/dev/null
+
+    if [[ $PSI_TEST_INTERRUPTED -eq 0 ]]; then
+        cleanup_psiphon_test_garbage
+        echo
+        green "============================================================"
+        green "  全部国家测试完毕！共测试 ${total} 个国家: 可用 [$ok_cnt] / 不可用 [$fail_cnt]"
+        green "============================================================"
+        # 恢复主赛风进程和副节点赛风实例
+        echo
+        yellow "[*] 正在恢复赛风服务..."
+        if is_main_psiphon_running 2>/dev/null || [[ -n "$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null)" ]]; then
+            start_main_psiphon 2>/dev/null
+        fi
+        ensure_all_psiphon_instances_running 2>/dev/null
+        green "[✓] 赛风服务已恢复"
     fi
-    ensure_all_psiphon_instances_running 2>/dev/null
-    green "[✓] 赛风服务已恢复"
 }
 
 psiphon_custom_test() {
     download_psiphon_core || return 1
     cleanup_psiphon_test_garbage
-    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; start_main_psiphon 2>/dev/null; ensure_all_psiphon_instances_running 2>/dev/null; green "[✓] 赛风服务已恢复"; return 1' INT TERM
+    PSI_TEST_INTERRUPTED=0
+    trap 'psi_test_sigint_handler' INT TERM
 
     echo
     green "============================================================"
@@ -2651,25 +2743,38 @@ psiphon_custom_test() {
     echo
     reading "请输入要测试的国家代码 (支持多个用空格隔开，如 KR TW NL DE): " custom_input
     custom_input="${custom_input^^}"
-    [[ -z "$custom_input" ]] && { red "[!] 国家代码不能为空"; trap - INT TERM; return 1; }
+    if [[ -z "$custom_input" ]]; then
+        red "[!] 国家代码不能为空"
+        trap - INT TERM
+        return 1
+    fi
     echo
     yellow "[*] 正在测试指定国家 [$custom_input]..."
     echo
     for cc in $custom_input; do
+        [[ $PSI_TEST_INTERRUPTED -eq 1 ]] && break
         test_single_psiphon_country "$cc"
+        local ret=$?
+        if [[ $PSI_TEST_INTERRUPTED -eq 1 || $ret -eq 130 ]]; then
+            PSI_TEST_INTERRUPTED=1
+            break
+        fi
     done
-    cleanup_psiphon_test_garbage
     trap - INT TERM
-    echo
-    green "[✓] 自定义测试完毕！"
-    # 恢复主赛风进程和副节点赛风实例
-    echo
-    yellow "[*] 正在恢复赛风服务..."
-    if is_main_psiphon_running 2>/dev/null || [[ "$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null)" ]]; then
-        start_main_psiphon 2>/dev/null
+
+    if [[ $PSI_TEST_INTERRUPTED -eq 0 ]]; then
+        cleanup_psiphon_test_garbage
+        echo
+        green "[✓] 自定义测试完毕！"
+        # 恢复主赛风进程和副节点赛风实例
+        echo
+        yellow "[*] 正在恢复赛风服务..."
+        if is_main_psiphon_running 2>/dev/null || [[ -n "$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null)" ]]; then
+            start_main_psiphon 2>/dev/null
+        fi
+        ensure_all_psiphon_instances_running 2>/dev/null
+        green "[✓] 赛风服务已恢复"
     fi
-    ensure_all_psiphon_instances_running 2>/dev/null
-    green "[✓] 赛风服务已恢复"
 }
 
 psiphon_view_log() {
@@ -2795,6 +2900,122 @@ generate_psiphon_instance_links() {
     purple "============================================================"
 }
 
+repair_single_psiphon_instance() {
+    local insts
+    mapfile -t insts < <(get_all_psiphon_instances)
+    if [[ ${#insts[@]} -eq 0 ]]; then
+        yellow "[!] 当前暂无已配置的赛风出口组"
+        return 1
+    fi
+
+    echo
+    green "============================================================"
+    green "  重启 / 修复指定赛风出口组"
+    green "============================================================"
+    echo "当前已配置的赛风出口组列表:"
+    local idx=1
+    for cc in "${insts[@]}"; do
+        [[ -z "$cc" ]] && continue
+        local cname=$(get_country_name "$cc")
+        local hp=$(cat "${PSI_INSTANCES_DIR}/$cc/hy2_port.txt" 2>/dev/null || echo "0")
+        local tp=$(cat "${PSI_INSTANCES_DIR}/$cc/tuic_port.txt" 2>/dev/null || echo "0")
+        local vp=$(cat "${PSI_INSTANCES_DIR}/$cc/vless_port.txt" 2>/dev/null || echo "0")
+        local p_info=""
+        [[ "$hp" -gt 0 ]] && p_info="${p_info}Hy2:$hp "
+        [[ "$tp" -gt 0 ]] && p_info="${p_info}TUIC:$tp "
+        [[ "$vp" -gt 0 ]] && p_info="${p_info}VLESS:$vp "
+        local st_str="${red}[✗ 未运行]${re}"
+        if is_psiphon_instance_running "$cc"; then
+            st_str="${green}[✓ 运行中]${re}"
+        fi
+        echo -e "  ${green}[${idx}] [${cc}] ${cname}${re} ${st_str} (入站: ${p_info:-无})"
+        ((idx++))
+    done
+    echo "------------------------------------------------------------"
+    red  "  0. 取消并返回"
+    echo "============================================================"
+    reading "请输入要重启/修复的国家序号或代码 (如 1 或 US): " target_in
+    [[ -z "$target_in" || "$target_in" == "0" ]] && return 0
+
+    local target_cc=""
+    if [[ "$target_in" =~ ^[0-9]+$ ]]; then
+        local sel_idx=$((target_in - 1))
+        if [[ $sel_idx -ge 0 && $sel_idx -lt ${#insts[@]} ]]; then
+            target_cc="${insts[$sel_idx]}"
+        fi
+    else
+        target_cc="${target_in^^}"
+    fi
+
+    if [[ -z "$target_cc" || ! -d "${PSI_INSTANCES_DIR}/$target_cc" ]]; then
+        red "[!] 未找到指定的赛风出口组: $target_in"
+        return 1
+    fi
+
+    local cname=$(get_country_name "$target_cc")
+    local inst_dir="${PSI_INSTANCES_DIR}/${target_cc}"
+    echo
+    yellow "[*] 正在为 [$target_cc - $cname] 执行深度重启与修复..."
+
+    # 1. 停止旧进程与服务
+    echo -e "${blue}--> [1/5] 停止旧服务并清理可能残留的孤儿进程...${re}"
+    stop_psiphon_instance "$target_cc"
+    sleep 1
+
+    # 2. 检查与校准 Socks5 端口
+    echo -e "${blue}--> [2/5] 校验本地 Socks5 监听端口...${re}"
+    local socks_p=$(cat "$inst_dir/socks_port.txt" 2>/dev/null || echo "0")
+    if [[ -z "$socks_p" || "$socks_p" -le 0 ]]; then
+        socks_p=$(get_free_loopback_port)
+        echo "$socks_p" > "$inst_dir/socks_port.txt"
+        green "    重新分配本地 Socks5 端口: $socks_p"
+    else
+        echo -e "    保持本地 Socks5 端口: $socks_p"
+    fi
+
+    # 3. 重构 Psiphon 配置文件并确保核心可用
+    echo -e "${blue}--> [3/5] 重新生成 Psiphon 配置文件与种子服务器列表...${re}"
+    download_psiphon_core || return 1
+    write_psiphon_config "$socks_p" "$target_cc" "$inst_dir/psiphon.config" "$inst_dir/data"
+
+    # 4. 同步 Sing-box 路由与入站
+    echo -e "${blue}--> [4/5] 同步 Sing-box 出站与分流路由规则...${re}"
+    sync_psiphon_instance_to_singbox "$target_cc"
+    apply_changes
+
+    # 5. 启动服务并测试连通性
+    echo -e "${blue}--> [5/5] 拉起守护进程并测试出口连通性...${re}"
+    start_psiphon_instance "$target_cc"
+    echo -ne "    等待隧道握手建立 (约 3~5 秒)... "
+    sleep 3
+    echo -e "${green}完成${re}"
+
+    local out_ip=""
+    out_ip=$(curl -s4m 6 --socks5 "127.0.0.1:${socks_p}" https://api.ipify.org 2>/dev/null || curl -s4m 6 --socks5 "127.0.0.1:${socks_p}" https://ip.sb 2>/dev/null || curl -s4m 6 --socks5 "127.0.0.1:${socks_p}" https://icanhazip.com 2>/dev/null)
+
+    echo
+    if [[ -n "$out_ip" ]]; then
+        local ip_info=$(curl -s4m 3 "http://ip-api.com/json/${out_ip}?lang=zh-CN" 2>/dev/null)
+        local ip_country=$(echo "$ip_info" | jq -r '.country // empty' 2>/dev/null)
+        local ip_isp=$(echo "$ip_info" | jq -r '.isp // empty' 2>/dev/null)
+        green "============================================================"
+        green "  [✓] 赛风出口组 [$target_cc - $cname] 重启修复成功！"
+        green "============================================================"
+        green "  运行状态 : 正常运行中"
+        blue  "  出口 IP  : ${out_ip}"
+        [[ -n "$ip_country" ]] && purple "  出口归属 : ${ip_country} (${ip_isp:-未知})"
+        green "============================================================"
+    else
+        green "============================================================"
+        green "  [✓] 赛风服务已重新拉起并常驻守护！"
+        yellow "  提示: 远端隧道握手仍在进行中 (Psiphon 首次连接或重新寻址通常需 5-15 秒)"
+        yellow "        可稍后在查看链接或客户端连接进行测试"
+        green "============================================================"
+    fi
+
+    generate_psiphon_instance_links "$target_cc"
+}
+
 psiphon_multigroup_menu() {
     auto_migrate_legacy_nodes
     while true; do
@@ -2824,8 +3045,12 @@ psiphon_multigroup_menu() {
                 [[ "$hp" -gt 0 ]] && p_info="${p_info}Hy2:$hp "
                 [[ "$tp" -gt 0 ]] && p_info="${p_info}TUIC:$tp "
                 [[ "$vp" -gt 0 ]] && p_info="${p_info}VLESS:$vp "
-                green "  [$idx] [$cc] $cname"
-                blue  "      入站端口: [ ${p_info:-无} ]"
+                local st_str="${red}[✗ 未运行]${re}"
+                if is_psiphon_instance_running "$cc"; then
+                    st_str="${green}[✓ 运行中]${re}"
+                fi
+                echo -e "  ${green}[$idx] [$cc] $cname${re} $st_str"
+                echo -e "      ${blue}入站端口: [ ${p_info:-无} ]${re}"
                 ((idx++))
             done
         else
@@ -2837,11 +3062,12 @@ psiphon_multigroup_menu() {
         green  "  1. 添加赛风出口组"
         green  "  2. 查看赛风出口组链接"
         red    "  3. 删除赛风出口组"
-        blue   "  4. 重启所有赛风实例"
+        blue   "  4. 重启/修复指定赛风出口组"
+        blue   "  5. 重启所有赛风实例"
         echo "------------------------------------------------------------"
         red    "  0. 返回上一级菜单"
         echo "============================================================"
-        reading "请选择 [0-4]: " choice
+        reading "请选择 [0-5]: " choice
 
         case "$choice" in
             1) add_psiphon_instance ;;
@@ -2888,7 +3114,8 @@ psiphon_multigroup_menu() {
                     fi
                 fi
                 ;;
-            4)
+            4) repair_single_psiphon_instance ;;
+            5)
                 yellow "正在重启所有赛风实例..."
                 for cc in "${insts[@]}"; do
                     restart_psiphon_instance "$cc"
