@@ -2449,27 +2449,37 @@ psiphon_switch_manual() {
 }
 
 cleanup_psiphon_test_garbage() {
+    # 三重强杀：按临时目录特征 + 按配置文件路径 + 按进程名+tmp 路径
     pkill -9 -f "/tmp/psi_test_" 2>/dev/null || true
+    pkill -9 -f "psiphon-tunnel-core.*--config.*/tmp/" 2>/dev/null || true
+    # 验证清理效果：循环确认进程确实全部退出，最多等待 3 秒
+    local retries=0
+    while pgrep -f "/tmp/psi_test_" >/dev/null 2>&1 && [[ $retries -lt 6 ]]; do
+        pkill -9 -f "/tmp/psi_test_" 2>/dev/null || true
+        sleep 0.5
+        ((retries++))
+    done
+    # 回收所有僵尸子进程
+    wait 2>/dev/null || true
     rm -rf /tmp/psi_test_* 2>/dev/null || true
 }
 
 test_single_psiphon_country() {
     local cc="${1^^}"
     local cname=$(get_country_name "$cc")
-    
-    # 每次测试前，强杀上一个国家可能残留的测试进程，保证绝对干净的环境
+
+    # 每次测试前，强杀所有残留的测试进程并验证它们已彻底退出
     cleanup_psiphon_test_garbage
-    sleep 0.2
 
     local test_port=$(get_free_loopback_port)
-    local test_dir="/tmp/psi_test_${cc}_${$}_${RANDOM}"
+    local test_dir="/tmp/psi_test_${cc}_$$"
     mkdir -p "$test_dir/data" 2>/dev/null
 
     local cfg_file="$test_dir/psiphon.config"
     write_psiphon_config "$test_port" "$cc" "$cfg_file" "$test_dir/data"
 
     if [[ ! -x "$WORKDIR/psiphon-tunnel-core" ]]; then
-        red "  [!] Psiphon 核心程序不存在或无执行权限: $WORKDIR/psiphon-tunnel-core"
+        red "  [!] Psiphon 核心程序不存在或无执行权限"
         rm -rf "$test_dir" 2>/dev/null || true
         return 1
     fi
@@ -2479,24 +2489,24 @@ test_single_psiphon_country() {
     local test_pid=$!
 
     local egress_ip="" is_ok=false
-    local max_try=10
+    local max_try=8
     local elapsed=0
 
     for ((i=1; i<=max_try; i++)); do
-        sleep 0.6
-        elapsed=$(( elapsed + 1 ))
+        # 如果测试进程已自行退出，无需继续等待
+        if ! kill -0 "$test_pid" 2>/dev/null; then
+            elapsed=$i
+            break
+        fi
+        sleep 0.5
+        elapsed=$i
         printf "\r  [*] [%s] %-14s -> 正在握手测试中 (%ds/%ds)..." "$cc" "$cname" "$elapsed" "$max_try"
 
-        # 交替探测端点 (采用纯 HTTP 免去 TLS 握手慢的问题，并用 timeout 2 秒硬性熔断保护防止 curl hang 住)
         local probe_url="http://api.ipify.org"
         [[ $((i % 2)) -eq 0 ]] && probe_url="http://icanhazip.com"
 
-        local res
-        if command -v timeout >/dev/null 2>&1; then
-            res=$(timeout 2 curl -sx "socks5h://127.0.0.1:${test_port}" -s4 --connect-timeout 1 -m 1.5 "$probe_url" 2>/dev/null | tr -d ' \r\n')
-        else
-            res=$(curl -sx "socks5h://127.0.0.1:${test_port}" -s4 --connect-timeout 1 -m 1.5 "$probe_url" 2>/dev/null | tr -d ' \r\n')
-        fi
+        local res=""
+        res=$(timeout 2 curl -sx "socks5h://127.0.0.1:${test_port}" -s4 --connect-timeout 1 -m 1 "$probe_url" 2>/dev/null | tr -d ' \r\n') || true
 
         if [[ -n "$res" && "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             egress_ip="$res"
@@ -2505,15 +2515,25 @@ test_single_psiphon_country() {
         fi
     done
 
-    # 彻底终止当前测试进程并回收，杜绝产生僵尸进程 (Defunct/Zombie)
-    if [[ -n "$test_pid" ]] && kill -0 "$test_pid" 2>/dev/null; then
-        kill -9 "$test_pid" 2>/dev/null || true
-        wait "$test_pid" 2>/dev/null || true
-    fi
+    # === 彻底终止当前测试进程 ===
+    # 第一步：直接 SIGKILL 主 PID
+    kill -9 "$test_pid" 2>/dev/null || true
+    wait "$test_pid" 2>/dev/null || true
+    # 第二步：按配置文件路径和目录路径宽泛匹配，杀掉可能的子进程
     pkill -9 -f "$cfg_file" 2>/dev/null || true
     pkill -9 -f "$test_dir" 2>/dev/null || true
+    # 第三步：验证主 PID 确实已死，否则重试
+    local kill_retries=0
+    while kill -0 "$test_pid" 2>/dev/null && [[ $kill_retries -lt 5 ]]; do
+        kill -9 "$test_pid" 2>/dev/null || true
+        sleep 0.3
+        ((kill_retries++))
+    done
+    # 回收所有僵尸子进程
+    wait 2>/dev/null || true
     rm -rf "$test_dir" 2>/dev/null || true
-    sleep 0.1
+    # 冷却 1 秒，让内核回收 TCP TIME_WAIT 连接和文件描述符
+    sleep 1
 
     if $is_ok; then
         printf "\r\033[K"
@@ -2574,6 +2594,17 @@ psiphon_test_all() {
     local total=${#all_list[@]}
     local ok_cnt=0 fail_cnt=0
     for cc in "${all_list[@]}"; do
+        # 系统资源安全熔断：当进程数超过系统上限 80% 时立即中止
+        if [[ -f /proc/sys/kernel/pid_max ]]; then
+            local cur_pids=$(find /proc -maxdepth 1 -name '[0-9]*' -type d 2>/dev/null | wc -l)
+            local max_pids=$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 32768)
+            if [[ $cur_pids -gt $((max_pids * 80 / 100)) ]]; then
+                echo
+                red "[!] 系统进程数接近上限 (${cur_pids}/${max_pids})，为安全起见中止测试"
+                cleanup_psiphon_test_garbage
+                break
+            fi
+        fi
         echo -ne "${blue}[${idx}/${total}]${re} "
         if test_single_psiphon_country "$cc"; then
             ((ok_cnt++))
