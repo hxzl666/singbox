@@ -2816,7 +2816,8 @@ add_psiphon_instance() {
     [[ -z "$cc" ]] && { red "[!] 国家代码不能为空"; return 1; }
 
     local inst_dir="${PSI_INSTANCES_DIR}/${cc}"
-    mkdir -p "$inst_dir"
+    rm -rf "$inst_dir/data" 2>/dev/null || true
+    mkdir -p "$inst_dir/data" 2>/dev/null
 
     local socks_p=$(get_free_loopback_port)
     local cfg_file="$inst_dir/psiphon.config"
@@ -2977,9 +2978,11 @@ repair_single_psiphon_instance() {
         echo -e "    保持本地 Socks5 端口: $socks_p"
     fi
 
-    # 3. 重构 Psiphon 配置文件并确保核心可用
-    echo -e "${blue}--> [3/5] 重新生成 Psiphon 配置文件与种子服务器列表...${re}"
+    # 3. 彻底重置历史脏数据并载入纯净种子服务器列表
+    echo -e "${blue}--> [3/5] 彻底重置历史脏数据并载入纯净种子列表...${re}"
     download_psiphon_core || return 1
+    rm -rf "$inst_dir/data" 2>/dev/null || true
+    mkdir -p "$inst_dir/data" 2>/dev/null
     write_psiphon_config "$socks_p" "$target_cc" "$inst_dir/psiphon.config" "$inst_dir/data"
 
     # 4. 同步 Sing-box 路由与入站
@@ -2987,23 +2990,36 @@ repair_single_psiphon_instance() {
     sync_psiphon_instance_to_singbox "$target_cc"
     apply_changes
 
-    # 5. 启动服务并测试连通性
-    echo -e "${blue}--> [5/5] 拉起守护进程并测试出口连通性...${re}"
+    # 5. 启动服务并执行平滑动态出口连通性探测
+    echo -e "${blue}--> [5/5] 拉起守护进程并执行实时出口连通性探测...${re}"
     start_psiphon_instance "$target_cc"
-    echo -ne "    等待隧道握手建立 (约 3~5 秒)... "
-    sleep 3
-    echo -e "${green}完成${re}"
-
     local out_ip=""
-    out_ip=$(curl -s4m 6 --socks5 "127.0.0.1:${socks_p}" https://api.ipify.org 2>/dev/null || curl -s4m 6 --socks5 "127.0.0.1:${socks_p}" https://ip.sb 2>/dev/null || curl -s4m 6 --socks5 "127.0.0.1:${socks_p}" https://icanhazip.com 2>/dev/null)
+    local max_wait=10
+    local elapsed=0
+
+    for ((i=1; i<=max_wait; i++)); do
+        printf "\r    [*] 正在建立加密隧道并探测出口 IP (%ds/%ds)..." "$i" "$max_wait"
+        local res=""
+        res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks_p}" -s4 --connect-timeout 2 -m 2 "http://api.ipify.org" 2>/dev/null | tr -d ' \r\n')
+        [[ -z "$res" || ! "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks_p}" -s4 --connect-timeout 2 -m 2 "http://ipv4.icanhazip.com" 2>/dev/null | tr -d ' \r\n')
+        [[ -z "$res" || ! "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${socks_p}" -s4 --connect-timeout 2 -m 2 "https://api.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+
+        if [[ -n "$res" && "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            out_ip="$res"
+            elapsed=$i
+            break
+        fi
+        sleep 1
+    done
+    printf "\r\033[K"
 
     echo
     if [[ -n "$out_ip" ]]; then
-        local ip_info=$(curl -s4m 3 "http://ip-api.com/json/${out_ip}?lang=zh-CN" 2>/dev/null)
+        local ip_info=$(curl -s4m 4 "http://ip-api.com/json/${out_ip}?lang=zh-CN" 2>/dev/null)
         local ip_country=$(echo "$ip_info" | jq -r '.country // empty' 2>/dev/null)
         local ip_isp=$(echo "$ip_info" | jq -r '.isp // empty' 2>/dev/null)
         green "============================================================"
-        green "  [✓] 赛风出口组 [$target_cc - $cname] 重启修复成功！"
+        green "  [✓] 赛风出口组 [$target_cc - $cname] 重启修复成功！(握手耗时: 约 ${elapsed}s)"
         green "============================================================"
         green "  运行状态 : 正常运行中"
         blue  "  出口 IP  : ${out_ip}"
@@ -3012,7 +3028,7 @@ repair_single_psiphon_instance() {
     else
         green "============================================================"
         green "  [✓] 赛风服务已重新拉起并常驻守护！"
-        yellow "  提示: 远端隧道握手仍在进行中 (Psiphon 首次连接或重新寻址通常需 5-15 秒)"
+        yellow "  提示: 远端隧道握手耗时较长，守护进程已在后台持续重试"
         yellow "        可稍后在查看链接或客户端连接进行测试"
         green "============================================================"
     fi
@@ -3120,11 +3136,20 @@ psiphon_multigroup_menu() {
                 ;;
             4) repair_single_psiphon_instance ;;
             5)
-                yellow "正在重启所有赛风实例..."
+                yellow "正在重启并重置所有赛风实例..."
                 for cc in "${insts[@]}"; do
-                    restart_psiphon_instance "$cc"
+                    [[ -z "$cc" ]] && continue
+                    local idir="${PSI_INSTANCES_DIR}/${cc}"
+                    stop_psiphon_instance "$cc"
+                    rm -rf "$idir/data" 2>/dev/null || true
+                    mkdir -p "$idir/data" 2>/dev/null
+                    local socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
+                    [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
+                    echo "$socks_p" > "$idir/socks_port.txt"
+                    write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data"
+                    start_psiphon_instance "$cc"
                 done
-                green "所有赛风实例已重启并常驻守护！"
+                green "所有赛风实例已重启、清空旧缓存并重新载入种子守护！"
                 ;;
             0) return 0 ;;
             *) red "无效选项" ;;
