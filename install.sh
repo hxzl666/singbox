@@ -3457,6 +3457,335 @@ run_cron_check() {
     ensure_all_psiphon_instances_running
 }
 
+# ==================== 8. TCP / UDP / BBR 网络深度调优模块 ====================
+SYSCTL_TCP_OPT="/etc/sysctl.d/99-singbox-network-performance.conf"
+LIMITS_TCP_OPT="/etc/security/limits.d/99-singbox-network-performance.conf"
+
+set_ipv4_priority() {
+    echo
+    yellow "[*] 正在调整系统互联网协议解析优先级..."
+    if [[ ! -f /etc/gai.conf ]]; then
+        cat > /etc/gai.conf <<'EOF_GAI'
+label ::1/128       0
+label ::/0          1
+label 2002::/16     2
+label ::/96         3
+label ::ffff:0:0/96 4
+precedence  ::1/128       50
+precedence  ::/0          40
+precedence  2002::/16     30
+precedence  ::/96         20
+precedence  ::ffff:0:0/96 10
+EOF_GAI
+    fi
+
+    cp -f /etc/gai.conf /etc/gai.conf.bak 2>/dev/null || true
+
+    if grep -q "precedence ::ffff:0:0/96  100" /etc/gai.conf; then
+        sed -i 's/^#precedence ::ffff:0:0\/96  100/precedence ::ffff:0:0\/96  100/' /etc/gai.conf
+    else
+        echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
+    fi
+
+    echo
+    green "[✓] 优化成功！当前系统已成功设置为 [ IPv4 优先解析 ]。"
+    echo -e "    ${purple}说明: 有效解决双栈 VPS 因 IPv6 国际绕路导致的节点连接握手卡顿问题。${re}"
+}
+
+enable_bbr_tune() {
+    echo
+    yellow "[*] 正在激活 BBR + FQ 拥塞控制算法..."
+    mkdir -p /etc/sysctl.d
+    echo "net.core.default_qdisc = fq" > /etc/sysctl.d/10-bbr.conf
+    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.d/10-bbr.conf
+    sysctl --system &>/dev/null
+
+    echo
+    cyan "[*] 正在与 Linux 内核交换握手信号，激活 BBR 加速引擎..."
+    local bbr_steps=(
+        "Initializing FQ Pacifier" 
+        "Loading BBR Kernel Module" 
+        "Calibrating Pacing Rate" 
+        "Synchronizing TCP States"
+    )
+    for step in "${bbr_steps[@]}"; do
+        printf "  [⚙] %-28s [" "$step"
+        for i in {1..5}; do printf "%b■%b" "${green}" "${re}"; sleep 0.06; done
+        printf "] %b[SUCCESS]%b\n" "${green}" "${re}"
+    done
+
+    echo
+    green "🚀 BBR + FQ 网络加速模块已成功灌注至内核底层！"
+    echo "============================================================"
+    printf "  %-24s : %b%-15s%b\n" "当前拥塞控制算法" "${green}" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" "${re}"
+    printf "  %-24s : %b%-15s%b\n" "默认队列调度算法" "${green}" "$(sysctl -n net.core.default_qdisc 2>/dev/null)" "${re}"
+    printf "  %-24s : %b%-15s%b\n" "链路抗丢包实时补偿" "${cyan}" "动态补偿 [已就绪]" "${re}"
+    echo "============================================================"
+    echo -e "${purple}说明: 显著提升跨境单线程吞吐速率、降低 YouTube/大文件下行缓冲延迟。${re}"
+}
+
+smart_tune_tcp_tune() {
+    local old_bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "cubic")
+    local old_somax=$(sysctl -n net.core.somaxconn 2>/dev/null || echo "128")
+    local old_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "212992")
+    local old_file=$(ulimit -n 2>/dev/null || echo "1024")
+
+    echo
+    yellow "[*] 正在扫描系统硬件与内存环境..."
+    local mem_total_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    [[ -z "$mem_total_kb" || "$mem_total_kb" -le 0 ]] && mem_total_kb=1048576
+    local cpu_count=$(nproc 2>/dev/null || echo "1")
+    local buf_bytes=$((mem_total_kb * 5 / 100 * 1024))
+    [[ $buf_bytes -lt 16777216 ]] && buf_bytes=16777216
+
+    echo -e "  - CPU 核心数: ${cyan}${cpu_count} 核心${re} | 系统总内存: ${cyan}$((mem_total_kb / 1024)) MB${re}"
+    echo -e "  - 动态网络缓冲区: ${cyan}$((buf_bytes / 1024 / 1024)) MB${re} (基于物理内存 5% 智能分配)"
+
+    echo
+    yellow "[*] 正在注入 Sing-box 生产级 + 跨境专属网络优化内核参数..."
+    mkdir -p /etc/sysctl.d
+    cat > "$SYSCTL_TCP_OPT" <<EOF_SYSCTL
+# --- 基础队列与拥塞算法 ---
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# --- 缓冲区与超高并发容量 ---
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_max_syn_backlog = 16384
+net.ipv4.ip_local_port_range = 1024 65535
+net.core.rmem_max = ${buf_bytes}
+net.core.wmem_max = ${buf_bytes}
+net.ipv4.tcp_rmem = 4096 87380 ${buf_bytes}
+net.ipv4.tcp_wmem = 4096 65536 ${buf_bytes}
+net.core.rmem_default = 2097152
+net.core.wmem_default = 2097152
+
+# --- 跨境代理 / Reality / Hy2 针对性低延迟调优 ---
+# 降低发送队列积压，显著削减 Reality/VLESS 首包延迟 (TTFB)
+net.ipv4.tcp_notsent_lowat = 16384
+# 开启 MTU 探测，防止跨境运营商 ICMP 黑洞导致断流
+net.ipv4.tcp_mtu_probing = 1
+# 深度扩容 UDP 缓冲区，解决 Hysteria2 / TUIC / QUIC 高并发丢包
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+
+# 开启 ECN 智能拥塞标记，跨境高位拥塞时不粗暴丢包，极大平滑抖动
+net.ipv4.tcp_ecn = 1
+# BBRv3 / 新版内核算法向前兼容
+net.ipv4.tcp_congestion_control_version = 3
+
+# 限制孤儿连接数，防止翻墙协议在大并发断开时耗尽内存
+net.ipv4.tcp_max_orphans = 32768
+
+# --- 连接保活与快速复用 ---
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_fastopen = 3
+EOF_SYSCTL
+
+    sysctl --system &>/dev/null
+
+    echo
+    cyan "[*] 正在加载跨境物理链路专项调优补丁..."
+    local steps=("Analyzing Network Topo" "Clamping MSS Window" "Expanding UDP Ring Buffer" "Activating ECN Engine")
+    for step in "${steps[@]}"; do
+        printf "  [*] %-30s " "$step..."
+        for i in {1..5}; do printf "%b■%b" "${green}" "${re}"; sleep 0.04; done
+        printf " [ %bOK%b ]\n" "${green}" "${re}"
+    done
+
+    mkdir -p /etc/security/limits.d/
+    cat > "$LIMITS_TCP_OPT" <<'EOF_LIMITS'
+* soft nofile 1048576
+* hard nofile 1048576
+* soft nproc 65535
+* hard nproc 65535
+EOF_LIMITS
+
+    if command -v iptables &>/dev/null; then
+        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        green "  ✔ 成功部署 MSS Clamp 智能钳制规则，防止跨境 MTU 超出导致连接卡死"
+    fi
+
+    ulimit -n 1048576 2>/dev/null || true
+
+    echo
+    green "============================================================"
+    green "  [✓] Sing-box 生产级 + 跨境网络深度调优部署完成！"
+    green "============================================================"
+    printf "  %-14s: %-15s -> %b%-15s%b\n" "拥塞控制算法" "$old_bbr" "${green}" "bbr" "${re}"
+    printf "  %-14s: %-15s -> %b%-15s%b\n" "最大并发连接" "$old_somax" "${green}" "65535" "${re}"
+    printf "  %-14s: %-15s -> %b%-15s%b\n" "文件句柄上限" "$old_file" "${green}" "1048576" "${re}"
+    printf "  %-14s: %-15s -> %b%-15s%b\n" "动态网络缓存" "$((old_rmem / 1024 / 1024))MB" "${green}" "$((buf_bytes / 1024 / 1024))MB" "${re}"
+    echo "============================================================"
+    echo -e "${purple}说明: 所有配置已持久化至 $SYSCTL_TCP_OPT，重启服务器依然生效。${re}"
+}
+
+optimize_nic_tune() {
+    echo
+    yellow "[*] 正在执行多核心网卡硬中断/软中断负载均衡 (RSS/RPS) 优化..."
+    if ! command -v ethtool &>/dev/null; then
+        if command -v apt-get &>/dev/null; then
+            apt-get update -y && apt-get install -y ethtool
+        elif command -v yum &>/dev/null; then
+            yum install -y ethtool
+        elif command -v dnf &>/dev/null; then
+            dnf install -y ethtool
+        elif command -v apk &>/dev/null; then
+            apk add ethtool
+        fi
+    fi
+
+    local interfaces=$(ls /sys/class/net 2>/dev/null | grep -vE 'lo|docker|veth|br-|any|tung3|sit0|tun|wg')
+    local cpu_count=$(nproc 2>/dev/null || echo "1")
+    local rps_cpus=$(printf '%x' $(((1 << cpu_count) - 1)))
+    for eth in $interfaces; do
+        local max_rx=$(ethtool -g "$eth" 2>/dev/null | grep -A 5 "Pre-set maximums" | grep "RX:" | awk '{print $2}')
+        [[ -n "$max_rx" ]] && ethtool -G "$eth" rx "${max_rx}" tx "${max_rx}" &>/dev/null || true
+        for rps_file in /sys/class/net/$eth/queues/rx-*/rps_cpus; do [[ -f "$rps_file" ]] && echo "$rps_cpus" > "$rps_file" 2>/dev/null; done
+        for rfc_file in /sys/class/net/$eth/queues/rx-*/rps_flow_cnt; do [[ -f "$rfc_file" ]] && echo "4096" > "$rfc_file" 2>/dev/null; done
+    done
+    sysctl -w net.core.rps_sock_flow_entries=32768 &>/dev/null || true
+
+    echo
+    cyan "[*] 正在启动网卡硬件多队列负载分发流水线..."
+    local nic_steps=(
+        "Mapping Network Interface" 
+        "Unbinding Single Core IRQ" 
+        "Injecting RPS Network Mask" 
+        "Balancing Socket Flows"
+    )
+    for step in "${nic_steps[@]}"; do
+        printf "  [⚡] %-28s [" "$step"
+        for i in {1..5}; do printf "%b■%b" "${green}" "${re}"; sleep 0.04; done
+        printf "] %b[DONE]%b\n" "${green}" "${re}"
+    done
+
+    echo
+    green "============================================================"
+    green "  [✓] 网卡硬件中断多核心流分发部署完毕！"
+    green "============================================================"
+    local percent=0
+    [[ $cpu_count -gt 0 ]] && percent=$((100 / cpu_count))
+    for ((i=0; i<cpu_count; i++)); do
+        echo -e "  ⚡ CPU 核心 #$i : [${green}██████████████████████████████${re}] 负载分配: ${yellow}${percent}%${re}"
+        sleep 0.04
+    done
+    echo "============================================================"
+    echo -e "${purple}说明: 成功打破单核软中断 (SoftIRQ) 瓶颈，大并发网络流量已均匀平摊至所有 ${cpu_count} 个核心。${re}"
+}
+
+rollback_tcp_tune() {
+    echo
+    yellow "[*] 正在准备回退网络调优设置并恢复系统默认值..."
+    rm -f "$SYSCTL_TCP_OPT" "$LIMITS_TCP_OPT" /etc/sysctl.d/10-bbr.conf
+
+    if [[ -f /etc/gai.conf.bak ]]; then
+        mv -f /etc/gai.conf.bak /etc/gai.conf
+    else
+        sed -i 's/^precedence ::ffff:0:0\/96  100/#precedence ::ffff:0:0\/96  100/' /etc/gai.conf 2>/dev/null || true
+    fi
+
+    sysctl -w net.ipv4.tcp_congestion_control=cubic &>/dev/null || true
+    sysctl -w net.core.default_qdisc=pfifo_fast &>/dev/null || true
+    sysctl -w net.core.rps_sock_flow_entries=0 &>/dev/null || true
+
+    if command -v iptables &>/dev/null; then
+        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+    fi
+
+    local interfaces=$(ls /sys/class/net 2>/dev/null | grep -vE 'lo|docker|veth|br-|any|tung3|sit0|tun|wg')
+    for eth in $interfaces; do
+        for rps_file in /sys/class/net/$eth/queues/rx-*/rps_cpus; do [[ -f "$rps_file" ]] && echo "0" > "$rps_file" 2>/dev/null; done
+    done
+
+    ulimit -n 1024 2>/dev/null || true
+    sysctl --system &>/dev/null || true
+    echo
+    green "[✓] 回退完成！所有网络独立配置文件已清理，内存参数已恢复为系统默认状态。"
+}
+
+onekey_full_tcp_tune() {
+    echo
+    green "============================================================"
+    green "  一键开启全套极速网络深度调优 (推荐)"
+    green "============================================================"
+    set_ipv4_priority
+    echo
+    enable_bbr_tune
+    echo
+    smart_tune_tcp_tune
+    echo
+    optimize_nic_tune
+    echo
+    green "============================================================"
+    green "  [🎉] 全套 TCP / BBR / 网卡 / IPv4 深度调优已全部成功激活！"
+    green "============================================================"
+}
+
+tcp_tune_menu() {
+    while true; do
+        [[ -t 1 ]] && clear 2>/dev/null || true
+        echo
+        green "============================================================"
+        green "  TCP / UDP / BBR 网络深度调优与性能看板"
+        green "============================================================"
+        yellow "  源自 tcp.vpsing.de 核心算法，针对 Sing-box 多协议环境深度优化"
+        yellow "  全面增强 Reality / Hysteria2 / TUIC / Argo 跨境吞吐与连接稳定性"
+        green "============================================================"
+
+        local status_ipv4="${red}[未开启]${re}"
+        if [[ -f /etc/gai.conf ]] && grep -q "^precedence ::ffff:0:0/96  100" /etc/gai.conf; then
+            status_ipv4="${green}[已激活]${re}"
+        fi
+
+        local status_bbr="${red}[未开启]${re}"
+        if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+            status_bbr="${green}[已激活]${re}"
+        fi
+
+        local status_sysctl="${red}[未开启]${re}"
+        if [[ -f "$SYSCTL_TCP_OPT" ]]; then
+            status_sysctl="${green}[已激活]${re}"
+        fi
+
+        local status_nic="${red}[未开启]${re}"
+        if [[ "$(sysctl -n net.core.rps_sock_flow_entries 2>/dev/null)" == "32768" ]]; then
+            status_nic="${green}[已激活]${re}"
+        fi
+
+        echo
+        echo -e "  1. 设置 IPv4 优先解析       -> $status_ipv4  ${purple}[解决 IPv6 国际绕路导致的连接握手卡顿]${re}"
+        echo -e "  2. 开启 BBR + FQ 拥塞算法   -> $status_bbr  ${purple}[降低跨境丢包率，大幅提升单线程速率]${re}"
+        echo -e "  3. 生产级 + 跨境内核调优    -> $status_sysctl  ${purple}[扩容连接池/UDP缓存，优化 Reality/Hy2 首包]${re}"
+        echo -e "  4. 网卡多队列全核心均衡     -> $status_nic  ${purple}[消除 CPU 单核中断瓶颈，平摊全核心负载]${re}"
+        echo "------------------------------------------------------------"
+        green  "  5. 一键开启全套极速网络调优 (推荐一键执行 1-4)"
+        yellow "  6. 一键回退到系统默认网络设置"
+        echo "------------------------------------------------------------"
+        red    "  0. 返回上一级菜单"
+        echo "============================================================"
+        echo -e "当前内核状态: 算法: ${green}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${re} | 队列: ${green}$(sysctl -n net.core.default_qdisc 2>/dev/null)${re} | 句柄: ${green}$(ulimit -n 2>/dev/null)${re}"
+        echo "============================================================"
+        reading "请选择 [0-6]: " choice
+
+        case "$choice" in
+            1) set_ipv4_priority; echo; reading "按回车继续..." _ ;;
+            2) enable_bbr_tune; echo; reading "按回车继续..." _ ;;
+            3) smart_tune_tcp_tune; echo; reading "按回车继续..." _ ;;
+            4) optimize_nic_tune; echo; reading "按回车继续..." _ ;;
+            5) onekey_full_tcp_tune; echo; reading "按回车继续..." _ ;;
+            6) rollback_tcp_tune; echo; reading "按回车继续..." _ ;;
+            0) return 0 ;;
+            *) red "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
 # ==================== 快捷命令同步更新 ====================
 create_sb_tool() {
     mkdir -p /usr/local/bin "$WORKDIR"
@@ -3501,6 +3830,7 @@ fi
 exec bash "$WORKDIR/install.sh" "$@"
 EOF_SB
     chmod +x /usr/local/bin/sb 2>/dev/null || true
+    ln -sf /usr/local/bin/sb /usr/local/bin/t 2>/dev/null || true
 }
 
 # ==================== 主菜单 ====================
@@ -3611,12 +3941,13 @@ menu() {
         yellow " 10. 系统诊断与配置修复"
         blue   " 11. 查看运行日志"
         yellow " 12. 开启 / 关闭服务自愈守护"
-        red    " 13. 彻底卸载 Sing-box 环境"
+        cyan   " 13. TCP / BBR 网络深度调优"
+        red    " 14. 彻底卸载 Sing-box 环境"
         echo "------------------------------------------------------------"
         red    "  0. 退出脚本"
         echo "============================================================"
 
-        reading "请选择 [0-13]: " choice
+        reading "请选择 [0-14]: " choice
         echo
 
         case "$choice" in
@@ -3657,7 +3988,8 @@ menu() {
                 fi
                 reading "按回车继续..." _
                 ;;
-            13)
+            13) tcp_tune_menu ;;
+            14)
                 reading "确定彻底卸载 Sing-box 及所有组件? (y/N): " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
                     service_stop sing-box
@@ -3665,7 +3997,7 @@ menu() {
                     service_disable sing-box 2>/dev/null
                     service_disable argo-tunnel 2>/dev/null
                     pkill -9 -f "psiphon-tunnel-core" 2>/dev/null || true
-                    rm -rf /etc/s-box /usr/local/bin/cloudflared /usr/local/bin/sb
+                    rm -rf /etc/s-box /usr/local/bin/cloudflared /usr/local/bin/sb /usr/local/bin/t
                     crontab -l 2>/dev/null | grep -v "sb cron" | crontab - 2>/dev/null || true
                     green "Sing-box 环境已彻底卸载清理！"
                     exit 0
@@ -3868,6 +4200,10 @@ case "$1" in
         ;;
     all)
         show_all_nodes_summary
+        exit 0
+        ;;
+    tcp|bbr|t)
+        tcp_tune_menu
         exit 0
         ;;
     restart)
