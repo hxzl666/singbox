@@ -2449,33 +2449,38 @@ psiphon_switch_manual() {
 }
 
 cleanup_psiphon_test_garbage() {
-    # 三重强杀：按临时目录特征 + 按配置文件路径 + 按进程名+tmp 路径
+    # 清理测试专用的临时进程和目录
     pkill -9 -f "/tmp/psi_test_" 2>/dev/null || true
     pkill -9 -f "psiphon-tunnel-core.*--config.*/tmp/" 2>/dev/null || true
-    # 验证清理效果：循环确认进程确实全部退出，最多等待 3 秒
-    local retries=0
-    while pgrep -f "/tmp/psi_test_" >/dev/null 2>&1 && [[ $retries -lt 6 ]]; do
-        pkill -9 -f "/tmp/psi_test_" 2>/dev/null || true
-        sleep 0.5
-        ((retries++))
-    done
-    # 回收所有僵尸子进程
     wait 2>/dev/null || true
     rm -rf /tmp/psi_test_* 2>/dev/null || true
 }
 
+# 单进程复用架构：stop → 改配置 → start → 探测出口 IP → stop
+# 不再为每个国家单独 fork 临时进程，彻底杜绝进程累积耗尽系统资源
 test_single_psiphon_country() {
     local cc="${1^^}"
     local cname=$(get_country_name "$cc")
-
-    # 每次测试前，强杀所有残留的测试进程并验证它们已彻底退出
-    cleanup_psiphon_test_garbage
-
-    local test_port=$(get_free_loopback_port)
-    local test_dir="/tmp/psi_test_${cc}_$$"
-    mkdir -p "$test_dir/data" 2>/dev/null
-
+    local test_port=21999
+    local test_dir="/tmp/psi_test_${cc}"
     local cfg_file="$test_dir/psiphon.config"
+    local log_file="$test_dir/test.log"
+    local pid_file="$test_dir/test.pid"
+
+    # 1. 彻底杀掉上一轮测试残留
+    if [[ -f "$pid_file" ]]; then
+        local old_pid=$(cat "$pid_file" 2>/dev/null)
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            kill -9 "$old_pid" 2>/dev/null || true
+            wait "$old_pid" 2>/dev/null || true
+        fi
+    fi
+    cleanup_psiphon_test_garbage
+    sleep 0.5
+
+    # 2. 写入当前国家的配置文件并启动单个测试进程
+    rm -rf "$test_dir" 2>/dev/null || true
+    mkdir -p "$test_dir/data" 2>/dev/null
     write_psiphon_config "$test_port" "$cc" "$cfg_file" "$test_dir/data"
 
     if [[ ! -x "$WORKDIR/psiphon-tunnel-core" ]]; then
@@ -2484,29 +2489,29 @@ test_single_psiphon_country() {
         return 1
     fi
 
-    # 启动后台临时测试进程
-    "$WORKDIR/psiphon-tunnel-core" --config "$cfg_file" > "$test_dir/test.log" 2>&1 &
+    : > "$log_file"
+    "$WORKDIR/psiphon-tunnel-core" --config "$cfg_file" >> "$log_file" 2>&1 &
     local test_pid=$!
+    echo "$test_pid" > "$pid_file"
 
+    # 3. 探测循环：等待 SOCKS 端口就绪后请求出口 IP
     local egress_ip="" is_ok=false
-    local max_try=8
+    local max_wait=8
     local elapsed=0
 
-    for ((i=1; i<=max_try; i++)); do
-        # 如果测试进程已自行退出，无需继续等待
+    for ((i=1; i<=max_wait; i++)); do
+        # 如果进程已自行退出，无需继续
         if ! kill -0 "$test_pid" 2>/dev/null; then
             elapsed=$i
             break
         fi
-        sleep 0.5
+        sleep 1
         elapsed=$i
-        printf "\r  [*] [%s] %-14s -> 正在握手测试中 (%ds/%ds)..." "$cc" "$cname" "$elapsed" "$max_try"
+        printf "\r  [*] [%s] %-14s -> 正在握手测试中 (%ds/%ds)..." "$cc" "$cname" "$elapsed" "$max_wait"
 
-        local probe_url="http://api.ipify.org"
-        [[ $((i % 2)) -eq 0 ]] && probe_url="http://icanhazip.com"
-
+        # 尝试通过 SOCKS5 代理探测出口 IP
         local res=""
-        res=$(timeout 2 curl -sx "socks5h://127.0.0.1:${test_port}" -s4 --connect-timeout 1 -m 1 "$probe_url" 2>/dev/null | tr -d ' \r\n') || true
+        res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${test_port}" -s4 --connect-timeout 1 -m 2 "http://api.ipify.org" 2>/dev/null | tr -d ' \r\n') || true
 
         if [[ -n "$res" && "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             egress_ip="$res"
@@ -2515,24 +2520,20 @@ test_single_psiphon_country() {
         fi
     done
 
-    # === 彻底终止当前测试进程 ===
-    # 第一步：直接 SIGKILL 主 PID
+    # 4. 彻底终止本次测试进程 (先 SIGKILL 再验证，确保绝对退出)
     kill -9 "$test_pid" 2>/dev/null || true
     wait "$test_pid" 2>/dev/null || true
-    # 第二步：按配置文件路径和目录路径宽泛匹配，杀掉可能的子进程
     pkill -9 -f "$cfg_file" 2>/dev/null || true
-    pkill -9 -f "$test_dir" 2>/dev/null || true
-    # 第三步：验证主 PID 确实已死，否则重试
-    local kill_retries=0
-    while kill -0 "$test_pid" 2>/dev/null && [[ $kill_retries -lt 5 ]]; do
+    # 验证进程确实已死
+    local retries=0
+    while kill -0 "$test_pid" 2>/dev/null && [[ $retries -lt 5 ]]; do
         kill -9 "$test_pid" 2>/dev/null || true
         sleep 0.3
-        ((kill_retries++))
+        ((retries++))
     done
-    # 回收所有僵尸子进程
     wait 2>/dev/null || true
     rm -rf "$test_dir" 2>/dev/null || true
-    # 冷却 1 秒，让内核回收 TCP TIME_WAIT 连接和文件描述符
+    # 冷却等待：给系统时间回收 TCP 连接和文件描述符
     sleep 1
 
     if $is_ok; then
@@ -2549,7 +2550,7 @@ test_single_psiphon_country() {
 psiphon_quick_test() {
     download_psiphon_core || return 1
     cleanup_psiphon_test_garbage
-    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; return 1' INT TERM
+    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; start_main_psiphon 2>/dev/null; ensure_all_psiphon_instances_running 2>/dev/null; green "[✓] 赛风服务已恢复"; return 1' INT TERM
 
     echo
     green "============================================================"
@@ -2572,12 +2573,20 @@ psiphon_quick_test() {
     green "============================================================"
     green "  快速测试完毕！共测试 4 个国家: 可用 [$ok_cnt] / 不可用 [$fail_cnt]"
     green "============================================================"
+    # 恢复主赛风进程和副节点赛风实例
+    echo
+    yellow "[*] 正在恢复赛风服务..."
+    if is_main_psiphon_running 2>/dev/null || [[ "$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null)" ]]; then
+        start_main_psiphon 2>/dev/null
+    fi
+    ensure_all_psiphon_instances_running 2>/dev/null
+    green "[✓] 赛风服务已恢复"
 }
 
 psiphon_test_all() {
     download_psiphon_core || return 1
     cleanup_psiphon_test_garbage
-    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; return 1' INT TERM
+    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; start_main_psiphon 2>/dev/null; ensure_all_psiphon_instances_running 2>/dev/null; green "[✓] 赛风服务已恢复"; return 1' INT TERM
 
     echo
     green "============================================================"
@@ -2619,12 +2628,20 @@ psiphon_test_all() {
     green "============================================================"
     green "  全部国家测试完毕！共测试 ${total} 个国家: 可用 [$ok_cnt] / 不可用 [$fail_cnt]"
     green "============================================================"
+    # 恢复主赛风进程和副节点赛风实例
+    echo
+    yellow "[*] 正在恢复赛风服务..."
+    if is_main_psiphon_running 2>/dev/null || [[ "$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null)" ]]; then
+        start_main_psiphon 2>/dev/null
+    fi
+    ensure_all_psiphon_instances_running 2>/dev/null
+    green "[✓] 赛风服务已恢复"
 }
 
 psiphon_custom_test() {
     download_psiphon_core || return 1
     cleanup_psiphon_test_garbage
-    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; return 1' INT TERM
+    trap 'cleanup_psiphon_test_garbage; echo; red "[!] 测试已手动中断并清理残留进程"; start_main_psiphon 2>/dev/null; ensure_all_psiphon_instances_running 2>/dev/null; green "[✓] 赛风服务已恢复"; return 1' INT TERM
 
     echo
     green "============================================================"
@@ -2645,6 +2662,14 @@ psiphon_custom_test() {
     trap - INT TERM
     echo
     green "[✓] 自定义测试完毕！"
+    # 恢复主赛风进程和副节点赛风实例
+    echo
+    yellow "[*] 正在恢复赛风服务..."
+    if is_main_psiphon_running 2>/dev/null || [[ "$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null)" ]]; then
+        start_main_psiphon 2>/dev/null
+    fi
+    ensure_all_psiphon_instances_running 2>/dev/null
+    green "[✓] 赛风服务已恢复"
 }
 
 psiphon_view_log() {
