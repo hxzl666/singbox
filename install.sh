@@ -476,44 +476,24 @@ is_psiphon_instance_running() {
 # 统一的副节点出站进程启停与检测接口
 start_secondary_egress() {
     local cc="${1^^}"
-    local mode=$(get_psiphon_egress_mode "$cc")
-    if [[ "$mode" == "cfon" ]]; then
-        stop_psiphon_instance "$cc"
-        start_cfon_instance "$cc"
-    else
-        stop_cfon_instance "$cc"
-        start_psiphon_instance "$cc"
-    fi
+    start_psiphon_instance "$cc"
 }
 
 stop_secondary_egress() {
     local cc="${1^^}"
     stop_psiphon_instance "$cc"
-    stop_cfon_instance "$cc"
 }
 
 is_secondary_egress_running() {
     local cc="${1^^}"
-    local mode=$(get_psiphon_egress_mode "$cc")
-    if [[ "$mode" == "cfon" ]]; then
-        is_cfon_instance_running "$cc"
-    else
-        is_psiphon_instance_running "$cc"
-    fi
+    is_psiphon_instance_running "$cc"
 }
 
 restart_psiphon_instance() {
     local cc="${1^^}"
-    local mode=$(get_psiphon_egress_mode "$cc")
-    if [[ "$mode" == "cfon" ]]; then
-        stop_cfon_instance "$cc"
-        sleep 1
-        start_cfon_instance "$cc"
-    else
-        stop_psiphon_instance "$cc"
-        sleep 1
-        start_psiphon_instance "$cc"
-    fi
+    stop_psiphon_instance "$cc"
+    sleep 1
+    start_psiphon_instance "$cc"
 }
 
 # ==================== IP 与端口获取 ====================
