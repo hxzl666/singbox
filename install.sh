@@ -132,6 +132,11 @@ service_start() {
 
 service_stop() {
     local name=$1
+    if [[ "$name" == "sing-box" ]]; then
+        systemctl stop sing-box >/dev/null 2>&1 || true
+        pkill -9 -f "/etc/s-box/sing-box.*run" >/dev/null 2>&1 || true
+        pkill -9 -f "/etc/s-box/sing-box" >/dev/null 2>&1 || true
+    fi
     if $IS_OPENRC; then
         rc-service "$name" stop >/dev/null 2>&1
     elif $IS_DIRECT; then
@@ -153,15 +158,9 @@ service_stop() {
 
 service_restart() {
     local name=$1
-    if $IS_OPENRC; then
-        rc-service "$name" restart >/dev/null 2>&1
-    elif $IS_DIRECT; then
-        service_stop "$name"
-        sleep 1
-        service_start "$name"
-    else
-        systemctl restart "$name" >/dev/null 2>&1
-    fi
+    service_stop "$name"
+    sleep 1
+    service_start "$name"
 }
 
 service_is_active() {
@@ -704,38 +703,41 @@ warp_egress_test() {
     yellow "[*] 正在探测 IPv4 出口路由..."
     local ipv4="" country4="" region4="" city4="" isp4="" json4=""
     
-    # 优先请求 api-ipv4.ip.sb/geoip 一步获取 IP 和归属地
-    json4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/geoip" 2>/dev/null)
-    if [[ -n "$json4" ]] && echo "$json4" | jq -e '.ip' >/dev/null 2>&1; then
-        ipv4=$(echo "$json4" | jq -r '.ip // empty' 2>/dev/null)
-        country4=$(echo "$json4" | jq -r '.country // empty' 2>/dev/null)
-        region4=$(echo "$json4" | jq -r '.region // empty' 2>/dev/null)
-        city4=$(echo "$json4" | jq -r '.city // empty' 2>/dev/null)
-        isp4=$(echo "$json4" | jq -r '.isp // .organization // .asn_organization // empty' 2>/dev/null)
+    # 优先采用 0 依赖官方 Trace 端点 (毫秒级响应)
+    local trace4
+    trace4=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s4 --connect-timeout 2 -m 4 "http://1.1.1.1/cdn-cgi/trace" 2>/dev/null)
+    if [[ -n "$trace4" ]] && echo "$trace4" | grep -q "ip="; then
+        ipv4=$(echo "$trace4" | awk -F= '/^ip=/{print $2}' | tr -d ' \r\n')
     fi
 
-    # 纯文本端点重试
-    if [[ -z "$ipv4" ]]; then
-        ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
-        [[ -z "$ipv4" || ! "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
-            ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api.ipify.org" 2>/dev/null | tr -d ' \r\n')
+    # 备用源 1: ipify
+    if [[ -z "$ipv4" || ! "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ipv4=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s4 --connect-timeout 2 -m 3 "http://api.ipify.org" 2>/dev/null | tr -d ' \r\n')
+    fi
+
+    # 备用源 2: icanhazip
+    if [[ -z "$ipv4" || ! "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ipv4=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s4 --connect-timeout 2 -m 3 "http://ipv4.icanhazip.com" 2>/dev/null | tr -d ' \r\n')
+    fi
+
+    # 备用源 3: ip.sb
+    if [[ -z "$ipv4" || ! "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ipv4=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s4 --connect-timeout 2 -m 3 "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
     fi
 
     # 赛风模式备用探测
     if [[ -z "$ipv4" && "$psi_en" == "true" ]]; then
         local psi_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
-        ipv4=$(curl -sx "socks5h://127.0.0.1:${psi_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+        ipv4=$(curl -sx "socks5://127.0.0.1:${psi_port}" -s4 --connect-timeout 2 -m 3 "http://1.1.1.1/cdn-cgi/trace" 2>/dev/null | awk -F= '/^ip=/{print $2}' | tr -d ' \r\n')
     fi
 
     if [[ -n "$ipv4" && "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        if [[ -z "$country4" ]]; then
-            local info4
-            info4=$(curl -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api.ip.sb/geoip/${ipv4}" 2>/dev/null || curl -s --connect-timeout 3 -m 5 "http://ip-api.com/json/${ipv4}?lang=zh-CN" 2>/dev/null)
-            country4=$(echo "$info4" | jq -r '.country // .country_name // empty' 2>/dev/null)
-            region4=$(echo "$info4" | jq -r '.region // .regionName // empty' 2>/dev/null)
-            city4=$(echo "$info4" | jq -r '.city // empty' 2>/dev/null)
-            isp4=$(echo "$info4" | jq -r '.isp // .organization // empty' 2>/dev/null)
-        fi
+        local info4
+        info4=$(curl -s4 --connect-timeout 3 -m 4 "http://ip-api.com/json/${ipv4}?lang=zh-CN" 2>/dev/null || curl -s4 --connect-timeout 3 -m 4 "https://api.ip.sb/geoip/${ipv4}" 2>/dev/null)
+        country4=$(echo "$info4" | jq -r '.country // .country_name // empty' 2>/dev/null)
+        region4=$(echo "$info4" | jq -r '.region // .regionName // empty' 2>/dev/null)
+        city4=$(echo "$info4" | jq -r '.city // empty' 2>/dev/null)
+        isp4=$(echo "$info4" | jq -r '.isp // .organization // empty' 2>/dev/null)
 
         green "  [✓] IPv4 出口 IP : ${ipv4}"
         [[ -n "$country4" || -n "$city4" ]] && blue  "      出口国家地区 : ${country4:-未知} - ${region4} ${city4}"
@@ -748,34 +750,37 @@ warp_egress_test() {
 
     # 2. 探测 IPv6 出口
     yellow "[*] 正在探测 IPv6 出口路由..."
-    local ipv6="" country6="" region6="" city6="" isp6="" json6=""
+    local ipv6="" country6="" region6="" city6="" isp6=""
 
-    # 优先请求 api-ipv6.ip.sb/geoip
-    json6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/geoip" 2>/dev/null)
-    if [[ -n "$json6" ]] && echo "$json6" | jq -e '.ip' >/dev/null 2>&1; then
-        ipv6=$(echo "$json6" | jq -r '.ip // empty' 2>/dev/null)
-        country6=$(echo "$json6" | jq -r '.country // empty' 2>/dev/null)
-        region6=$(echo "$json6" | jq -r '.region // empty' 2>/dev/null)
-        city6=$(echo "$json6" | jq -r '.city // empty' 2>/dev/null)
-        isp6=$(echo "$json6" | jq -r '.isp // .organization // .asn_organization // empty' 2>/dev/null)
+    # 优先采用 0 依赖官方 Trace 端点 (毫秒级响应)
+    local trace6
+    trace6=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s6 --connect-timeout 2 -m 4 "http://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null)
+    if [[ -n "$trace6" ]] && echo "$trace6" | grep -q "ip="; then
+        ipv6=$(echo "$trace6" | awk -F= '/^ip=/{print $2}' | tr -d ' \r\n')
     fi
 
-    # 纯文本端点重试
-    if [[ -z "$ipv6" ]]; then
-        ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
-        [[ -z "$ipv6" || ! "$ipv6" =~ : ]] && \
-            ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api6.ipify.org" 2>/dev/null | tr -d ' \r\n')
+    # 备用源 1: ipify
+    if [[ -z "$ipv6" || ! "$ipv6" =~ : ]]; then
+        ipv6=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s6 --connect-timeout 2 -m 3 "http://api6.ipify.org" 2>/dev/null | tr -d ' \r\n')
+    fi
+
+    # 备用源 2: icanhazip
+    if [[ -z "$ipv6" || ! "$ipv6" =~ : ]]; then
+        ipv6=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s6 --connect-timeout 2 -m 3 "http://ipv6.icanhazip.com" 2>/dev/null | tr -d ' \r\n')
+    fi
+
+    # 备用源 3: ip.sb
+    if [[ -z "$ipv6" || ! "$ipv6" =~ : ]]; then
+        ipv6=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s6 --connect-timeout 2 -m 3 "https://api-ipv6.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
     fi
 
     if [[ -n "$ipv6" && "$ipv6" =~ : ]]; then
-        if [[ -z "$country6" ]]; then
-            local info6
-            info6=$(curl -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api.ip.sb/geoip/${ipv6}" 2>/dev/null || curl -s --connect-timeout 2 -m 4 "http://ip-api.com/json/${ipv6}?lang=zh-CN" 2>/dev/null)
-            country6=$(echo "$info6" | jq -r '.country // .country_name // empty' 2>/dev/null)
-            region6=$(echo "$info6" | jq -r '.region // .regionName // empty' 2>/dev/null)
-            city6=$(echo "$info6" | jq -r '.city // empty' 2>/dev/null)
-            isp6=$(echo "$info6" | jq -r '.isp // .organization // empty' 2>/dev/null)
-        fi
+        local info6
+        info6=$(curl -s --connect-timeout 3 -m 4 "https://api.ip.sb/geoip/${ipv6}" 2>/dev/null || curl -s --connect-timeout 3 -m 4 "http://ip-api.com/json/${ipv6}?lang=zh-CN" 2>/dev/null)
+        country6=$(echo "$info6" | jq -r '.country // .country_name // empty' 2>/dev/null)
+        region6=$(echo "$info6" | jq -r '.region // .regionName // empty' 2>/dev/null)
+        city6=$(echo "$info6" | jq -r '.city // empty' 2>/dev/null)
+        isp6=$(echo "$info6" | jq -r '.isp // .organization // empty' 2>/dev/null)
 
         green "  [✓] IPv6 出口 IP : ${ipv6}"
         [[ -n "$country6" || -n "$city6" ]] && blue  "      出口国家地区 : ${country6:-未知} - ${region6} ${city6}"
@@ -1757,10 +1762,10 @@ apply_main_node_outbound() {
       .route.default_domain_resolver = "dns-direct" |
       .route = (.route // {}) |
 
-      # 确保 socks-loopback 入站存在 (赛风/WARP 出站路由链的关键桥梁)
-      if any(.inbounds[]?; .tag == "socks-loopback") then . else
-        .inbounds += [{"tag":"socks-loopback","type":"socks","listen":"127.0.0.1","listen_port":20080}]
-      end |
+      # 严格去重并确保唯一的 socks-loopback 入站存在
+      .inbounds = [(.inbounds // [])[] | select(.tag != "socks-loopback")] + [
+        {"tag":"socks-loopback","type":"socks","listen":"127.0.0.1","listen_port":20080}
+      ] |
 
       .outbounds = (.outbounds // []) |
       if any(.outbounds[]; .tag == "direct") then . else .outbounds += [{"type":"direct","tag":"direct"}] end |
@@ -1916,6 +1921,15 @@ apply_changes() {
         fi
     fi
     service_restart sing-box
+    sleep 1
+    if ! service_is_active sing-box; then
+        pkill -9 -f "/etc/s-box/sing-box" >/dev/null 2>&1 || true
+        if command -v fuser >/dev/null 2>&1; then
+            fuser -k 20080/tcp >/dev/null 2>&1 || true
+        fi
+        sleep 1
+        service_start sing-box
+    fi
     return 0
 }
 
@@ -2189,7 +2203,7 @@ EOF_BLANK
           "listen_port": $ploop
         }]
       ) as $main_inbounds |
-      .inbounds = $main_inbounds + .inbounds
+      .inbounds = ($main_inbounds + .inbounds) | unique_by(.tag)
       ' "$cfg" > "$tmp_json" && mv -f "$tmp_json" "$cfg"
 
     sync_all_secondary_nodes
