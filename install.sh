@@ -1720,8 +1720,9 @@ apply_main_node_outbound() {
       # 清理 endpoints 中的历史 warp-out
       .endpoints = [(.endpoints // [])[] | select(.tag != "warp-out")] |
 
-      # 彻底清理历史的 socks-loopback 规则以及旧的 WARP/赛风 出站分流规则
+      # 彻底清理历史的 action: "resolve" 规则以及旧的 WARP/赛风 出站分流规则
       .route.rules = [(.route.rules // [])[] | select(
+        (.action != "resolve") and
         (.inbound != ["socks-loopback"]) and
         (.outbound != "warp-out") and
         (.outbound != "psiphon-main-out")
@@ -1747,6 +1748,7 @@ apply_main_node_outbound() {
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
           .route.rules += [
+            {"action": "resolve", "strategy": "prefer_ipv4"},
             {"inbound": ["socks-loopback"], "ip_version": 4, "outbound": "warp-out"},
             {"inbound": ["socks-loopback"], "ip_version": 6, "outbound": "direct"},
             {"ip_version": 4, "outbound": "warp-out"},
@@ -1755,6 +1757,7 @@ apply_main_node_outbound() {
           .route.final = "direct"
         elif $warp_mode == "ipv6" then
           .route.rules += [
+            {"action": "resolve", "strategy": "prefer_ipv6"},
             {"inbound": ["socks-loopback"], "ip_version": 6, "outbound": "warp-out"},
             {"inbound": ["socks-loopback"], "ip_version": 4, "outbound": "direct"},
             {"ip_version": 6, "outbound": "warp-out"},
