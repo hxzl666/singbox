@@ -752,26 +752,22 @@ warp_egress_test() {
     yellow "[*] 正在探测 IPv6 出口路由..."
     local ipv6="" country6="" region6="" city6="" isp6=""
 
-    # 优先采用 0 依赖官方 Trace 端点 (毫秒级响应)
-    local trace6
-    trace6=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s6 --connect-timeout 2 -m 4 "http://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null)
-    if [[ -n "$trace6" ]] && echo "$trace6" | grep -q "ip="; then
-        ipv6=$(echo "$trace6" | awk -F= '/^ip=/{print $2}' | tr -d ' \r\n')
+    # 优先请求 api-ipv6.ip.sb
+    ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 "https://api-ipv6.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+
+    # 备用源 1: ipify IPv6
+    if [[ -z "$ipv6" || ! "$ipv6" =~ : ]]; then
+        ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 "https://api6.ipify.org" 2>/dev/null | tr -d ' \r\n')
     fi
 
-    # 备用源 1: ipify
+    # 备用源 2: icanhazip IPv6
     if [[ -z "$ipv6" || ! "$ipv6" =~ : ]]; then
-        ipv6=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s6 --connect-timeout 2 -m 3 "http://api6.ipify.org" 2>/dev/null | tr -d ' \r\n')
+        ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 "http://ipv6.icanhazip.com" 2>/dev/null | tr -d ' \r\n')
     fi
 
-    # 备用源 2: icanhazip
+    # 备用源 3: cloudflare trace
     if [[ -z "$ipv6" || ! "$ipv6" =~ : ]]; then
-        ipv6=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s6 --connect-timeout 2 -m 3 "http://ipv6.icanhazip.com" 2>/dev/null | tr -d ' \r\n')
-    fi
-
-    # 备用源 3: ip.sb
-    if [[ -z "$ipv6" || ! "$ipv6" =~ : ]]; then
-        ipv6=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s6 --connect-timeout 2 -m 3 "https://api-ipv6.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+        ipv6=$(curl -sx "socks5://127.0.0.1:${loop_port}" -s6 --connect-timeout 2 -m 4 "http://[2606:4700:4700::1111]/cdn-cgi/trace" 2>/dev/null | awk -F= '/^ip=/{print $2}' | tr -d ' \r\n')
     fi
 
     if [[ -n "$ipv6" && "$ipv6" =~ : ]]; then
@@ -1098,7 +1094,7 @@ cleanup_orphan_secondary_nodes() {
     local psi_insts
     mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
     for cc in "${psi_insts[@]}"; do
-        [[ -n "$cc" ]] && valid_tags+=("psiphon-${cc,,}")
+        [[ -n "$cc" ]] && valid_tags+=("psiphon-${cc,,}" "psiphon-warp-${cc,,}")
     done
 
     local proxy_tags
@@ -1533,7 +1529,22 @@ get_psiphon_egress_mode() {
     [[ -f "$file" ]] && cat "$file" 2>/dev/null || echo "psiphon"
 }
 
+get_psiphon_cfon_socks_port() {
+    local cc="${1^^}"
+    local inst_dir="${PSI_INSTANCES_DIR}/${cc}"
+    local port_file="${inst_dir}/cfon_socks_port.txt"
+    local port
+
+    mkdir -p "$inst_dir"
+    port=$(cat "$port_file" 2>/dev/null || echo "0")
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" -le 0 ]]; then
+        port=$(get_free_loopback_port)
+        echo "$port" > "$port_file"
+    fi
+    printf '%s\n' "$port"
+}
 set_psiphon_egress_mode() {
+
     local cc="${1^^}"
     local mode="$2"
     [[ "$mode" == "psiphon" || "$mode" == "cfon" ]] || return 1
@@ -1579,6 +1590,21 @@ sync_psiphon_instance_to_singbox() {
     local out_tag="psiphon-${cc_lower}"
 
     local tmp_json
+    local egress_mode cfon_enabled cfon_socks_port warp_endpoint warp_port warp_pvk warp_ipv6 warp_res
+    egress_mode=$(get_psiphon_egress_mode "$cc")
+    cfon_enabled="false"
+    cfon_socks_port="0"
+    if [[ "$egress_mode" == "cfon" ]]; then
+        ensure_warp_config >/dev/null 2>&1 || true
+        cfon_enabled="true"
+        cfon_socks_port=$(get_psiphon_cfon_socks_port "$cc")
+    fi
+    warp_endpoint=$(get_warp_endpoint)
+    warp_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null || echo "2408")
+    warp_pvk=$(cat "$WORKDIR/warp_private_key.txt" 2>/dev/null || echo "52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=")
+    warp_ipv6=$(cat "$WORKDIR/warp_ipv6.txt" 2>/dev/null || echo "2606:4700:110:8d8d:1845:c39f:2dd5:a03a")
+    warp_res=$(cat "$WORKDIR/warp_reserved.txt" 2>/dev/null || echo "[215, 69, 233]")
+
     tmp_json=$(mktemp)
 
     if jq \
@@ -1593,9 +1619,32 @@ sync_psiphon_instance_to_singbox() {
       --arg reality_pvk "$reality_pvk" \
       --arg reym "$reym" \
       --arg listen_addr "${LISTEN_ADDR:-"::"}" \
+      --arg cfon_en "$cfon_enabled" \
+      --argjson cfon_port "${cfon_socks_port:-0}" \
+      --arg warp_ep "$warp_endpoint" \
+      --argjson warp_port "$warp_port" \
+      --arg warp_pvk "$warp_pvk" \
+      --arg warp_ipv6 "$warp_ipv6" \
+      --argjson warp_res "$warp_res" \
       '
       # 清理旧的副节点 WARP endpoint（Cfon 由底座自身管理，无需 singbox endpoint）
       .endpoints = [(.endpoints // [])[] | select(.tag != ("psiphon-warp-" + $cc))] |
+      if $cfon_en == "true" and $cfon_port > 0 then
+        .endpoints += [{
+          "type": "wireguard",
+          "tag": ("psiphon-warp-" + $cc),
+          "system": false,
+          "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
+          "private_key": $warp_pvk,
+          "peers": [{
+            "address": $warp_ep,
+            "port": $warp_port,
+            "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+            "allowed_ips": ["0.0.0.0/0", "::/0"],
+            "reserved": $warp_res
+          }]
+        }]
+      else . end |
 
       # 管理专属的 SOCKS outbound
       .outbounds = [.outbounds[] | select(.tag != $out_tag)] |
@@ -1614,7 +1663,8 @@ sync_psiphon_instance_to_singbox() {
         .tag != ("hy2-psi-" + $cc + "-in") and
         .tag != ("tuic-psi-" + $cc + "-in") and
         .tag != ("vless-psi-" + $cc + "-in") and
-        .tag != ("socks-psi-" + $cc + "-in")
+        .tag != ("socks-psi-" + $cc + "-in") and
+        .tag != ("socks-cfon-" + $cc + "-in")
       )] |
 
       (
@@ -1658,6 +1708,15 @@ sync_psiphon_instance_to_singbox() {
         }] else . end
       ) as $new_inbounds |
       .inbounds += $new_inbounds |
+      if $cfon_en == "true" and $cfon_port > 0 then
+        .inbounds += [{
+          "type": "socks",
+          "tag": ("socks-cfon-" + $cc + "-in"),
+          "listen": "127.0.0.1",
+          "listen_port": $cfon_port
+        }]
+      else . end |
+
 
       ($new_inbounds | map(.tag)) as $inbound_tags |
 
@@ -1667,6 +1726,10 @@ sync_psiphon_instance_to_singbox() {
         (.outbound != $out_tag) and
         (.outbound != ("psiphon-warp-" + $cc))
       )] |
+      if $cfon_en == "true" and $cfon_port > 0 then
+        .route.rules = ([{"inbound": [("socks-cfon-" + $cc + "-in")], "action": "route", "outbound": ("psiphon-warp-" + $cc)}] + .route.rules)
+      else . end |
+
 
       if ($inbound_tags | length) > 0 and $socks_port > 0 then
         .route.rules = ([{"inbound": $inbound_tags, "action": "route", "outbound": $out_tag}] + .route.rules)
@@ -1693,7 +1756,11 @@ ensure_all_psiphon_instances_running() {
         [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
         [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
         echo "$socks_p" > "$idir/socks_port.txt"
-        write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data"
+        local upstream_proxy=""
+        if [[ "$(get_psiphon_egress_mode "$cc")" == "cfon" ]]; then
+            upstream_proxy="socks5://127.0.0.1:$(get_psiphon_cfon_socks_port "$cc")"
+        fi
+        write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data" "$upstream_proxy"
         start_psiphon_instance "$cc"
     done
 }
@@ -1755,7 +1822,7 @@ apply_main_node_outbound() {
       .dns = {
         "servers": [
           {"type": "local", "tag": "dns-direct"},
-          {"type": "udp", "tag": "dns-remote", "server": "8.8.8.8", "detour": "direct"}
+          {"type": "udp", "tag": "dns-remote", "server": "8.8.8.8"}
         ],
         "final": "dns-direct"
       } |
@@ -1777,15 +1844,14 @@ apply_main_node_outbound() {
       # 清理 endpoints 中的历史 warp-out
       .endpoints = [(.endpoints // [])[] | select(.tag != "warp-out")] |
 
-      # 彻底清理旧的 sniff、resolve、分流 ip_cidr 规则及 WARP/赛风分流规则
-      .route.rules = [(.route.rules // [])[] | select(
-        (.action != "sniff") and
-        (.action != "resolve") and
-        (.inbound != ["socks-loopback"]) and
-        (.outbound != "warp-out") and
-        (.outbound != "psiphon-main-out") and
-        ((.ip_cidr == ["0.0.0.0/0"] or .ip_cidr == ["::/0"]) | not)
-      )] |
+      # 100% 绝对保护所有副节点规则 (入站/出站双重白名单机制，零误伤)
+      def is_secondary_rule:
+        (
+          ((.inbound | type == "array") and (.inbound | any(. | tostring | (contains("psi") or contains("proxy") or contains("custom"))))) or
+          ((.inbound | type == "string") and (.inbound | (contains("psi") or contains("proxy") or contains("custom")))) or
+          ((.outbound | type == "string") and ((.outbound | (startswith("psiphon-") and . != "psiphon-main-out")) or (.outbound | (startswith("proxy-") or startswith("custom-")))))
+        );
+      .route.rules = [(.route.rules // [])[] | select(is_secondary_rule)] |
       
       if $warp_en == "true" then
         # 基础 WARP Endpoint 配置 (保持双栈 allowed_ips 放行，由路由层精确控制分流)
@@ -1806,37 +1872,40 @@ apply_main_node_outbound() {
         if $warp_mode == "all" or $warp_mode == "dual" then
           # 双栈全局: 双栈流量与 socks-loopback 均走 WARP
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
-          .route.rules = [
+          .route.rules = .route.rules + [
             {"inbound": ["socks-loopback"], "action": "route", "outbound": "warp-out"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"}
-          ] + .route.rules |
+            {"ip_version": 4, "action": "route", "outbound": "warp-out"},
+            {"ip_version": 6, "action": "route", "outbound": "warp-out"}
+          ] |
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
           # 仅 IPv4 走 WARP: IPv4 走 WARP，IPv6 走直连
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
-          .route.rules = [
+          .route.rules = .route.rules + [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv4"},
             {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "warp-out"},
-            {"ip_cidr": ["::/0"], "action": "route", "outbound": "direct"}
-          ] + .route.rules |
+            {"ip_version": 4, "action": "route", "outbound": "warp-out"},
+            {"ip_cidr": ["::/0"], "action": "route", "outbound": "direct"},
+            {"ip_version": 6, "action": "route", "outbound": "direct"}
+          ] |
           .route.final = "direct"
         elif $warp_mode == "ipv6" then
-          # 仅 IPv6 走 WARP: IPv6 走 WARP，IPv4 走直连
+          # 仅 IPv6 走 WARP: IPv6 走 WARP，IPv4 走直连 (对齐勇哥经典架构)
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
-          .route.rules = [
+          .route.rules = .route.rules + [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0"], "action": "route", "outbound": "warp-out"},
-            {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "direct"}
-          ] + .route.rules |
+            {"ip_version": 6, "action": "route", "outbound": "warp-out"},
+            {"ip_version": 4, "action": "route", "outbound": "direct"}
+          ] |
           .route.final = "direct"
         elif $warp_mode == "google" or $warp_mode == "rules" then
           # 规则分流: 仅特定媒体/AI 域名走 WARP, 其余直连
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
-          .route.rules = [
+          .route.rules = .route.rules + [
             {"inbound": ["socks-loopback"], "action": "route", "outbound": "direct"},
             {"action": "sniff"},
             {
@@ -1844,16 +1913,16 @@ apply_main_node_outbound() {
               "action": "route",
               "outbound": "warp-out"
             }
-          ] + .route.rules |
+          ] |
           .route.final = "direct"
         else
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
-          .route.rules = [
+          .route.rules = .route.rules + [
             {"inbound": ["socks-loopback"], "action": "route", "outbound": "warp-out"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
             {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"}
-          ] + .route.rules |
+          ] |
           .route.final = "warp-out"
         end
       elif $psi_en == "true" then
@@ -1865,15 +1934,15 @@ apply_main_node_outbound() {
           "server_port": $psi_port,
           "version": "5"
         }] |
-        .route.rules = [
+        .route.rules = .route.rules + [
           {"inbound": ["socks-loopback"], "action": "route", "outbound": "psiphon-main-out"}
-        ] + .route.rules |
+        ] |
         .route.final = "psiphon-main-out"
       else
         .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
-        .route.rules = [
+        .route.rules = .route.rules + [
           {"inbound": ["socks-loopback"], "action": "route", "outbound": "direct"}
-        ] + .route.rules |
+        ] |
         .route.final = "direct"
       end |
       if (.endpoints | length) == 0 then del(.endpoints) else . end
@@ -1889,10 +1958,16 @@ apply_changes() {
         return 1
     fi
 
-    # 适配 Sing-box 1.12.0+ / 1.13.0+ 默认解析器强校验要求 (仅在需要时补齐)
+    # 适配 Sing-box 1.12.0+ / 1.13.0+ 语法校验与 inbounds 入站去重
     if command -v jq >/dev/null 2>&1; then
         local tmp_fix=$(mktemp)
         jq '
+          if (.inbounds // null) != null then
+            .inbounds = (.inbounds | unique_by(.tag))
+          else . end |
+          if (.dns.servers // null) != null then
+            .dns.servers = [.dns.servers[] | del(.detour)]
+          else . end |
           if (.route // null) != null and (.dns // null) != null then
             .route.default_domain_resolver = (.route.default_domain_resolver // "dns-direct")
           else . end
@@ -3248,7 +3323,7 @@ repair_single_psiphon_instance() {
     # 3. 彻底重置历史脏数据并载入纯净种子服务器列表
     echo -e "${blue}--> [3/5] 彻底重置历史脏数据并载入纯净种子列表...${re}"
     local up_proxy=""
-    [[ "$(get_psiphon_egress_mode "$target_cc")" == "cfon" ]] && up_proxy="socks5://127.0.0.1:20080"
+    [[ "$(get_psiphon_egress_mode "$target_cc")" == "cfon" ]] && up_proxy="socks5://127.0.0.1:$(get_psiphon_cfon_socks_port "$target_cc")"
     write_psiphon_config "$socks_p" "$target_cc" "$inst_dir/psiphon.config" "$inst_dir/data" "$up_proxy"
 
     # 4. 同步 Sing-box 路由与入站
@@ -3448,7 +3523,7 @@ configure_psiphon_instance_egress_menu() {
                 yellow "[*] 正在切换 [$target_cc - $cname] 为【赛风（WARP 前置 / Cfon）】..."
                 ensure_warp_config
                 set_psiphon_egress_mode "$target_cc" "cfon"
-                write_psiphon_config "$socks_p" "$target_cc" "$idir/psiphon.config" "$idir/data" "socks5://127.0.0.1:20080"
+                write_psiphon_config "$socks_p" "$target_cc" "$idir/psiphon.config" "$idir/data" "socks5://127.0.0.1:$(get_psiphon_cfon_socks_port "$target_cc")"
                 restart_psiphon_instance "$target_cc"
                 sync_psiphon_instance_to_singbox "$target_cc"
                 apply_changes
@@ -3574,6 +3649,7 @@ psiphon_multigroup_menu() {
                         .inbounds = [.inbounds[] | select(
                           (.tag | contains("psi-" + $cc)) or
                           (.tag | contains("psi-" + $ccu)) or
+                          (.tag | contains("cfon-" + $cc)) or
                           (.tag | contains("psiphon-" + $cc)) | not
                         )] |
                         .route.rules = [.route.rules[] | select(
@@ -3607,7 +3683,7 @@ psiphon_multigroup_menu() {
                     [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
                     echo "$socks_p" > "$idir/socks_port.txt"
                     local up_proxy=""
-                    [[ "$(get_psiphon_egress_mode "$cc")" == "cfon" ]] && up_proxy="socks5://127.0.0.1:20080"
+                    [[ "$(get_psiphon_egress_mode "$cc")" == "cfon" ]] && up_proxy="socks5://127.0.0.1:$(get_psiphon_cfon_socks_port "$cc")"
                     write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data" "$up_proxy"
                     start_psiphon_instance "$cc"
                 done
