@@ -1747,19 +1747,15 @@ apply_main_node_outbound() {
           .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
-          .route.rules += [
-            {"action": "resolve", "strategy": "prefer_ipv4"},
-            {"inbound": ["socks-loopback"], "ip_version": 4, "outbound": "warp-out"},
-            {"inbound": ["socks-loopback"], "ip_version": 6, "outbound": "direct"},
+          # 前置 resolve 规则到数组开头：确保域名连接先被解析为 IP，routing 引擎才能根据 ip_version 精准分流
+          .route.rules = [{"action": "resolve", "strategy": "prefer_ipv4"}] + .route.rules + [
             {"ip_version": 4, "outbound": "warp-out"},
             {"ip_version": 6, "outbound": "direct"}
           ] |
           .route.final = "direct"
         elif $warp_mode == "ipv6" then
-          .route.rules += [
-            {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"inbound": ["socks-loopback"], "ip_version": 6, "outbound": "warp-out"},
-            {"inbound": ["socks-loopback"], "ip_version": 4, "outbound": "direct"},
+          # 前置 resolve 规则到数组开头：域名连接优先解析为 IPv6 后，ip_version: 6 规则才能匹配并路由到 WARP
+          .route.rules = [{"action": "resolve", "strategy": "prefer_ipv6"}] + .route.rules + [
             {"ip_version": 6, "outbound": "warp-out"},
             {"ip_version": 4, "outbound": "direct"}
           ] |
