@@ -1796,27 +1796,28 @@ apply_main_node_outbound() {
           .route.rules = [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"}
+            {"ip_version": 6, "action": "route", "outbound": "warp-out"},
+            {"ip_version": 4, "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
-          # 仅 IPv4 走 WARP: IPv4走WARP，直连锁定原生 IPv6
-          .outbounds = [.outbounds[] | if .tag == "direct" then . + {"domain_strategy": "ipv6_only"} else . end] |
+          # 仅 IPv4 走 WARP: IPv4 走 WARP，IPv6 走直连 (使用标准 ip_version 协议栈分流)
+          .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv4"},
-            {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "warp-out"},
-            {"ip_cidr": ["::/0"], "action": "route", "outbound": "direct"}
+            {"ip_version": 4, "action": "route", "outbound": "warp-out"},
+            {"ip_version": 6, "action": "route", "outbound": "direct"}
           ] + .route.rules |
           .route.final = "direct"
         elif $warp_mode == "ipv6" then
-          # 仅 IPv6 走 WARP: IPv6走WARP，直连锁定原生 IPv4 (杜绝原生 IPv6 泄露)
-          .outbounds = [.outbounds[] | if .tag == "direct" then . + {"domain_strategy": "ipv4_only"} else . end] |
+          # 仅 IPv6 走 WARP: IPv6 走 WARP，IPv4 走直连 (使用标准 ip_version 协议栈分流)
+          .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0"], "action": "route", "outbound": "warp-out"},
-            {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "direct"}
+            {"ip_version": 6, "action": "route", "outbound": "warp-out"},
+            {"ip_version": 4, "action": "route", "outbound": "direct"}
           ] + .route.rules |
           .route.final = "direct"
         elif $warp_mode == "google" or $warp_mode == "rules" then
@@ -1836,7 +1837,8 @@ apply_main_node_outbound() {
           .route.rules = [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"}
+            {"ip_version": 6, "action": "route", "outbound": "warp-out"},
+            {"ip_version": 4, "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "warp-out"
         end
@@ -1886,6 +1888,7 @@ apply_changes() {
     if [[ -x /etc/s-box/sing-box ]]; then
         local check_out
         export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true
+        export ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true
         if ! check_out=$(/etc/s-box/sing-box check -c /etc/s-box/sb.json 2>&1); then
             # 若因旧版本核心不支持 AnyTLS 导致报错，自动触发升级至最新核心
             if echo "$check_out" | grep -qi "anytls"; then
