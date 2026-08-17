@@ -1792,6 +1792,7 @@ apply_main_node_outbound() {
         }] |
         if $warp_mode == "all" or $warp_mode == "dual" then
           # 双栈全局: 优先 IPv6 解析，双栈流量均走 WARP
+          .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
@@ -1799,23 +1800,28 @@ apply_main_node_outbound() {
           ] + .route.rules |
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
-          # 仅 IPv4 走 WARP (s4): 优先 IPv4 解析，0.0.0.0/0 走 WARP，IPv6 保持原生直连
+          # 仅 IPv4 走 WARP: IPv4走WARP，直连锁定原生 IPv6
+          .outbounds = [.outbounds[] | if .tag == "direct" then . + {"domain_strategy": "ipv6_only"} else . end] |
           .route.rules = [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv4"},
-            {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "warp-out"}
+            {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "warp-out"},
+            {"ip_cidr": ["::/0"], "action": "route", "outbound": "direct"}
           ] + .route.rules |
           .route.final = "direct"
         elif $warp_mode == "ipv6" then
-          # 仅 IPv6 走 WARP (s6): 优先 IPv6 解析，::/0 走 WARP，IPv4 保持原生直连
+          # 仅 IPv6 走 WARP: IPv6走WARP，直连锁定原生 IPv4 (杜绝原生 IPv6 泄露)
+          .outbounds = [.outbounds[] | if .tag == "direct" then . + {"domain_strategy": "ipv4_only"} else . end] |
           .route.rules = [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0"], "action": "route", "outbound": "warp-out"}
+            {"ip_cidr": ["::/0"], "action": "route", "outbound": "warp-out"},
+            {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "direct"}
           ] + .route.rules |
           .route.final = "direct"
         elif $warp_mode == "google" or $warp_mode == "rules" then
           # 规则分流: 仅特定媒体/AI 域名走 WARP, 其余直连
+          .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
             {"action": "sniff"},
             {
@@ -1826,6 +1832,7 @@ apply_main_node_outbound() {
           ] + .route.rules |
           .route.final = "direct"
         else
+          .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
@@ -1834,6 +1841,7 @@ apply_main_node_outbound() {
           .route.final = "warp-out"
         end
       elif $psi_en == "true" then
+        .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
         .outbounds += [{
           "type": "socks",
           "tag": "psiphon-main-out",
@@ -1846,6 +1854,7 @@ apply_main_node_outbound() {
         ] + .route.rules |
         .route.final = "psiphon-main-out"
       else
+        .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
         .route.rules = [
           {"inbound": ["socks-loopback"], "action": "route", "outbound": "direct"}
         ] + .route.rules |
