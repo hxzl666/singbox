@@ -1737,18 +1737,18 @@ apply_main_node_outbound() {
           ] + .route.rules |
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
-          # 仅 IPv4 走 WARP (s4): 强制 IPv4 解析，0.0.0.0/0 走 WARP，其余直连
+          # 仅 IPv4 走 WARP (s4): 优先 IPv4 解析，0.0.0.0/0 走 WARP，IPv6 保持原生直连
           .route.rules = [
             {"action": "sniff"},
-            {"action": "resolve", "strategy": "ipv4_only"},
+            {"action": "resolve", "strategy": "prefer_ipv4"},
             {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "direct"
         elif $warp_mode == "ipv6" then
-          # 仅 IPv6 走 WARP (s6): 强制 IPv6 解析，::/0 走 WARP，其余直连
+          # 仅 IPv6 走 WARP (s6): 优先 IPv6 解析，::/0 走 WARP，IPv4 保持原生直连
           .route.rules = [
             {"action": "sniff"},
-            {"action": "resolve", "strategy": "ipv6_only"},
+            {"action": "resolve", "strategy": "prefer_ipv6"},
             {"ip_cidr": ["::/0"], "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "direct"
