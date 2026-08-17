@@ -1749,9 +1749,9 @@ apply_main_node_outbound() {
       '
       .dns = {
         "servers": [
-          {"type": "udp", "tag": "dns-remote", "server": "1.1.1.1"},
-          {"type": "udp", "tag": "dns-google", "server": "8.8.8.8"},
-          {"type": "local", "tag": "dns-direct"}
+          {"type": "udp", "tag": "dns-remote", "server": "1.1.1.1", "detour": "direct"},
+          {"type": "udp", "tag": "dns-google", "server": "8.8.8.8", "detour": "direct"},
+          {"type": "local", "tag": "dns-direct", "detour": "direct"}
         ],
         "final": "dns-remote",
         "strategy": (if $warp_mode == "ipv4" then "prefer_ipv4" else "prefer_ipv6" end)
@@ -1815,33 +1815,33 @@ apply_main_node_outbound() {
           ] + .route.rules |
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
-          # 仅 IPv4 走 WARP: IPv4 走 WARP，IPv6 走直连
+          # 仅 IPv4 走 WARP: IPv4 走 WARP，IPv6 走直连，兜底由 WARP 接管
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
             {"protocol": "dns", "action": "route", "outbound": "direct"},
             {"port": 53, "action": "route", "outbound": "direct"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv4"},
-            {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "warp-out"},
-            {"ip_version": 4, "action": "route", "outbound": "warp-out"},
             {"ip_cidr": ["::/0"], "action": "route", "outbound": "direct"},
-            {"ip_version": 6, "action": "route", "outbound": "direct"}
+            {"ip_version": 6, "action": "route", "outbound": "direct"},
+            {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "warp-out"},
+            {"ip_version": 4, "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
-          .route.final = "direct"
+          .route.final = "warp-out"
         elif $warp_mode == "ipv6" then
-          # 仅 IPv6 走 WARP: IPv6 走 WARP，IPv4 走直连
+          # 仅 IPv6 走 WARP: IPv4 走直连，其余所有 IPv6 与域名流量 100% 走 WARP (杜绝 HE 原生 IPv6 泄露)
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
             {"protocol": "dns", "action": "route", "outbound": "direct"},
             {"port": 53, "action": "route", "outbound": "direct"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0"], "action": "route", "outbound": "warp-out"},
-            {"ip_version": 6, "action": "route", "outbound": "warp-out"},
             {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "direct"},
-            {"ip_version": 4, "action": "route", "outbound": "direct"}
+            {"ip_version": 4, "action": "route", "outbound": "direct"},
+            {"ip_cidr": ["::/0"], "action": "route", "outbound": "warp-out"},
+            {"ip_version": 6, "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
-          .route.final = "direct"
+          .route.final = "warp-out"
         elif $warp_mode == "google" or $warp_mode == "rules" then
           # 规则分流: 仅特定媒体/AI 域名走 WARP, 其余直连
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
