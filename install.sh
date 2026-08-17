@@ -1688,18 +1688,7 @@ apply_main_node_outbound() {
       --arg psi_en "$psi_main_enabled" \
       --argjson psi_port "$psi_main_port" \
       '
-      # 确保 route.default_domain_resolver 存在 (适配 Sing-box 1.12.0+ 规范)
       .route = (.route // {}) |
-      .route.default_domain_resolver = (.route.default_domain_resolver // "dns-direct") |
-      .dns = (.dns // {
-        "servers": [
-          {"type": "local", "tag": "dns-direct"},
-          {"type": "local", "tag": "local"},
-          {"type": "udp", "tag": "dns-remote", "server": "8.8.8.8"},
-          {"type": "udp", "tag": "remote-dns", "server": "8.8.8.8"}
-        ],
-        "final": "dns-direct"
-      }) |
 
       # 确保 socks-loopback 入站存在 (赛风/WARP 出站路由链的关键桥梁)
       if any(.inbounds[]?; .tag == "socks-loopback") then . else
@@ -1743,33 +1732,31 @@ apply_main_node_outbound() {
           }]
         }] |
         if $warp_mode == "all" or $warp_mode == "dual" then
-          # 双栈全局: 所有流量经由 warp-out 出站
+          # 双栈全局: 优先 IPv6 解析，双栈流量均走 WARP
           .route.rules = [
             {"action": "sniff"},
-            {"action": "resolve", "strategy": "prefer_ipv6", "server": "dns-remote"},
-            {"inbound": ["socks-loopback"], "outbound": "warp-out"}
+            {"action": "resolve", "strategy": "prefer_ipv6"},
+            {"ip_cidr": ["::/0", "0.0.0.0/0"], "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
-          # 仅 IPv4 走 WARP: IPv4 流量走 WARP, IPv6 原生直连
+          # 仅 IPv4 走 WARP (s4): 优先 IPv4 解析，0.0.0.0/0 走 WARP，其余直连
           .route.rules = [
             {"action": "sniff"},
-            {"action": "resolve", "strategy": "prefer_ipv4", "server": "dns-remote"},
-            {"ip_cidr": ["0.0.0.0/0"], "outbound": "warp-out"},
-            {"ip_cidr": ["::/0"], "outbound": "direct"}
+            {"action": "resolve", "strategy": "prefer_ipv4"},
+            {"ip_cidr": ["0.0.0.0/0"], "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "direct"
         elif $warp_mode == "ipv6" then
-          # 仅 IPv6 走 WARP: IPv6 流量走 WARP, IPv4 原生直连
+          # 仅 IPv6 走 WARP (s6): 优先 IPv6 解析，::/0 走 WARP，其余直连
           .route.rules = [
             {"action": "sniff"},
-            {"action": "resolve", "strategy": "prefer_ipv6", "server": "dns-remote"},
-            {"ip_cidr": ["::/0"], "outbound": "warp-out"},
-            {"ip_cidr": ["0.0.0.0/0"], "outbound": "direct"}
+            {"action": "resolve", "strategy": "prefer_ipv6"},
+            {"ip_cidr": ["::/0"], "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "direct"
         elif $warp_mode == "google" or $warp_mode == "rules" then
-          # 规则分流: 仅特定媒体/AI 域名走 WARP, 其余原生直连
+          # 规则分流: 仅特定媒体/AI 域名走 WARP, 其余直连
           .route.rules = [
             {"action": "sniff"},
             {
@@ -1781,8 +1768,8 @@ apply_main_node_outbound() {
         else
           .route.rules = [
             {"action": "sniff"},
-            {"action": "resolve", "strategy": "prefer_ipv6", "server": "dns-remote"},
-            {"inbound": ["socks-loopback"], "outbound": "warp-out"}
+            {"action": "resolve", "strategy": "prefer_ipv6"},
+            {"ip_cidr": ["::/0", "0.0.0.0/0"], "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "warp-out"
         end
