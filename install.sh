@@ -1076,7 +1076,7 @@ cleanup_orphan_secondary_nodes() {
     local psi_insts
     mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
     for cc in "${psi_insts[@]}"; do
-        [[ -n "$cc" ]] && valid_tags+=("psiphon-${cc,,}")
+        [[ -n "$cc" ]] && valid_tags+=("psiphon-${cc,,}" "psiphon-warp-${cc,,}")
     done
 
     local proxy_tags
@@ -1088,6 +1088,7 @@ cleanup_orphan_secondary_nodes() {
     local tmp_clean=$(mktemp)
     if jq --argjson valids "$(printf '%s\n' "${valid_tags[@]}" | jq -R . | jq -s .)" '
       .outbounds = [.outbounds[] | select(.tag as $t | ($valids | index($t)) != null)] |
+      .endpoints = [(.endpoints // [])[] | select(.tag as $t | ($valids | index($t)) != null)] |
       .route.rules = [
         .route.rules[] |
         select(
@@ -1503,6 +1504,73 @@ sync_proxy_group_to_singbox() {
     fi
 }
 
+# ==================== 赛风副节点独立 WARP 管理模块 ====================
+get_psiphon_warp_mode() {
+    local cc="${1^^}"
+    local mode_file="${PSI_INSTANCES_DIR}/${cc}/warp/mode.txt"
+    [[ -f "$mode_file" ]] && cat "$mode_file" 2>/dev/null || echo "1"
+}
+
+set_psiphon_warp_mode() {
+    local cc="${1^^}"
+    local mode="$2"
+    local dir="${PSI_INSTANCES_DIR}/${cc}/warp"
+    mkdir -p "$dir"
+    echo "$mode" > "$dir/mode.txt"
+}
+
+get_psiphon_warp_endpoint() {
+    local cc="${1^^}"
+    local ep_file="${PSI_INSTANCES_DIR}/${cc}/warp/endpoint.txt"
+    [[ -f "$ep_file" ]] && cat "$ep_file" 2>/dev/null || echo "162.159.192.1"
+}
+
+init_psiphon_warp_config() {
+    local cc="${1^^}"
+    local dir="${PSI_INSTANCES_DIR}/${cc}/warp"
+    mkdir -p "$dir"
+
+    local warpurl
+    warpurl=$(curl -sm5 -k https://warp.xijp.eu.org 2>/dev/null || wget -qO- --timeout=5 https://warp.xijp.eu.org 2>/dev/null)
+    
+    local WARP_PVK="52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A="
+    local WARP_IPV6="2606:4700:110:8d8d:1845:c39f:2dd5:a03a"
+    local WARP_RES="[215, 69, 233]"
+    
+    if [[ -n "$warpurl" ]] && ! printf '%s' "$warpurl" | grep -q -i "html"; then
+        local tmp_pvk tmp_ipv6 tmp_res
+        tmp_pvk=$(echo "$warpurl" | awk -F'：' '/Private_key/{print $2}' | xargs)
+        tmp_ipv6=$(echo "$warpurl" | awk -F'：' '/IPV6/{print $2}' | xargs)
+        tmp_res=$(echo "$warpurl" | awk -F'：' '/reserved/{print $2}' | xargs)
+        
+        [[ -n "$tmp_pvk" ]] && WARP_PVK="$tmp_pvk"
+        [[ -n "$tmp_ipv6" ]] && WARP_IPV6="$tmp_ipv6"
+        if [[ -n "$tmp_res" ]]; then
+            if [[ ! "$tmp_res" =~ ^\[ ]]; then
+                WARP_RES="[${tmp_res}]"
+            else
+                WARP_RES="$tmp_res"
+            fi
+        fi
+    fi
+
+    echo "$WARP_PVK" > "$dir/private_key.txt"
+    echo "$WARP_IPV6" > "$dir/ipv6.txt"
+    echo "$WARP_RES" > "$dir/reserved.txt"
+    [[ ! -f "$dir/endpoint.txt" ]] && echo "162.159.192.1" > "$dir/endpoint.txt"
+    [[ ! -f "$dir/port.txt" ]] && echo "2408" > "$dir/port.txt"
+    return 0
+}
+
+ensure_psiphon_warp_config() {
+    local cc="${1^^}"
+    local dir="${PSI_INSTANCES_DIR}/${cc}/warp"
+    if [[ -s "$dir/private_key.txt" && -s "$dir/ipv6.txt" && -s "$dir/reserved.txt" ]]; then
+        return 0
+    fi
+    init_psiphon_warp_config "$cc"
+}
+
 # ==================== 同步赛风副节点到 sing-box (纯 jq) ====================
 sync_psiphon_instance_to_singbox() {
     local cc="${1^^}"
@@ -1530,12 +1598,33 @@ sync_psiphon_instance_to_singbox() {
     local cc_lower=$(echo "$cc" | tr '[:upper:]' '[:lower:]')
     local out_tag="psiphon-${cc_lower}"
 
+    # 读取该赛风副节点的专属 WARP 模式与凭据
+    local warp_m=$(get_psiphon_warp_mode "$cc")
+    local psi_warp_tag="psiphon-warp-${cc_lower}"
+    local warp_pvk="" warp_ipv6="" warp_res="[0,0,0]" warp_ep="162.159.192.1" warp_port="2408"
+    if [[ "$warp_m" != "1" ]]; then
+        ensure_psiphon_warp_config "$cc"
+        local wdir="${PSI_INSTANCES_DIR}/${cc}/warp"
+        warp_pvk=$(cat "$wdir/private_key.txt" 2>/dev/null)
+        warp_ipv6=$(cat "$wdir/ipv6.txt" 2>/dev/null)
+        warp_res=$(cat "$wdir/reserved.txt" 2>/dev/null || echo "[215, 69, 233]")
+        warp_ep=$(cat "$wdir/endpoint.txt" 2>/dev/null || echo "162.159.192.1")
+        warp_port=$(cat "$wdir/port.txt" 2>/dev/null || echo "2408")
+    fi
+
     local tmp_json
     tmp_json=$(mktemp)
 
     if jq \
       --arg cc "$cc_lower" \
       --arg out_tag "$out_tag" \
+      --arg psi_warp_tag "$psi_warp_tag" \
+      --arg warp_m "$warp_m" \
+      --arg warp_pvk "$warp_pvk" \
+      --arg warp_ipv6 "$warp_ipv6" \
+      --argjson warp_res "$warp_res" \
+      --arg warp_ep "$warp_ep" \
+      --argjson warp_port "${warp_port:-2408}" \
       --argjson socks_port "${socks_port:-0}" \
       --argjson hy2_port "${hy2_port:-0}" \
       --argjson tuic_port "${tuic_port:-0}" \
@@ -1545,6 +1634,7 @@ sync_psiphon_instance_to_singbox() {
       --arg reym "$reym" \
       --arg listen_addr "${LISTEN_ADDR:-"::"}" \
       '
+      # 管理专属的 SOCKS outbound
       .outbounds = [.outbounds[] | select(.tag != $out_tag)] |
       if $socks_port > 0 then
         .outbounds += [{
@@ -1556,6 +1646,26 @@ sync_psiphon_instance_to_singbox() {
         }]
       else . end |
 
+      # 管理专属的 WARP endpoint
+      .endpoints = [(.endpoints // [])[] | select(.tag != $psi_warp_tag)] |
+      if $warp_m != "1" and $warp_pvk != "" then
+        .endpoints += [{
+          "type": "wireguard",
+          "tag": $psi_warp_tag,
+          "system": false,
+          "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
+          "private_key": $warp_pvk,
+          "peers": [{
+            "address": $warp_ep,
+            "port": $warp_port,
+            "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+            "allowed_ips": ["0.0.0.0/0", "::/0"],
+            "reserved": $warp_res
+          }]
+        }]
+      else . end |
+
+      # 重构专属的 Inbounds (Hy2 / TUIC / VLESS)
       .inbounds = [.inbounds[] | select(
         .tag != ("hy2-psi-" + $cc + "-in") and
         .tag != ("tuic-psi-" + $cc + "-in") and
@@ -1600,9 +1710,43 @@ sync_psiphon_instance_to_singbox() {
 
       ($new_inbounds | map(.tag)) as $inbound_tags |
 
-      .route.rules = ([.route.rules[] | select(.outbound != $out_tag)]) |
-      if ($inbound_tags | length) > 0 and $socks_port > 0 then
-        .route.rules = ([{"inbound": $inbound_tags, "outbound": $out_tag}] + .route.rules)
+      # 清理旧的与该赛风副节点相关的 route 规则
+      .route.rules = [.route.rules[] | select(
+        (.inbound != $inbound_tags) and
+        (.outbound != $out_tag) and
+        (.outbound != $psi_warp_tag)
+      )] |
+
+      if ($inbound_tags | length) > 0 then
+        if $warp_m == "2" then
+          # 模式 2: 双栈全部走副节点专属 WARP
+          .route.rules = [
+            {"inbound": $inbound_tags, "action": "sniff"},
+            {"inbound": $inbound_tags, "action": "resolve", "strategy": "prefer_ipv6"},
+            {"inbound": $inbound_tags, "action": "route", "outbound": $psi_warp_tag}
+          ] + .route.rules
+        elif $warp_m == "3" then
+          # 模式 3: 仅 IPv4 走 WARP，IPv6 走赛风原生
+          .route.rules = [
+            {"inbound": $inbound_tags, "action": "sniff"},
+            {"inbound": $inbound_tags, "action": "resolve", "strategy": "prefer_ipv4"},
+            {"inbound": $inbound_tags, "ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": $psi_warp_tag},
+            {"inbound": $inbound_tags, "ip_cidr": ["::/0"], "action": "route", "outbound": $out_tag}
+          ] + .route.rules
+        elif $warp_m == "4" then
+          # 模式 4: 仅 IPv6 走 WARP，IPv4 走赛风原生
+          .route.rules = [
+            {"inbound": $inbound_tags, "action": "sniff"},
+            {"inbound": $inbound_tags, "action": "resolve", "strategy": "prefer_ipv6"},
+            {"inbound": $inbound_tags, "ip_cidr": ["::/0"], "action": "route", "outbound": $psi_warp_tag},
+            {"inbound": $inbound_tags, "ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": $out_tag}
+          ] + .route.rules
+        else
+          # 模式 1: 纯赛风原生出站
+          .route.rules = [
+            {"inbound": $inbound_tags, "action": "route", "outbound": $out_tag}
+          ] + .route.rules
+        end
       else . end
       ' "$cfg" > "$tmp_json" 2>/dev/null && jq -e . "$tmp_json" >/dev/null 2>&1; then
         mv -f "$tmp_json" "$cfg"
@@ -3206,6 +3350,237 @@ repair_single_psiphon_instance() {
     generate_psiphon_instance_links "$target_cc"
 }
 
+psiphon_instance_egress_test() {
+    local cc="${1^^}"
+    local cname=$(get_country_name "$cc")
+    local socks_p=$(cat "${PSI_INSTANCES_DIR}/$cc/socks_port.txt" 2>/dev/null)
+    local warp_m=$(get_psiphon_warp_mode "$cc")
+
+    local mode_desc="纯赛风原生出站"
+    case "$warp_m" in
+        2) mode_desc="WARP 双栈全局出站" ;;
+        3) mode_desc="WARP 仅 IPv4 出站 (IPv4走WARP，IPv6走赛风)" ;;
+        4) mode_desc="WARP 仅 IPv6 出站 (IPv6走WARP，IPv4走赛风)" ;;
+    esac
+
+    echo
+    echo "============================================================"
+    green "  【赛风副节点出口 IP 检测】 [$cc - $cname] 当前模式: ${mode_desc}"
+    echo "============================================================"
+
+    # 1. 探测 IPv4
+    yellow "[*] 正在探测 IPv4 出口路由..."
+    local ipv4="" country4="" region4="" city4="" isp4="" json4=""
+    if [[ "$warp_m" == "2" || "$warp_m" == "3" ]]; then
+        json4=$(curl -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/geoip" 2>/dev/null)
+    elif [[ -n "$socks_p" && "$socks_p" -gt 0 ]]; then
+        json4=$(curl -sx "socks5h://127.0.0.1:${socks_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/geoip" 2>/dev/null)
+    fi
+
+    if [[ -n "$json4" ]] && echo "$json4" | jq -e '.ip' >/dev/null 2>&1; then
+        ipv4=$(echo "$json4" | jq -r '.ip // empty' 2>/dev/null)
+        country4=$(echo "$json4" | jq -r '.country // empty' 2>/dev/null)
+        region4=$(echo "$json4" | jq -r '.region // empty' 2>/dev/null)
+        city4=$(echo "$json4" | jq -r '.city // empty' 2>/dev/null)
+        isp4=$(echo "$json4" | jq -r '.isp // .organization // .asn_organization // empty' 2>/dev/null)
+    fi
+
+    if [[ -n "$ipv4" && "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        green "  [✓] IPv4 出口 IP : ${ipv4}"
+        [[ -n "$country4" || -n "$city4" ]] && blue "      出口国家地区 : ${country4:-未知} - ${region4} ${city4}"
+        [[ -n "$isp4" ]] && blue "      网络运营商   : ${isp4}"
+    else
+        yellow "  [!] IPv4 出口    : 未获取到"
+    fi
+
+    echo "  ----------------------------------------------------------"
+
+    # 2. 探测 IPv6
+    yellow "[*] 正在探测 IPv6 出口路由..."
+    local ipv6="" country6="" region6="" city6="" isp6="" json6=""
+    if [[ "$warp_m" == "2" || "$warp_m" == "4" ]]; then
+        json6=$(curl -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/geoip" 2>/dev/null)
+    elif [[ -n "$socks_p" && "$socks_p" -gt 0 ]]; then
+        json6=$(curl -sx "socks5h://127.0.0.1:${socks_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/geoip" 2>/dev/null)
+    fi
+
+    if [[ -n "$json6" ]] && echo "$json6" | jq -e '.ip' >/dev/null 2>&1; then
+        ipv6=$(echo "$json6" | jq -r '.ip // empty' 2>/dev/null)
+        country6=$(echo "$json6" | jq -r '.country // empty' 2>/dev/null)
+        region6=$(echo "$json6" | jq -r '.region // empty' 2>/dev/null)
+        city6=$(echo "$json6" | jq -r '.city // empty' 2>/dev/null)
+        isp6=$(echo "$json6" | jq -r '.isp // .organization // .asn_organization // empty' 2>/dev/null)
+    fi
+
+    if [[ -n "$ipv6" && "$ipv6" =~ : ]]; then
+        green "  [✓] IPv6 出口 IP : ${ipv6}"
+        [[ -n "$country6" || -n "$city6" ]] && blue "      出口国家地区 : ${country6:-未知} - ${region6} ${city6}"
+        [[ -n "$isp6" ]] && blue "      网络运营商   : ${isp6}"
+    else
+        yellow "  [!] IPv6 出口    : 未获取到"
+    fi
+    echo "============================================================"
+}
+
+configure_psiphon_instance_warp_menu() {
+    local insts
+    mapfile -t insts < <(get_all_psiphon_instances)
+    if [[ ${#insts[@]} -eq 0 ]]; then
+        yellow "暂无可配置的赛风出口组，请先添加赛风副节点！"
+        return 0
+    fi
+
+    echo
+    green "==== 选择要配置 WARP 出站的赛风副节点 ===="
+    local idx=1
+    for cc in "${insts[@]}"; do
+        local cname=$(get_country_name "$cc")
+        local wm=$(get_psiphon_warp_mode "$cc")
+        local wm_desc="纯赛风原生"
+        case "$wm" in
+            2) wm_desc="双栈 WARP" ;;
+            3) wm_desc="仅 IPv4 WARP" ;;
+            4) wm_desc="仅 IPv6 WARP" ;;
+        esac
+        echo -e "  ${green}[$idx] [$cc] $cname${re} (当前: ${blue}${wm_desc}${re})"
+        ((idx++))
+    done
+    echo "------------------------------------------------------------"
+    reading "请输入国家代码 (如 US) 或序号 [回车取消]: " input_target
+    [[ -z "$input_target" ]] && return 0
+
+    local target_cc=""
+    if [[ "$input_target" =~ ^[0-9]+$ ]] && [[ "$input_target" -ge 1 && "$input_target" -le ${#insts[@]} ]]; then
+        target_cc="${insts[$((input_target-1))]}"
+    else
+        target_cc="${input_target^^}"
+    fi
+
+    if [[ ! -d "${PSI_INSTANCES_DIR}/$target_cc" ]]; then
+        red "未找到赛风出口组: $target_cc"
+        return 1
+    fi
+
+    local cname=$(get_country_name "$target_cc")
+    while true; do
+        [[ -t 1 ]] && clear 2>/dev/null || true
+        local cur_m=$(get_psiphon_warp_mode "$target_cc")
+        local cur_desc="纯赛风原生出站"
+        case "$cur_m" in
+            2) cur_desc="WARP 双栈全局出站" ;;
+            3) cur_desc="WARP 仅 IPv4 出站 (IPv4走WARP，IPv6走赛风)" ;;
+            4) cur_desc="WARP 仅 IPv6 出站 (IPv6走WARP，IPv4走赛风)" ;;
+        esac
+
+        echo
+        green "============================================================"
+        green "  赛风副节点 [$target_cc - $cname] WARP 出站模式配置"
+        green "============================================================"
+        yellow "  说明: 本设置仅对当前副节点生效，主节点与其他副节点完全隔离"
+        green "------------------------------------------------------------"
+        yellow "  当前出站状态: ${cur_desc}"
+        green "------------------------------------------------------------"
+        green "  1. 纯赛风原生出站 (IPv4/IPv6 均走赛风出口)"
+        green "  2. WARP 双栈全局出站 (IPv4/IPv6 全部走 WARP 出口)"
+        green "  3. WARP 仅 IPv4 出站 (IPv4走WARP，IPv6走赛风出口)"
+        green "  4. WARP 仅 IPv6 出站 (IPv6走WARP，IPv4走赛风出口)"
+        green "------------------------------------------------------------"
+        blue  "  5. 优选该副节点 WARP 接入 Endpoint"
+        blue  "  6. 恢复该副节点默认 WARP Endpoint"
+        purple "  7. 实时检测该副节点出口 IP"
+        green "------------------------------------------------------------"
+        red   "  0. 返回上一级"
+        green "============================================================"
+        reading "请选择 [0-7]: " w_choice
+
+        case "$w_choice" in
+            1)
+                set_psiphon_warp_mode "$target_cc" "1"
+                if sync_psiphon_instance_to_singbox "$target_cc" && apply_changes; then
+                    green "[✓] [$target_cc - $cname] 已切换为: 纯赛风原生出站"
+                else
+                    red "[✗] 切换失败: 配置校验或服务重启异常！"
+                fi
+                echo
+                reading "按回车继续..." _
+                ;;
+            2)
+                set_psiphon_warp_mode "$target_cc" "2"
+                if sync_psiphon_instance_to_singbox "$target_cc" && apply_changes; then
+                    green "[✓] [$target_cc - $cname] 已切换为: WARP 双栈全局出站"
+                else
+                    red "[✗] 切换失败: 配置校验或服务重启异常！"
+                fi
+                echo
+                reading "按回车继续..." _
+                ;;
+            3)
+                set_psiphon_warp_mode "$target_cc" "3"
+                if sync_psiphon_instance_to_singbox "$target_cc" && apply_changes; then
+                    green "[✓] [$target_cc - $cname] 已切换为: WARP 仅 IPv4 出站 (IPv4走WARP，IPv6走赛风)"
+                else
+                    red "[✗] 切换失败: 配置校验或服务重启异常！"
+                fi
+                echo
+                reading "按回车继续..." _
+                ;;
+            4)
+                set_psiphon_warp_mode "$target_cc" "4"
+                if sync_psiphon_instance_to_singbox "$target_cc" && apply_changes; then
+                    green "[✓] [$target_cc - $cname] 已切换为: WARP 仅 IPv6 出站 (IPv6走WARP，IPv4走赛风)"
+                else
+                    red "[✗] 切换失败: 配置校验或服务重启异常！"
+                fi
+                echo
+                reading "按回车继续..." _
+                ;;
+            5)
+                yellow "正在测试最优 WARP Endpoint..."
+                local best_ep="162.159.192.1"
+                local candidates=("162.159.192.1" "162.159.193.10" "162.159.195.2" "188.114.96.1" "188.114.97.1")
+                for ep in "${candidates[@]}"; do
+                    if ping -c 1 -W 1 "$ep" >/dev/null 2>&1; then
+                        best_ep="$ep"
+                        break
+                    fi
+                done
+                local wdir="${PSI_INSTANCES_DIR}/${target_cc}/warp"
+                mkdir -p "$wdir"
+                echo "$best_ep" > "$wdir/endpoint.txt"
+                echo "2408" > "$wdir/port.txt"
+                sync_psiphon_instance_to_singbox "$target_cc"
+                apply_changes
+                green "[✓] 已设置 [$target_cc] 专属优选 Endpoint: ${best_ep}:2408"
+                echo
+                reading "按回车继续..." _
+                ;;
+            6)
+                local wdir="${PSI_INSTANCES_DIR}/${target_cc}/warp"
+                mkdir -p "$wdir"
+                echo "162.159.192.1" > "$wdir/endpoint.txt"
+                echo "2408" > "$wdir/port.txt"
+                sync_psiphon_instance_to_singbox "$target_cc"
+                apply_changes
+                green "[✓] 已恢复 [$target_cc] 默认 Endpoint: 162.159.192.1:2408"
+                echo
+                reading "按回车继续..." _
+                ;;
+            7)
+                psiphon_instance_egress_test "$target_cc"
+                echo
+                reading "按回车继续..." _
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                red "无效选项，请重新选择"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 psiphon_multigroup_menu() {
     auto_migrate_legacy_nodes
     while true; do
@@ -3231,6 +3606,14 @@ psiphon_multigroup_menu() {
                 local hp=$(cat "${PSI_INSTANCES_DIR}/$cc/hy2_port.txt" 2>/dev/null || echo "0")
                 local tp=$(cat "${PSI_INSTANCES_DIR}/$cc/tuic_port.txt" 2>/dev/null || echo "0")
                 local vp=$(cat "${PSI_INSTANCES_DIR}/$cc/vless_port.txt" 2>/dev/null || echo "0")
+                local wm=$(get_psiphon_warp_mode "$cc")
+                local wm_tag="[原生]"
+                case "$wm" in
+                    2) wm_tag="${blue}[双栈WARP]${re}" ;;
+                    3) wm_tag="${blue}[仅IPv4 WARP]${re}" ;;
+                    4) wm_tag="${blue}[仅IPv6 WARP]${re}" ;;
+                    *) wm_tag="${green}[纯赛风原生]${re}" ;;
+                esac
                 local p_info=""
                 [[ "$hp" -gt 0 ]] && p_info="${p_info}Hy2:$hp "
                 [[ "$tp" -gt 0 ]] && p_info="${p_info}TUIC:$tp "
@@ -3239,7 +3622,7 @@ psiphon_multigroup_menu() {
                 if is_psiphon_instance_running "$cc"; then
                     st_str="${green}[✓ 运行中]${re}"
                 fi
-                echo -e "  ${green}[$idx] [$cc] $cname${re} $st_str"
+                echo -e "  ${green}[$idx] [$cc] $cname${re} $st_str  ${wm_tag}"
                 echo -e "      ${blue}入站端口: [ ${p_info:-无} ]${re}"
                 ((idx++))
             done
@@ -3254,10 +3637,11 @@ psiphon_multigroup_menu() {
         red    "  3. 删除赛风出口组"
         blue   "  4. 重启/修复指定赛风出口组"
         blue   "  5. 重启所有赛风实例"
+        purple "  6. 配置赛风副节点 WARP 出站"
         echo "------------------------------------------------------------"
         red    "  0. 返回上一级菜单"
         echo "============================================================"
-        reading "请选择 [0-5]: " choice
+        reading "请选择 [0-6]: " choice
 
         case "$choice" in
             1) add_psiphon_instance ;;
@@ -3283,6 +3667,10 @@ psiphon_multigroup_menu() {
                           .tag != $cc and
                           .tag != $ccu
                         )] |
+                        .endpoints = [(.endpoints // [])[] | select(
+                          .tag != ("psiphon-warp-" + $cc) and
+                          .tag != ("psiphon-warp-" + $ccu)
+                        )] |
                         .inbounds = [.inbounds[] | select(
                           (.tag | contains("psi-" + $cc)) or
                           (.tag | contains("psi-" + $ccu)) or
@@ -3291,6 +3679,8 @@ psiphon_multigroup_menu() {
                         .route.rules = [.route.rules[] | select(
                           .outbound != ("psiphon-" + $cc) and
                           .outbound != ("psiphon-" + $cc + "-out") and
+                          .outbound != ("psiphon-warp-" + $cc) and
+                          .outbound != ("psiphon-warp-" + $ccu) and
                           .outbound != ("psiphon-" + $ccu) and
                           .outbound != $cc and
                           .outbound != $ccu
@@ -3321,6 +3711,7 @@ psiphon_multigroup_menu() {
                 done
                 green "所有赛风实例已重启、清空旧缓存并重新载入种子守护！"
                 ;;
+            6) configure_psiphon_instance_warp_menu ;;
             0) return 0 ;;
             *) red "无效选项" ;;
         esac
