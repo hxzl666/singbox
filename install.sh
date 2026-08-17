@@ -1749,14 +1749,12 @@ apply_main_node_outbound() {
       '
       .dns = {
         "servers": [
-          {"type": "udp", "tag": "dns-remote", "server": "1.1.1.1", "detour": "direct"},
-          {"type": "udp", "tag": "dns-google", "server": "8.8.8.8", "detour": "direct"},
-          {"type": "local", "tag": "dns-direct", "detour": "direct"}
+          {"type": "local", "tag": "dns-direct"},
+          {"type": "udp", "tag": "dns-remote", "server": "8.8.8.8", "detour": "direct"}
         ],
-        "final": "dns-remote",
-        "strategy": (if $warp_mode == "ipv4" then "prefer_ipv4" else "prefer_ipv6" end)
+        "final": "dns-direct"
       } |
-      .route.default_domain_resolver = "dns-remote" |
+      .route.default_domain_resolver = "dns-direct" |
       .route = (.route // {}) |
 
       # 确保 socks-loopback 入站存在 (赛风/WARP 出站路由链的关键桥梁)
@@ -1774,14 +1772,13 @@ apply_main_node_outbound() {
       # 清理 endpoints 中的历史 warp-out
       .endpoints = [(.endpoints // [])[] | select(.tag != "warp-out")] |
 
-      # 彻底清理旧的 sniff、resolve、DNS 规则、分流 ip_cidr 规则及 WARP/赛风分流规则
+      # 彻底清理旧的 sniff、resolve、分流 ip_cidr 规则及 WARP/赛风分流规则
       .route.rules = [(.route.rules // [])[] | select(
         (.action != "sniff") and
         (.action != "resolve") and
         (.inbound != ["socks-loopback"]) and
         (.outbound != "warp-out") and
         (.outbound != "psiphon-main-out") and
-        (.protocol != "dns" and .port != 53 and .port != [53]) and
         ((.ip_cidr == ["0.0.0.0/0"] or .ip_cidr == ["::/0"]) | not)
       )] |
       
@@ -1802,52 +1799,40 @@ apply_main_node_outbound() {
           }]
         }] |
         if $warp_mode == "all" or $warp_mode == "dual" then
-          # 双栈全局: 优先 IPv6 解析，双栈流量均走 WARP
+          # 双栈全局: 双栈流量与 socks-loopback 均走 WARP
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
-            {"protocol": "dns", "action": "route", "outbound": "direct"},
-            {"port": 53, "action": "route", "outbound": "direct"},
+            {"inbound": ["socks-loopback"], "action": "route", "outbound": "warp-out"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"},
-            {"ip_version": 6, "action": "route", "outbound": "warp-out"},
-            {"ip_version": 4, "action": "route", "outbound": "warp-out"}
+            {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
-          # 仅 IPv4 走 WARP: IPv4 走 WARP，IPv6 走直连，兜底由 WARP 接管
+          # 仅 IPv4 走 WARP: IPv4 走 WARP，IPv6 走直连
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
-            {"protocol": "dns", "action": "route", "outbound": "direct"},
-            {"port": 53, "action": "route", "outbound": "direct"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv4"},
-            {"ip_cidr": ["::/0"], "action": "route", "outbound": "direct"},
-            {"ip_version": 6, "action": "route", "outbound": "direct"},
             {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "warp-out"},
-            {"ip_version": 4, "action": "route", "outbound": "warp-out"}
+            {"ip_cidr": ["::/0"], "action": "route", "outbound": "direct"}
           ] + .route.rules |
-          .route.final = "warp-out"
+          .route.final = "direct"
         elif $warp_mode == "ipv6" then
-          # 仅 IPv6 走 WARP: IPv4 走直连，其余所有 IPv6 与域名流量 100% 走 WARP (杜绝 HE 原生 IPv6 泄露)
+          # 仅 IPv6 走 WARP: IPv6 走 WARP，IPv4 走直连
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
-            {"protocol": "dns", "action": "route", "outbound": "direct"},
-            {"port": 53, "action": "route", "outbound": "direct"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "direct"},
-            {"ip_version": 4, "action": "route", "outbound": "direct"},
             {"ip_cidr": ["::/0"], "action": "route", "outbound": "warp-out"},
-            {"ip_version": 6, "action": "route", "outbound": "warp-out"}
+            {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "direct"}
           ] + .route.rules |
-          .route.final = "warp-out"
+          .route.final = "direct"
         elif $warp_mode == "google" or $warp_mode == "rules" then
           # 规则分流: 仅特定媒体/AI 域名走 WARP, 其余直连
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
-            {"protocol": "dns", "action": "route", "outbound": "direct"},
-            {"port": 53, "action": "route", "outbound": "direct"},
+            {"inbound": ["socks-loopback"], "action": "route", "outbound": "direct"},
             {"action": "sniff"},
             {
               "domain_suffix": ["google.com", "googlevideo.com", "youtube.com", "netflix.com", "openai.com", "chatgpt.com"],
@@ -1859,13 +1844,10 @@ apply_main_node_outbound() {
         else
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
-            {"protocol": "dns", "action": "route", "outbound": "direct"},
-            {"port": 53, "action": "route", "outbound": "direct"},
+            {"inbound": ["socks-loopback"], "action": "route", "outbound": "warp-out"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"},
-            {"ip_version": 6, "action": "route", "outbound": "warp-out"},
-            {"ip_version": 4, "action": "route", "outbound": "warp-out"}
+            {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "warp-out"
         end
