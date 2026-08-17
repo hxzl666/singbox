@@ -1580,10 +1580,14 @@ sync_psiphon_instance_to_singbox() {
     [[ -f "$cfg" ]] || return 1
     [[ -d "$inst_dir" ]] || return 1
 
-    local hy2_port tuic_port vless_port socks_port uuid reality_pvk reym
+    local hy2_port tuic_port vless_port socks_port uuid reality_pvk reym test_socks_port
     hy2_port=$(cat "$inst_dir/hy2_port.txt" 2>/dev/null || echo "0")
     tuic_port=$(cat "$inst_dir/tuic_port.txt" 2>/dev/null || echo "0")
     vless_port=$(cat "$inst_dir/vless_port.txt" 2>/dev/null || echo "0")
+    test_socks_port=$(cat "$inst_dir/test_socks_port.txt" 2>/dev/null || echo "0")
+    [[ -z "$test_socks_port" || "$test_socks_port" == "0" ]] && test_socks_port=$(get_free_loopback_port)
+    echo "$test_socks_port" > "$inst_dir/test_socks_port.txt"
+
     local cfg_socks_port=$(jq -r '.LocalSocksProxyPort // empty' "$inst_dir/psiphon.config" 2>/dev/null)
     if [[ -n "$cfg_socks_port" && "$cfg_socks_port" -gt 0 ]]; then
         socks_port="$cfg_socks_port"
@@ -1626,6 +1630,7 @@ sync_psiphon_instance_to_singbox() {
       --arg warp_ep "$warp_ep" \
       --argjson warp_port "${warp_port:-2408}" \
       --argjson socks_port "${socks_port:-0}" \
+      --argjson test_port "${test_socks_port:-0}" \
       --argjson hy2_port "${hy2_port:-0}" \
       --argjson tuic_port "${tuic_port:-0}" \
       --argjson vless_port "${vless_port:-0}" \
@@ -1646,7 +1651,7 @@ sync_psiphon_instance_to_singbox() {
         }]
       else . end |
 
-      # 管理专属的 WARP endpoint
+      # 管理专属的 WARP endpoint (通过赛风前置出站 detour: $out_tag 链式直连 Cloudflare)
       .endpoints = [(.endpoints // [])[] | select(.tag != $psi_warp_tag)] |
       if $warp_m != "1" and $warp_pvk != "" then
         .endpoints += [{
@@ -1655,6 +1660,7 @@ sync_psiphon_instance_to_singbox() {
           "system": false,
           "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
           "private_key": $warp_pvk,
+          "detour": $out_tag,
           "peers": [{
             "address": $warp_ep,
             "port": $warp_port,
@@ -1665,15 +1671,22 @@ sync_psiphon_instance_to_singbox() {
         }]
       else . end |
 
-      # 重构专属的 Inbounds (Hy2 / TUIC / VLESS)
+      # 重构专属的 Inbounds (Hy2 / TUIC / VLESS / 本地专属探测 socks-psi-$cc-in)
       .inbounds = [.inbounds[] | select(
         .tag != ("hy2-psi-" + $cc + "-in") and
         .tag != ("tuic-psi-" + $cc + "-in") and
-        .tag != ("vless-psi-" + $cc + "-in")
+        .tag != ("vless-psi-" + $cc + "-in") and
+        .tag != ("socks-psi-" + $cc + "-in")
       )] |
 
       (
         [] |
+        if $test_port > 0 then . + [{
+          "type": "socks",
+          "tag": ("socks-psi-" + $cc + "-in"),
+          "listen": "127.0.0.1",
+          "listen_port": $test_port
+        }] else . end |
         if $hy2_port > 0 then . + [{
           "type": "hysteria2",
           "tag": ("hy2-psi-" + $cc + "-in"),
@@ -3368,13 +3381,17 @@ psiphon_instance_egress_test() {
     green "  【赛风副节点出口 IP 检测】 [$cc - $cname] 当前模式: ${mode_desc}"
     echo "============================================================"
 
+    local test_p=$(cat "${PSI_INSTANCES_DIR}/$cc/test_socks_port.txt" 2>/dev/null)
+    [[ -z "$test_p" || "$test_p" == "0" ]] && test_p=$(cat "${PSI_INSTANCES_DIR}/$cc/socks_port.txt" 2>/dev/null)
+
     # 1. 探测 IPv4
     yellow "[*] 正在探测 IPv4 出口路由..."
     local ipv4="" country4="" region4="" city4="" isp4="" json4=""
-    if [[ "$warp_m" == "2" || "$warp_m" == "3" ]]; then
-        json4=$(curl -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/geoip" 2>/dev/null)
-    elif [[ -n "$socks_p" && "$socks_p" -gt 0 ]]; then
-        json4=$(curl -sx "socks5h://127.0.0.1:${socks_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/geoip" 2>/dev/null)
+    if [[ -n "$test_p" && "$test_p" -gt 0 ]]; then
+        json4=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/geoip" 2>/dev/null)
+        if [[ -z "$json4" || ! "$json4" =~ ip ]]; then
+            ipv4=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+        fi
     fi
 
     if [[ -n "$json4" ]] && echo "$json4" | jq -e '.ip' >/dev/null 2>&1; then
@@ -3398,10 +3415,11 @@ psiphon_instance_egress_test() {
     # 2. 探测 IPv6
     yellow "[*] 正在探测 IPv6 出口路由..."
     local ipv6="" country6="" region6="" city6="" isp6="" json6=""
-    if [[ "$warp_m" == "2" || "$warp_m" == "4" ]]; then
-        json6=$(curl -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/geoip" 2>/dev/null)
-    elif [[ -n "$socks_p" && "$socks_p" -gt 0 ]]; then
-        json6=$(curl -sx "socks5h://127.0.0.1:${socks_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/geoip" 2>/dev/null)
+    if [[ -n "$test_p" && "$test_p" -gt 0 ]]; then
+        json6=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/geoip" 2>/dev/null)
+        if [[ -z "$json6" || ! "$json6" =~ ip ]]; then
+            ipv6=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+        fi
     fi
 
     if [[ -n "$json6" ]] && echo "$json6" | jq -e '.ip' >/dev/null 2>&1; then
