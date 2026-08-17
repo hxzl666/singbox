@@ -690,12 +690,12 @@ warp_egress_test() {
     green "  【主节点出口 IP 检测】 当前模式: ${mode_desc}"
     echo "============================================================"
 
-    # 1. 探测 IPv4 出口 (使用 ip.sb 官方专用 IPv4 端点)
+    # 1. 探测 IPv4 出口
     yellow "[*] 正在探测 IPv4 出口路由..."
     local ipv4="" country4="" region4="" city4="" isp4="" json4=""
     
     # 优先请求 api-ipv4.ip.sb/geoip 一步获取 IP 和归属地
-    json4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/geoip" 2>/dev/null)
+    json4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/geoip" 2>/dev/null)
     if [[ -n "$json4" ]] && echo "$json4" | jq -e '.ip' >/dev/null 2>&1; then
         ipv4=$(echo "$json4" | jq -r '.ip // empty' 2>/dev/null)
         country4=$(echo "$json4" | jq -r '.country // empty' 2>/dev/null)
@@ -706,23 +706,21 @@ warp_egress_test() {
 
     # 纯文本端点重试
     if [[ -z "$ipv4" ]]; then
-        ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+        ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
         [[ -z "$ipv4" || ! "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
-            ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api.ipify.org" 2>/dev/null | tr -d ' \r\n')
-        [[ -z "$ipv4" || ! "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
-            ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "http://ip-api.com/line/?fields=query" 2>/dev/null | tr -d ' \r\n')
+            ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api.ipify.org" 2>/dev/null | tr -d ' \r\n')
     fi
 
     # 赛风模式备用探测
     if [[ -z "$ipv4" && "$psi_en" == "true" ]]; then
         local psi_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
-        ipv4=$(curl -sx "socks5h://127.0.0.1:${psi_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+        ipv4=$(curl -sx "socks5h://127.0.0.1:${psi_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
     fi
 
     if [[ -n "$ipv4" && "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         if [[ -z "$country4" ]]; then
             local info4
-            info4=$(curl -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api.ip.sb/geoip/${ipv4}" 2>/dev/null || curl -s --connect-timeout 2 -m 4 "http://ip-api.com/json/${ipv4}?lang=zh-CN" 2>/dev/null)
+            info4=$(curl -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api.ip.sb/geoip/${ipv4}" 2>/dev/null || curl -s --connect-timeout 3 -m 5 "http://ip-api.com/json/${ipv4}?lang=zh-CN" 2>/dev/null)
             country4=$(echo "$info4" | jq -r '.country // .country_name // empty' 2>/dev/null)
             region4=$(echo "$info4" | jq -r '.region // .regionName // empty' 2>/dev/null)
             city4=$(echo "$info4" | jq -r '.city // empty' 2>/dev/null)
@@ -738,12 +736,12 @@ warp_egress_test() {
 
     echo "  ----------------------------------------------------------"
 
-    # 2. 探测 IPv6 出口 (使用 ip.sb 官方专用 IPv6 端点，具备独立 AAAA 解析)
+    # 2. 探测 IPv6 出口
     yellow "[*] 正在探测 IPv6 出口路由..."
     local ipv6="" country6="" region6="" city6="" isp6="" json6=""
 
     # 优先请求 api-ipv6.ip.sb/geoip
-    json6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/geoip" 2>/dev/null)
+    json6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/geoip" 2>/dev/null)
     if [[ -n "$json6" ]] && echo "$json6" | jq -e '.ip' >/dev/null 2>&1; then
         ipv6=$(echo "$json6" | jq -r '.ip // empty' 2>/dev/null)
         country6=$(echo "$json6" | jq -r '.country // empty' 2>/dev/null)
@@ -754,11 +752,9 @@ warp_egress_test() {
 
     # 纯文本端点重试
     if [[ -z "$ipv6" ]]; then
-        ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+        ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
         [[ -z "$ipv6" || ! "$ipv6" =~ : ]] && \
-            ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api6.ipify.org" 2>/dev/null | tr -d ' \r\n')
-        [[ -z "$ipv6" || ! "$ipv6" =~ : ]] && \
-            ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://ipv6.icanhazip.com" 2>/dev/null | tr -d ' \r\n')
+            ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api6.ipify.org" 2>/dev/null | tr -d ' \r\n')
     fi
 
     if [[ -n "$ipv6" && "$ipv6" =~ : ]]; then
@@ -1728,105 +1724,61 @@ apply_main_node_outbound() {
       )] |
       
       if $warp_en == "true" then
+        # 基础 WARP Endpoint 配置 (保持双栈 allowed_ips 放行，由路由层精确控制分流)
+        .endpoints += [{
+          "type": "wireguard",
+          "tag": "warp-out",
+          "system": false,
+          "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
+          "private_key": $warp_pvk,
+          "peers": [{
+            "address": $warp_ep,
+            "port": $warp_port,
+            "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+            "allowed_ips": ["0.0.0.0/0", "::/0"],
+            "reserved": $warp_res
+          }]
+        }] |
         if $warp_mode == "all" or $warp_mode == "dual" then
-          # 双栈全局: allowed_ips 放行 IPv4+IPv6 全部流量, domain_strategy 优先 IPv6
-          .endpoints += [{
-            "type": "wireguard",
-            "tag": "warp-out",
-            "system": false,
-            "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
-            "private_key": $warp_pvk,
-            "domain_strategy": "prefer_ipv6",
-            "peers": [{
-              "address": $warp_ep,
-              "port": $warp_port,
-              "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-              "allowed_ips": ["0.0.0.0/0", "::/0"],
-              "reserved": $warp_res
-            }]
-          }] |
-          .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
+          # 双栈全局: 所有流量经由 warp-out 出站
+          .route.rules = [
+            {"action": "sniff"},
+            {"action": "resolve", "strategy": "prefer_ipv6"},
+            {"inbound": ["socks-loopback"], "outbound": "warp-out"}
+          ] + .route.rules |
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
-          # 仅 IPv4 走 WARP: allowed_ips 仅放行 0.0.0.0/0, domain_strategy 强制 IPv4 解析
-          .endpoints += [{
-            "type": "wireguard",
-            "tag": "warp-out",
-            "system": false,
-            "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
-            "private_key": $warp_pvk,
-            "domain_strategy": "prefer_ipv4",
-            "peers": [{
-              "address": $warp_ep,
-              "port": $warp_port,
-              "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-              "allowed_ips": ["0.0.0.0/0"],
-              "reserved": $warp_res
-            }]
-          }] |
-          .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
-          .route.final = "warp-out"
+          # 仅 IPv4 走 WARP: IPv4 流量走 WARP, IPv6 原生直连
+          .route.rules = [
+            {"action": "sniff"},
+            {"action": "resolve", "strategy": "prefer_ipv4"},
+            {"ip_cidr": ["0.0.0.0/0"], "outbound": "warp-out"}
+          ] + .route.rules |
+          .route.final = "direct"
         elif $warp_mode == "ipv6" then
-          # 仅 IPv6 走 WARP: allowed_ips 仅放行 ::/0, domain_strategy 优先 IPv6 解析
-          .endpoints += [{
-            "type": "wireguard",
-            "tag": "warp-out",
-            "system": false,
-            "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
-            "private_key": $warp_pvk,
-            "domain_strategy": "prefer_ipv6",
-            "peers": [{
-              "address": $warp_ep,
-              "port": $warp_port,
-              "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-              "allowed_ips": ["::/0"],
-              "reserved": $warp_res
-            }]
-          }] |
-          .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
-          .route.final = "warp-out"
+          # 仅 IPv6 走 WARP: IPv6 流量走 WARP, IPv4 原生直连
+          .route.rules = [
+            {"action": "sniff"},
+            {"action": "resolve", "strategy": "prefer_ipv6"},
+            {"ip_cidr": ["::/0"], "outbound": "warp-out"}
+          ] + .route.rules |
+          .route.final = "direct"
         elif $warp_mode == "google" or $warp_mode == "rules" then
-          # 规则分流: allowed_ips 放行全部, 仅匹配特定域名走 WARP
-          .endpoints += [{
-            "type": "wireguard",
-            "tag": "warp-out",
-            "system": false,
-            "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
-            "private_key": $warp_pvk,
-            "domain_strategy": "prefer_ipv6",
-            "peers": [{
-              "address": $warp_ep,
-              "port": $warp_port,
-              "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-              "allowed_ips": ["0.0.0.0/0", "::/0"],
-              "reserved": $warp_res
-            }]
-          }] |
-          .route.rules += [
-            {"inbound": ["socks-loopback"], "outbound": "warp-out"},
+          # 规则分流: 仅特定媒体/AI 域名走 WARP, 其余原生直连
+          .route.rules = [
+            {"action": "sniff"},
             {
               "domain_suffix": ["google.com", "googlevideo.com", "youtube.com", "netflix.com", "openai.com", "chatgpt.com"],
               "outbound": "warp-out"
             }
-          ] |
+          ] + .route.rules |
           .route.final = "direct"
         else
-          .endpoints += [{
-            "type": "wireguard",
-            "tag": "warp-out",
-            "system": false,
-            "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
-            "private_key": $warp_pvk,
-            "domain_strategy": "prefer_ipv6",
-            "peers": [{
-              "address": $warp_ep,
-              "port": $warp_port,
-              "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-              "allowed_ips": ["0.0.0.0/0", "::/0"],
-              "reserved": $warp_res
-            }]
-          }] |
-          .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
+          .route.rules = [
+            {"action": "sniff"},
+            {"action": "resolve", "strategy": "prefer_ipv6"},
+            {"inbound": ["socks-loopback"], "outbound": "warp-out"}
+          ] + .route.rules |
           .route.final = "warp-out"
         end
       elif $psi_en == "true" then
@@ -1837,10 +1789,14 @@ apply_main_node_outbound() {
           "server_port": $psi_port,
           "version": "5"
         }] |
-        .route.rules += [{"inbound": ["socks-loopback"], "outbound": "psiphon-main-out"}] |
+        .route.rules = [
+          {"inbound": ["socks-loopback"], "outbound": "psiphon-main-out"}
+        ] + .route.rules |
         .route.final = "psiphon-main-out"
       else
-        .route.rules += [{"inbound": ["socks-loopback"], "outbound": "direct"}] |
+        .route.rules = [
+          {"inbound": ["socks-loopback"], "outbound": "direct"}
+        ] + .route.rules |
         .route.final = "direct"
       end |
       if (.endpoints | length) == 0 then del(.endpoints) else . end
