@@ -51,8 +51,6 @@ log_err() { echo -e "${red}[错误] $1${re}"; }
 WORKDIR="/etc/s-box"
 PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
 PSI_INSTANCES_DIR="${WORKDIR}/psiphon_instances"
-WARP_PLUS_VERSION="v1.2.6"
-WARP_PLUS_BIN="${WORKDIR}/warp-plus"
 SCRIPT_VERSION="2.0.0"
 
 # 智能检测 IPv6 支持（自适应双栈 / 纯 IPv4 / LXD / Docker 容器环境）
@@ -389,77 +387,6 @@ download_psiphon_core() {
     return 0
 }
 
-download_warp_plus_core() {
-    [[ -x "$WARP_PLUS_BIN" ]] && return 0
-
-    local arch=$(detect_arch)
-    local asset="" sha=""
-    case "$arch" in
-        amd64|x86_64)
-            asset="warp-plus_linux-amd64.zip"
-            sha="380d2c8655b33db818adf407c706d52d14c2ab1764e702e91f356a7d7d9c3c98"
-            ;;
-        arm64|aarch64)
-            asset="warp-plus_linux-arm64.zip"
-            sha="c0b430c117eaa33513fa012aca983303ee88a4bda0f935dc62ff016109e492f3"
-            ;;
-        *)
-            red "[!] 当前架构暂未纳入 Cfon 支持：${arch}"
-            return 1
-            ;;
-    esac
-
-    command -v unzip >/dev/null 2>&1 || {
-        red "[!] 缺少 unzip 工具，无法解压 warp-plus"
-        return 1
-    }
-
-    local tmp_dir
-    tmp_dir=$(mktemp -d) || return 1
-    local wp_urls=(
-        "https://github.com/bepass-org/warp-plus/releases/download/${WARP_PLUS_VERSION}/${asset}"
-        "https://ghproxy.net/https://github.com/bepass-org/warp-plus/releases/download/${WARP_PLUS_VERSION}/${asset}"
-    )
-
-    yellow "[*] 正在下载 Cfon / warp-plus 核心 (${asset})..."
-    local downloaded=0
-    for url in "${wp_urls[@]}"; do
-        echo -e "${blue}--> 尝试下载源: ${url}${re}"
-        if curl -# -fSL --connect-timeout 10 --max-time 180 "$url" -o "$tmp_dir/pkg.zip"; then
-            downloaded=1
-            break
-        fi
-    done
-
-    if [[ $downloaded -eq 0 ]]; then
-        rm -rf "$tmp_dir"
-        red "[!] warp-plus 下载失败，请检查网络连通性"
-        return 1
-    fi
-
-    if [[ -n "$sha" ]] && command -v sha256sum >/dev/null 2>&1; then
-        if ! echo "${sha}  ${tmp_dir}/pkg.zip" | sha256sum -c - >/dev/null 2>&1; then
-            rm -rf "$tmp_dir"
-            red "[!] warp-plus 校验 SHA256 失败，已终止安装"
-            return 1
-        fi
-    fi
-
-    unzip -qo "$tmp_dir/pkg.zip" -d "$tmp_dir"
-    local bin
-    bin=$(find "$tmp_dir" -type f -name 'warp-plus' | head -n1)
-    if [[ -z "$bin" ]]; then
-        rm -rf "$tmp_dir"
-        red "[!] 压缩包中未找到 warp-plus 可执行文件"
-        return 1
-    fi
-
-    install -m 0755 "$bin" "$WARP_PLUS_BIN"
-    rm -rf "$tmp_dir"
-    green "[+] warp-plus / Cfon 核心安装完成: $WARP_PLUS_BIN"
-    return 0
-}
-
 setup_psiphon_systemd_services() {
     if [[ -d /etc/systemd/system ]] && ! $IS_DIRECT && ! $IS_OPENRC; then
         cat > /etc/systemd/system/psiphon-main.service <<'EOF_PSI_MAIN'
@@ -496,83 +423,8 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF_PSI_INST
 
-        cat > /etc/systemd/system/psiphon-cfon@.service <<'EOF_PSI_CFON'
-[Unit]
-Description=Psiphon Cfon secondary exit for %i
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/etc/s-box/psiphon_instances/%i
-ExecStart=/bin/bash -c 'idir="/etc/s-box/psiphon_instances/$1"; port=$(tr -cd 0-9 < "$idir/socks_port.txt"); test -n "$port" || exit 64; exec /etc/s-box/warp-plus --cfon --country "$1" --bind "127.0.0.1:$port" --cache-dir "$idir/cfon"' -- %i
-Restart=always
-RestartSec=5
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF_PSI_CFON
-
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
-}
-
-start_cfon_instance() {
-    local cc="${1^^}"
-    local idir="${PSI_INSTANCES_DIR}/${cc}"
-    [[ -d "$idir" ]] || return 1
-    local port
-    port=$(cat "$idir/socks_port.txt" 2>/dev/null)
-    [[ "$port" =~ ^[0-9]+$ ]] && [[ "$port" -gt 0 ]] || return 1
-    mkdir -p "$idir/cfon"
-
-    download_warp_plus_core || return 1
-    setup_psiphon_systemd_services
-
-    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
-        systemctl enable --now "psiphon-cfon@${cc}" >/dev/null 2>&1 || true
-    else
-        local pid=$(cat "$idir/cfon.pid" 2>/dev/null)
-        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
-            nohup "$WARP_PLUS_BIN" --cfon --country "$cc" \
-                --bind "127.0.0.1:${port}" \
-                --cache-dir "$idir/cfon" \
-                >> "$idir/cfon.log" 2>&1 &
-            echo $! > "$idir/cfon.pid"
-        fi
-    fi
-    return 0
-}
-
-stop_cfon_instance() {
-    local cc="${1^^}"
-    local idir="${PSI_INSTANCES_DIR}/${cc}"
-    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
-        systemctl stop "psiphon-cfon@${cc}" >/dev/null 2>&1 || true
-        systemctl disable --now "psiphon-cfon@${cc}" >/dev/null 2>&1 || true
-    fi
-    local pid=$(cat "$idir/cfon.pid" 2>/dev/null)
-    [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null || true
-    pkill -9 -f "${WARP_PLUS_BIN}.*--country ${cc}" 2>/dev/null || true
-    rm -f "$idir/cfon.pid"
-}
-
-is_cfon_instance_running() {
-    local cc="${1^^}"
-    local idir="${PSI_INSTANCES_DIR}/${cc}"
-    [[ -d "$idir" ]] || return 1
-    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
-        systemctl is-active "psiphon-cfon@${cc}" >/dev/null 2>&1 && return 0
-    fi
-    local pid=$(cat "$idir/cfon.pid" 2>/dev/null)
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        return 0
-    fi
-    if pgrep -f "${WARP_PLUS_BIN}.*--country ${cc}" >/dev/null 2>&1; then
-        return 0
-    fi
-    return 1
 }
 
 start_psiphon_instance() {
@@ -1011,6 +863,7 @@ write_psiphon_config() {
     local region="$2"
     local cfg_file="$3"
     local data_dir="$4"
+    local upstream_proxy="$5"
 
     mkdir -p "$data_dir" 2>/dev/null
     [[ "${region^^}" == "AUTO" ]] && region=""
@@ -1034,6 +887,11 @@ write_psiphon_config() {
         done
     fi
 
+    local upstream_line=""
+    if [[ -n "$upstream_proxy" ]]; then
+        upstream_line="  \"UpstreamProxyURL\": \"${upstream_proxy}\","
+    fi
+
     cat > "$cfg_file" <<EOF_PSI
 {
   "DataRootDirectory": "${data_dir}",
@@ -1043,6 +901,7 @@ write_psiphon_config() {
   "LocalSocksProxyPort": ${socks_port:-0},
   "DisableLocalHTTPProxy": true,
   "LocalHttpProxyPort": 0,
+${upstream_line}
   "EgressRegion": "${region}",
   "PropagationChannelId": "FFFFFFFFFFFFFFFF",
   "SponsorId": "FFFFFFFFFFFFFFFF",
@@ -3373,10 +3232,9 @@ repair_single_psiphon_instance() {
 
     # 3. 彻底重置历史脏数据并载入纯净种子服务器列表
     echo -e "${blue}--> [3/5] 彻底重置历史脏数据并载入纯净种子列表...${re}"
-    download_psiphon_core || return 1
-    rm -rf "$inst_dir/data" 2>/dev/null || true
-    mkdir -p "$inst_dir/data" 2>/dev/null
-    write_psiphon_config "$socks_p" "$target_cc" "$inst_dir/psiphon.config" "$inst_dir/data"
+    local up_proxy=""
+    [[ "$(get_psiphon_egress_mode "$target_cc")" == "cfon" ]] && up_proxy="socks5://127.0.0.1:20080"
+    write_psiphon_config "$socks_p" "$target_cc" "$inst_dir/psiphon.config" "$inst_dir/data" "$up_proxy"
 
     # 4. 同步 Sing-box 路由与入站
     echo -e "${blue}--> [4/5] 同步 Sing-box 出站与分流路由规则...${re}"
@@ -3562,10 +3420,9 @@ configure_psiphon_instance_egress_menu() {
         case "$mode_choice" in
             1)
                 yellow "[*] 正在切换 [$target_cc - $cname] 为【纯赛风原生出站】..."
-                stop_cfon_instance "$target_cc"
                 set_psiphon_egress_mode "$target_cc" "psiphon"
-                write_psiphon_config "$socks_p" "$target_cc" "$idir/psiphon.config" "$idir/data"
-                start_psiphon_instance "$target_cc"
+                write_psiphon_config "$socks_p" "$target_cc" "$idir/psiphon.config" "$idir/data" ""
+                restart_psiphon_instance "$target_cc"
                 sync_psiphon_instance_to_singbox "$target_cc"
                 apply_changes
                 green "[✓] [$target_cc - $cname] 已切换为: 纯赛风原生出站"
@@ -3574,35 +3431,13 @@ configure_psiphon_instance_egress_menu() {
                 ;;
             2)
                 yellow "[*] 正在切换 [$target_cc - $cname] 为【赛风（WARP 前置 / Cfon）】..."
-                if ! download_warp_plus_core; then
-                    red "[!] 下载 warp-plus 核心失败，切换终止"
-                else
-                    stop_psiphon_instance "$target_cc"
-                    set_psiphon_egress_mode "$target_cc" "cfon"
-                    start_cfon_instance "$target_cc"
-                    
-                    # 握手验证
-                    yellow "[*] 正在验证 Cfon 本地监听与连接..."
-                    local ok=0
-                    for ((i=1; i<=8; i++)); do
-                        if timeout 3 curl -sx "socks5h://127.0.0.1:${socks_p}" -s4 --connect-timeout 2 -m 2 "http://api.ipify.org" >/dev/null 2>&1; then
-                            ok=1
-                            break
-                        fi
-                        sleep 1
-                    done
-
-                    if [[ $ok -eq 1 ]]; then
-                        sync_psiphon_instance_to_singbox "$target_cc"
-                        apply_changes
-                        green "[✓] [$target_cc - $cname] 成功切换为: 赛风（WARP 前置 / Cfon）！"
-                    else
-                        yellow "[!] Cfon 握手耗时较长，守护进程已在后台持续同步"
-                        sync_psiphon_instance_to_singbox "$target_cc"
-                        apply_changes
-                        green "[✓] 配置已应用，后台服务持续拉起中"
-                    fi
-                fi
+                ensure_warp_config
+                set_psiphon_egress_mode "$target_cc" "cfon"
+                write_psiphon_config "$socks_p" "$target_cc" "$idir/psiphon.config" "$idir/data" "socks5://127.0.0.1:20080"
+                restart_psiphon_instance "$target_cc"
+                sync_psiphon_instance_to_singbox "$target_cc"
+                apply_changes
+                green "[✓] [$target_cc - $cname] 成功切换为: 赛风（WARP 前置 / Cfon）！"
                 echo
                 reading "按回车继续..." _
                 ;;
@@ -3613,19 +3448,10 @@ configure_psiphon_instance_egress_menu() {
                 ;;
             4)
                 echo
-                local cur_mode=$(get_psiphon_egress_mode "$target_cc")
-                if [[ "$cur_mode" == "cfon" ]]; then
-                    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
-                        journalctl -u "psiphon-cfon@${target_cc}" -n 50 --no-pager
-                    else
-                        tail -n 50 "$idir/cfon.log" 2>/dev/null || yellow "暂无日志"
-                    fi
+                if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+                    journalctl -u "psiphon-instance@${target_cc}" -n 50 --no-pager
                 else
-                    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
-                        journalctl -u "psiphon-instance@${target_cc}" -n 50 --no-pager
-                    else
-                        tail -n 50 "$idir/psiphon.log" 2>/dev/null || yellow "暂无日志"
-                    fi
+                    tail -n 50 "$idir/psiphon.log" 2>/dev/null || yellow "暂无日志"
                 fi
                 echo
                 reading "按回车继续..." _
@@ -3759,19 +3585,16 @@ psiphon_multigroup_menu() {
                 for cc in "${insts[@]}"; do
                     [[ -z "$cc" ]] && continue
                     local idir="${PSI_INSTANCES_DIR}/${cc}"
-                    stop_secondary_egress "$cc"
-                    local mode=$(get_psiphon_egress_mode "$cc")
-                    if [[ "$mode" == "cfon" ]]; then
-                        start_cfon_instance "$cc"
-                    else
-                        rm -rf "$idir/data" 2>/dev/null || true
-                        mkdir -p "$idir/data" 2>/dev/null
-                        local socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
-                        [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
-                        echo "$socks_p" > "$idir/socks_port.txt"
-                        write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data"
-                        start_psiphon_instance "$cc"
-                    fi
+                    stop_psiphon_instance "$cc"
+                    rm -rf "$idir/data" 2>/dev/null || true
+                    mkdir -p "$idir/data" 2>/dev/null
+                    local socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
+                    [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
+                    echo "$socks_p" > "$idir/socks_port.txt"
+                    local up_proxy=""
+                    [[ "$(get_psiphon_egress_mode "$cc")" == "cfon" ]] && up_proxy="socks5://127.0.0.1:20080"
+                    write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data" "$up_proxy"
+                    start_psiphon_instance "$cc"
                 done
                 green "所有赛风实例已按照各自模式重启并重新载入！"
                 ;;
