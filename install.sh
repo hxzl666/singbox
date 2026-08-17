@@ -1088,16 +1088,13 @@ cleanup_orphan_secondary_nodes() {
     local tmp_clean=$(mktemp)
     if jq --argjson valids "$(printf '%s\n' "${valid_tags[@]}" | jq -R . | jq -s .)" '
       .outbounds = [.outbounds[] | select(.tag as $t | ($valids | index($t)) != null)] |
-      .route.rules = [.route.rules[] | select(.outbound as $o | ($valids | index($o)) != null)] |
-      .dns = {
-        "servers": [
-          {"type": "local", "tag": "dns-direct"},
-          {"type": "local", "tag": "local"},
-          {"type": "udp", "tag": "dns-remote", "server": "8.8.8.8"},
-          {"type": "udp", "tag": "remote-dns", "server": "8.8.8.8"}
-        ],
-        "final": "dns-direct"
-      }
+      .route.rules = [
+        .route.rules[] |
+        select(
+          (has("outbound") | not) or
+          (.outbound as $o | ($valids | index($o)) != null)
+        )
+      ]
     ' "$cfg" > "$tmp_clean" 2>/dev/null && jq -e . "$tmp_clean" >/dev/null 2>&1; then
         mv -f "$tmp_clean" "$cfg"
     else
@@ -1736,23 +1733,23 @@ apply_main_node_outbound() {
           .route.rules = [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0", "0.0.0.0/0"], "outbound": "warp-out"}
+            {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
-          # 仅 IPv4 走 WARP (s4): 优先 IPv4 解析，0.0.0.0/0 走 WARP，其余直连
+          # 仅 IPv4 走 WARP (s4): 强制 IPv4 解析，0.0.0.0/0 走 WARP，其余直连
           .route.rules = [
             {"action": "sniff"},
-            {"action": "resolve", "strategy": "prefer_ipv4"},
-            {"ip_cidr": ["0.0.0.0/0"], "outbound": "warp-out"}
+            {"action": "resolve", "strategy": "ipv4_only"},
+            {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "direct"
         elif $warp_mode == "ipv6" then
-          # 仅 IPv6 走 WARP (s6): 优先 IPv6 解析，::/0 走 WARP，其余直连
+          # 仅 IPv6 走 WARP (s6): 强制 IPv6 解析，::/0 走 WARP，其余直连
           .route.rules = [
             {"action": "sniff"},
-            {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0"], "outbound": "warp-out"}
+            {"action": "resolve", "strategy": "ipv6_only"},
+            {"ip_cidr": ["::/0"], "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "direct"
         elif $warp_mode == "google" or $warp_mode == "rules" then
@@ -1761,6 +1758,7 @@ apply_main_node_outbound() {
             {"action": "sniff"},
             {
               "domain_suffix": ["google.com", "googlevideo.com", "youtube.com", "netflix.com", "openai.com", "chatgpt.com"],
+              "action": "route",
               "outbound": "warp-out"
             }
           ] + .route.rules |
@@ -1769,7 +1767,7 @@ apply_main_node_outbound() {
           .route.rules = [
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
-            {"ip_cidr": ["::/0", "0.0.0.0/0"], "outbound": "warp-out"}
+            {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"}
           ] + .route.rules |
           .route.final = "warp-out"
         end
@@ -1782,12 +1780,12 @@ apply_main_node_outbound() {
           "version": "5"
         }] |
         .route.rules = [
-          {"inbound": ["socks-loopback"], "outbound": "psiphon-main-out"}
+          {"inbound": ["socks-loopback"], "action": "route", "outbound": "psiphon-main-out"}
         ] + .route.rules |
         .route.final = "psiphon-main-out"
       else
         .route.rules = [
-          {"inbound": ["socks-loopback"], "outbound": "direct"}
+          {"inbound": ["socks-loopback"], "action": "route", "outbound": "direct"}
         ] + .route.rules |
         .route.final = "direct"
       end |
@@ -1804,21 +1802,13 @@ apply_changes() {
         return 1
     fi
 
-    # 规范化补全 route.default_domain_resolver 与 dns 配置 (适配 Sing-box 1.12.0+ / 1.13.0+ 强校验要求)
+    # 适配 Sing-box 1.12.0+ / 1.13.0+ 默认解析器强校验要求 (仅在需要时补齐)
     if command -v jq >/dev/null 2>&1; then
         local tmp_fix=$(mktemp)
         jq '
-          .dns = (.dns // {
-            "servers": [
-              {"type": "local", "tag": "dns-direct"},
-              {"type": "local", "tag": "local"},
-              {"type": "udp", "tag": "dns-remote", "server": "8.8.8.8"},
-              {"type": "udp", "tag": "remote-dns", "server": "8.8.8.8"}
-            ],
-            "final": "dns-direct"
-          }) |
-          .route = (.route // {}) |
-          .route.default_domain_resolver = (.route.default_domain_resolver // "dns-direct")
+          if (.route // null) != null and (.dns // null) != null then
+            .route.default_domain_resolver = (.route.default_domain_resolver // "dns-direct")
+          else . end
         ' /etc/s-box/sb.json > "$tmp_fix" 2>/dev/null && mv -f "$tmp_fix" /etc/s-box/sb.json
     fi
 
@@ -2205,9 +2195,11 @@ configure_warp_outbound() {
                 echo "false" > "$WORKDIR/warp_enabled.txt"
                 echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
                 stop_main_psiphon
-                apply_main_node_outbound
-                apply_changes
-                green "[✓] 已切换为主节点: 原生直连出站"
+                if apply_main_node_outbound && apply_changes; then
+                    green "[✓] 已切换为主节点: 原生直连出站"
+                else
+                    red "[✗] 切换失败: 配置生成或服务重启异常！"
+                fi
                 echo
                 reading "按回车继续..." _
                 ;;
@@ -2217,9 +2209,11 @@ configure_warp_outbound() {
                 echo "all" > "$WORKDIR/warp_mode.txt"
                 echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
                 stop_main_psiphon
-                apply_main_node_outbound
-                apply_changes
-                green "[✓] 已切换为主节点: WARP 双栈全局出站"
+                if apply_main_node_outbound && apply_changes; then
+                    green "[✓] 已切换为主节点: WARP 双栈全局出站"
+                else
+                    red "[✗] 切换失败: 配置生成或服务重启异常！"
+                fi
                 echo
                 reading "按回车继续..." _
                 ;;
@@ -2229,9 +2223,11 @@ configure_warp_outbound() {
                 echo "ipv4" > "$WORKDIR/warp_mode.txt"
                 echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
                 stop_main_psiphon
-                apply_main_node_outbound
-                apply_changes
-                green "[✓] 已切换为主节点: WARP 仅 IPv4 出站"
+                if apply_main_node_outbound && apply_changes; then
+                    green "[✓] 已切换为主节点: WARP 仅 IPv4 出站"
+                else
+                    red "[✗] 切换失败: 配置生成或服务重启异常！"
+                fi
                 echo
                 reading "按回车继续..." _
                 ;;
@@ -2241,9 +2237,11 @@ configure_warp_outbound() {
                 echo "ipv6" > "$WORKDIR/warp_mode.txt"
                 echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
                 stop_main_psiphon
-                apply_main_node_outbound
-                apply_changes
-                green "[✓] 已切换为主节点: WARP 仅 IPv6 出站"
+                if apply_main_node_outbound && apply_changes; then
+                    green "[✓] 已切换为主节点: WARP 仅 IPv6 出站"
+                else
+                    red "[✗] 切换失败: 配置生成或服务重启异常！"
+                fi
                 echo
                 reading "按回车继续..." _
                 ;;
@@ -2253,9 +2251,11 @@ configure_warp_outbound() {
                 echo "google" > "$WORKDIR/warp_mode.txt"
                 echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
                 stop_main_psiphon
-                apply_main_node_outbound
-                apply_changes
-                green "[✓] 已切换为主节点: WARP 规则分流出站"
+                if apply_main_node_outbound && apply_changes; then
+                    green "[✓] 已切换为主节点: WARP 规则分流出站"
+                else
+                    red "[✗] 切换失败: 配置生成或服务重启异常！"
+                fi
                 echo
                 reading "按回车继续..." _
                 ;;
@@ -2263,9 +2263,11 @@ configure_warp_outbound() {
                 echo "false" > "$WORKDIR/warp_enabled.txt"
                 echo "true" > "$WORKDIR/psiphon_main_enabled.txt"
                 start_main_psiphon
-                apply_main_node_outbound
-                apply_changes
-                green "[✓] 已切换为主节点: 赛风出站"
+                if apply_main_node_outbound && apply_changes; then
+                    green "[✓] 已切换为主节点: 赛风出站"
+                else
+                    red "[✗] 切换失败: 配置生成或服务重启异常！"
+                fi
                 echo
                 reading "按回车继续..." _
                 ;;
