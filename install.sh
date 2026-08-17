@@ -51,6 +51,8 @@ log_err() { echo -e "${red}[错误] $1${re}"; }
 WORKDIR="/etc/s-box"
 PROXY_GROUPS_DIR="${WORKDIR}/proxy_groups"
 PSI_INSTANCES_DIR="${WORKDIR}/psiphon_instances"
+WARP_PLUS_VERSION="v1.2.6"
+WARP_PLUS_BIN="${WORKDIR}/warp-plus"
 SCRIPT_VERSION="2.0.0"
 
 # 智能检测 IPv6 支持（自适应双栈 / 纯 IPv4 / LXD / Docker 容器环境）
@@ -188,7 +190,7 @@ install_system_dependencies() {
     export DEBIAN_FRONTEND=noninteractive
 
     local need_install=0
-    for cmd in curl wget jq openssl tar git net-tools; do
+    for cmd in curl wget jq openssl tar git net-tools unzip; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             need_install=1
             break
@@ -196,22 +198,22 @@ install_system_dependencies() {
     done
 
     if [[ $need_install -eq 1 ]]; then
-        yellow "[*] 正在安装系统基础依赖 (curl, wget, jq, openssl, git, net-tools, ca-certificates)..."
+        yellow "[*] 正在安装系统基础依赖 (curl, wget, jq, openssl, git, net-tools, unzip, ca-certificates)..."
         if command -v apt-get >/dev/null 2>&1; then
             echo -e "${blue}--> 正在更新 APT 软件包列表...${re}"
             apt-get update -y || yellow "[!] APT 源更新存在部分失败，尝试继续安装依赖..."
             echo -e "${blue}--> 正在安装基础依赖软件包...${re}"
-            apt-get install -y --no-install-recommends curl wget tar jq openssl git net-tools cron ca-certificates
+            apt-get install -y --no-install-recommends curl wget tar jq openssl git net-tools unzip cron ca-certificates
         elif command -v yum >/dev/null 2>&1; then
             echo -e "${blue}--> 正在安装 YUM 基础依赖包...${re}"
-            yum install -y curl wget tar jq openssl git net-tools cronie ca-certificates
+            yum install -y curl wget tar jq openssl git net-tools unzip cronie ca-certificates
         elif command -v apk >/dev/null 2>&1; then
             echo -e "${blue}--> 正在更新 APK 软件源并安装依赖...${re}"
             apk update
-            apk add curl wget tar jq openssl git net-tools ca-certificates
+            apk add curl wget tar jq openssl git net-tools unzip ca-certificates
         elif command -v pacman >/dev/null 2>&1; then
             echo -e "${blue}--> 正在安装 Pacman 基础依赖包...${re}"
-            pacman -Sy --noconfirm curl wget tar jq openssl net-tools cronie ca-certificates
+            pacman -Sy --noconfirm curl wget tar jq openssl net-tools unzip cronie ca-certificates
         fi
         green "[+] 系统依赖包安装完成"
     else
@@ -387,6 +389,77 @@ download_psiphon_core() {
     return 0
 }
 
+download_warp_plus_core() {
+    [[ -x "$WARP_PLUS_BIN" ]] && return 0
+
+    local arch=$(detect_arch)
+    local asset="" sha=""
+    case "$arch" in
+        amd64|x86_64)
+            asset="warp-plus_linux-amd64.zip"
+            sha="380d2c8655b33db818adf407c706d52d14c2ab1764e702e91f356a7d7d9c3c98"
+            ;;
+        arm64|aarch64)
+            asset="warp-plus_linux-arm64.zip"
+            sha="c0b430c117eaa33513fa012aca983303ee88a4bda0f935dc62ff016109e492f3"
+            ;;
+        *)
+            red "[!] 当前架构暂未纳入 Cfon 支持：${arch}"
+            return 1
+            ;;
+    esac
+
+    command -v unzip >/dev/null 2>&1 || {
+        red "[!] 缺少 unzip 工具，无法解压 warp-plus"
+        return 1
+    }
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d) || return 1
+    local wp_urls=(
+        "https://github.com/bepass-org/warp-plus/releases/download/${WARP_PLUS_VERSION}/${asset}"
+        "https://ghproxy.net/https://github.com/bepass-org/warp-plus/releases/download/${WARP_PLUS_VERSION}/${asset}"
+    )
+
+    yellow "[*] 正在下载 Cfon / warp-plus 核心 (${asset})..."
+    local downloaded=0
+    for url in "${wp_urls[@]}"; do
+        echo -e "${blue}--> 尝试下载源: ${url}${re}"
+        if curl -# -fSL --connect-timeout 10 --max-time 180 "$url" -o "$tmp_dir/pkg.zip"; then
+            downloaded=1
+            break
+        fi
+    done
+
+    if [[ $downloaded -eq 0 ]]; then
+        rm -rf "$tmp_dir"
+        red "[!] warp-plus 下载失败，请检查网络连通性"
+        return 1
+    fi
+
+    if [[ -n "$sha" ]] && command -v sha256sum >/dev/null 2>&1; then
+        if ! echo "${sha}  ${tmp_dir}/pkg.zip" | sha256sum -c - >/dev/null 2>&1; then
+            rm -rf "$tmp_dir"
+            red "[!] warp-plus 校验 SHA256 失败，已终止安装"
+            return 1
+        fi
+    fi
+
+    unzip -qo "$tmp_dir/pkg.zip" -d "$tmp_dir"
+    local bin
+    bin=$(find "$tmp_dir" -type f -name 'warp-plus' | head -n1)
+    if [[ -z "$bin" ]]; then
+        rm -rf "$tmp_dir"
+        red "[!] 压缩包中未找到 warp-plus 可执行文件"
+        return 1
+    fi
+
+    install -m 0755 "$bin" "$WARP_PLUS_BIN"
+    rm -rf "$tmp_dir"
+    green "[+] warp-plus / Cfon 核心安装完成: $WARP_PLUS_BIN"
+    return 0
+}
+
 setup_psiphon_systemd_services() {
     if [[ -d /etc/systemd/system ]] && ! $IS_DIRECT && ! $IS_OPENRC; then
         cat > /etc/systemd/system/psiphon-main.service <<'EOF_PSI_MAIN'
@@ -423,8 +496,83 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF_PSI_INST
 
+        cat > /etc/systemd/system/psiphon-cfon@.service <<'EOF_PSI_CFON'
+[Unit]
+Description=Psiphon Cfon secondary exit for %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/s-box/psiphon_instances/%i
+ExecStart=/bin/bash -c 'idir="/etc/s-box/psiphon_instances/$1"; port=$(tr -cd 0-9 < "$idir/socks_port.txt"); test -n "$port" || exit 64; exec /etc/s-box/warp-plus --cfon --country "$1" --bind "127.0.0.1:$port" --cache-dir "$idir/cfon"' -- %i
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF_PSI_CFON
+
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
+}
+
+start_cfon_instance() {
+    local cc="${1^^}"
+    local idir="${PSI_INSTANCES_DIR}/${cc}"
+    [[ -d "$idir" ]] || return 1
+    local port
+    port=$(cat "$idir/socks_port.txt" 2>/dev/null)
+    [[ "$port" =~ ^[0-9]+$ ]] && [[ "$port" -gt 0 ]] || return 1
+    mkdir -p "$idir/cfon"
+
+    download_warp_plus_core || return 1
+    setup_psiphon_systemd_services
+
+    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        systemctl enable --now "psiphon-cfon@${cc}" >/dev/null 2>&1 || true
+    else
+        local pid=$(cat "$idir/cfon.pid" 2>/dev/null)
+        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+            nohup "$WARP_PLUS_BIN" --cfon --country "$cc" \
+                --bind "127.0.0.1:${port}" \
+                --cache-dir "$idir/cfon" \
+                >> "$idir/cfon.log" 2>&1 &
+            echo $! > "$idir/cfon.pid"
+        fi
+    fi
+    return 0
+}
+
+stop_cfon_instance() {
+    local cc="${1^^}"
+    local idir="${PSI_INSTANCES_DIR}/${cc}"
+    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        systemctl stop "psiphon-cfon@${cc}" >/dev/null 2>&1 || true
+        systemctl disable --now "psiphon-cfon@${cc}" >/dev/null 2>&1 || true
+    fi
+    local pid=$(cat "$idir/cfon.pid" 2>/dev/null)
+    [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null || true
+    pkill -9 -f "${WARP_PLUS_BIN}.*--country ${cc}" 2>/dev/null || true
+    rm -f "$idir/cfon.pid"
+}
+
+is_cfon_instance_running() {
+    local cc="${1^^}"
+    local idir="${PSI_INSTANCES_DIR}/${cc}"
+    [[ -d "$idir" ]] || return 1
+    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        systemctl is-active "psiphon-cfon@${cc}" >/dev/null 2>&1 && return 0
+    fi
+    local pid=$(cat "$idir/cfon.pid" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    if pgrep -f "${WARP_PLUS_BIN}.*--country ${cc}" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
 }
 
 start_psiphon_instance() {
@@ -473,12 +621,42 @@ is_psiphon_instance_running() {
     return 1
 }
 
+# 统一的副节点出站进程启停与检测接口
+start_secondary_egress() {
+    local cc="${1^^}"
+    local mode=$(get_psiphon_egress_mode "$cc")
+    if [[ "$mode" == "cfon" ]]; then
+        stop_psiphon_instance "$cc"
+        start_cfon_instance "$cc"
+    else
+        stop_cfon_instance "$cc"
+        start_psiphon_instance "$cc"
+    fi
+}
+
+stop_secondary_egress() {
+    local cc="${1^^}"
+    stop_psiphon_instance "$cc"
+    stop_cfon_instance "$cc"
+}
+
+is_secondary_egress_running() {
+    local cc="${1^^}"
+    local mode=$(get_psiphon_egress_mode "$cc")
+    if [[ "$mode" == "cfon" ]]; then
+        is_cfon_instance_running "$cc"
+    else
+        is_psiphon_instance_running "$cc"
+    fi
+}
+
 restart_psiphon_instance() {
     local cc="${1^^}"
-    local idir="${PSI_INSTANCES_DIR}/${cc}"
-    setup_psiphon_systemd_services
-    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
-        systemctl restart "psiphon-instance@${cc}" >/dev/null 2>&1 || true
+    local mode=$(get_psiphon_egress_mode "$cc")
+    if [[ "$mode" == "cfon" ]]; then
+        stop_cfon_instance "$cc"
+        sleep 1
+        start_cfon_instance "$cc"
     else
         stop_psiphon_instance "$cc"
         sleep 1
@@ -1076,7 +1254,7 @@ cleanup_orphan_secondary_nodes() {
     local psi_insts
     mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
     for cc in "${psi_insts[@]}"; do
-        [[ -n "$cc" ]] && valid_tags+=("psiphon-${cc,,}" "psiphon-warp-${cc,,}")
+        [[ -n "$cc" ]] && valid_tags+=("psiphon-${cc,,}")
     done
 
     local proxy_tags
@@ -1504,71 +1682,26 @@ sync_proxy_group_to_singbox() {
     fi
 }
 
-# ==================== 赛风副节点独立 WARP 管理模块 ====================
-get_psiphon_warp_mode() {
+# ==================== 赛风副节点出站模式管理模块 (纯赛风 / Cfon) ====================
+get_psiphon_egress_mode() {
     local cc="${1^^}"
-    local mode_file="${PSI_INSTANCES_DIR}/${cc}/warp/mode.txt"
-    [[ -f "$mode_file" ]] && cat "$mode_file" 2>/dev/null || echo "1"
+    local file="${PSI_INSTANCES_DIR}/${cc}/egress_mode.txt"
+    [[ -f "$file" ]] && cat "$file" 2>/dev/null || echo "psiphon"
 }
 
-set_psiphon_warp_mode() {
+set_psiphon_egress_mode() {
     local cc="${1^^}"
     local mode="$2"
-    local dir="${PSI_INSTANCES_DIR}/${cc}/warp"
-    mkdir -p "$dir"
-    echo "$mode" > "$dir/mode.txt"
+    [[ "$mode" == "psiphon" || "$mode" == "cfon" ]] || return 1
+    mkdir -p "${PSI_INSTANCES_DIR}/${cc}"
+    printf '%s\n' "$mode" > "${PSI_INSTANCES_DIR}/${cc}/egress_mode.txt"
 }
 
-get_psiphon_warp_endpoint() {
-    local cc="${1^^}"
-    local ep_file="${PSI_INSTANCES_DIR}/${cc}/warp/endpoint.txt"
-    [[ -f "$ep_file" ]] && cat "$ep_file" 2>/dev/null || echo "162.159.192.1"
-}
-
-init_psiphon_warp_config() {
-    local cc="${1^^}"
-    local dir="${PSI_INSTANCES_DIR}/${cc}/warp"
-    mkdir -p "$dir"
-
-    local warpurl
-    warpurl=$(curl -sm5 -k https://warp.xijp.eu.org 2>/dev/null || wget -qO- --timeout=5 https://warp.xijp.eu.org 2>/dev/null)
-    
-    local WARP_PVK="52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A="
-    local WARP_IPV6="2606:4700:110:8d8d:1845:c39f:2dd5:a03a"
-    local WARP_RES="[215, 69, 233]"
-    
-    if [[ -n "$warpurl" ]] && ! printf '%s' "$warpurl" | grep -q -i "html"; then
-        local tmp_pvk tmp_ipv6 tmp_res
-        tmp_pvk=$(echo "$warpurl" | awk -F'：' '/Private_key/{print $2}' | xargs)
-        tmp_ipv6=$(echo "$warpurl" | awk -F'：' '/IPV6/{print $2}' | xargs)
-        tmp_res=$(echo "$warpurl" | awk -F'：' '/reserved/{print $2}' | xargs)
-        
-        [[ -n "$tmp_pvk" ]] && WARP_PVK="$tmp_pvk"
-        [[ -n "$tmp_ipv6" ]] && WARP_IPV6="$tmp_ipv6"
-        if [[ -n "$tmp_res" ]]; then
-            if [[ ! "$tmp_res" =~ ^\[ ]]; then
-                WARP_RES="[${tmp_res}]"
-            else
-                WARP_RES="$tmp_res"
-            fi
-        fi
-    fi
-
-    echo "$WARP_PVK" > "$dir/private_key.txt"
-    echo "$WARP_IPV6" > "$dir/ipv6.txt"
-    echo "$WARP_RES" > "$dir/reserved.txt"
-    [[ ! -f "$dir/endpoint.txt" ]] && echo "162.159.192.1" > "$dir/endpoint.txt"
-    [[ ! -f "$dir/port.txt" ]] && echo "2408" > "$dir/port.txt"
-    return 0
-}
-
-ensure_psiphon_warp_config() {
-    local cc="${1^^}"
-    local dir="${PSI_INSTANCES_DIR}/${cc}/warp"
-    if [[ -s "$dir/private_key.txt" && -s "$dir/ipv6.txt" && -s "$dir/reserved.txt" ]]; then
-        return 0
-    fi
-    init_psiphon_warp_config "$cc"
+get_psiphon_egress_desc() {
+    case "$(get_psiphon_egress_mode "$1")" in
+        cfon) echo "赛风（WARP 前置 / Cfon）" ;;
+        *)    echo "纯赛风原生出站" ;;
+    esac
 }
 
 # ==================== 同步赛风副节点到 sing-box (纯 jq) ====================
@@ -1588,13 +1721,12 @@ sync_psiphon_instance_to_singbox() {
     [[ -z "$test_socks_port" || "$test_socks_port" == "0" ]] && test_socks_port=$(get_free_loopback_port)
     echo "$test_socks_port" > "$inst_dir/test_socks_port.txt"
 
-    local cfg_socks_port=$(jq -r '.LocalSocksProxyPort // empty' "$inst_dir/psiphon.config" 2>/dev/null)
-    if [[ -n "$cfg_socks_port" && "$cfg_socks_port" -gt 0 ]]; then
-        socks_port="$cfg_socks_port"
+    socks_port=$(cat "$inst_dir/socks_port.txt" 2>/dev/null || echo "0")
+    if [[ -z "$socks_port" || "$socks_port" == "0" ]]; then
+        socks_port=$(get_free_loopback_port)
         echo "$socks_port" > "$inst_dir/socks_port.txt"
-    else
-        socks_port=$(cat "$inst_dir/socks_port.txt" 2>/dev/null || echo "0")
     fi
+
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
     [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$cfg" 2>/dev/null | head -n1)
     reality_pvk=$(cat "$WORKDIR/private_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key' "$cfg" 2>/dev/null | head -n1)
@@ -1602,33 +1734,12 @@ sync_psiphon_instance_to_singbox() {
     local cc_lower=$(echo "$cc" | tr '[:upper:]' '[:lower:]')
     local out_tag="psiphon-${cc_lower}"
 
-    # 读取该赛风副节点的专属 WARP 模式与凭据
-    local warp_m=$(get_psiphon_warp_mode "$cc")
-    local psi_warp_tag="psiphon-warp-${cc_lower}"
-    local warp_pvk="" warp_ipv6="" warp_res="[0,0,0]" warp_ep="162.159.192.1" warp_port="2408"
-    if [[ "$warp_m" != "1" ]]; then
-        ensure_psiphon_warp_config "$cc"
-        local wdir="${PSI_INSTANCES_DIR}/${cc}/warp"
-        warp_pvk=$(cat "$wdir/private_key.txt" 2>/dev/null)
-        warp_ipv6=$(cat "$wdir/ipv6.txt" 2>/dev/null)
-        warp_res=$(cat "$wdir/reserved.txt" 2>/dev/null || echo "[215, 69, 233]")
-        warp_ep=$(cat "$wdir/endpoint.txt" 2>/dev/null || echo "162.159.192.1")
-        warp_port=$(cat "$wdir/port.txt" 2>/dev/null || echo "2408")
-    fi
-
     local tmp_json
     tmp_json=$(mktemp)
 
     if jq \
       --arg cc "$cc_lower" \
       --arg out_tag "$out_tag" \
-      --arg psi_warp_tag "$psi_warp_tag" \
-      --arg warp_m "$warp_m" \
-      --arg warp_pvk "$warp_pvk" \
-      --arg warp_ipv6 "$warp_ipv6" \
-      --argjson warp_res "$warp_res" \
-      --arg warp_ep "$warp_ep" \
-      --argjson warp_port "${warp_port:-2408}" \
       --argjson socks_port "${socks_port:-0}" \
       --argjson test_port "${test_socks_port:-0}" \
       --argjson hy2_port "${hy2_port:-0}" \
@@ -1639,6 +1750,9 @@ sync_psiphon_instance_to_singbox() {
       --arg reym "$reym" \
       --arg listen_addr "${LISTEN_ADDR:-"::"}" \
       '
+      # 清理旧的副节点 WARP endpoint（Cfon 由底座自身管理，无需 singbox endpoint）
+      .endpoints = [(.endpoints // [])[] | select(.tag != ("psiphon-warp-" + $cc))] |
+
       # 管理专属的 SOCKS outbound
       .outbounds = [.outbounds[] | select(.tag != $out_tag)] |
       if $socks_port > 0 then
@@ -1648,26 +1762,6 @@ sync_psiphon_instance_to_singbox() {
           "server": "127.0.0.1",
           "server_port": $socks_port,
           "version": "5"
-        }]
-      else . end |
-
-      # 管理专属的 WARP endpoint (通过赛风前置出站 detour: $out_tag 链式直连 Cloudflare)
-      .endpoints = [(.endpoints // [])[] | select(.tag != $psi_warp_tag)] |
-      if $warp_m != "1" and $warp_pvk != "" then
-        .endpoints += [{
-          "type": "wireguard",
-          "tag": $psi_warp_tag,
-          "system": false,
-          "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
-          "private_key": $warp_pvk,
-          "detour": $out_tag,
-          "peers": [{
-            "address": $warp_ep,
-            "port": $warp_port,
-            "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-            "allowed_ips": ["0.0.0.0/0", "::/0"],
-            "reserved": $warp_res
-          }]
         }]
       else . end |
 
@@ -1727,39 +1821,11 @@ sync_psiphon_instance_to_singbox() {
       .route.rules = [.route.rules[] | select(
         (.inbound != $inbound_tags) and
         (.outbound != $out_tag) and
-        (.outbound != $psi_warp_tag)
+        (.outbound != ("psiphon-warp-" + $cc))
       )] |
 
-      if ($inbound_tags | length) > 0 then
-        if $warp_m == "2" then
-          # 模式 2: 双栈全部走副节点专属 WARP
-          .route.rules = [
-            {"inbound": $inbound_tags, "action": "sniff"},
-            {"inbound": $inbound_tags, "action": "resolve", "strategy": "prefer_ipv6"},
-            {"inbound": $inbound_tags, "action": "route", "outbound": $psi_warp_tag}
-          ] + .route.rules
-        elif $warp_m == "3" then
-          # 模式 3: 仅 IPv4 走 WARP，IPv6 走赛风原生
-          .route.rules = [
-            {"inbound": $inbound_tags, "action": "sniff"},
-            {"inbound": $inbound_tags, "action": "resolve", "strategy": "prefer_ipv4"},
-            {"inbound": $inbound_tags, "ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": $psi_warp_tag},
-            {"inbound": $inbound_tags, "ip_cidr": ["::/0"], "action": "route", "outbound": $out_tag}
-          ] + .route.rules
-        elif $warp_m == "4" then
-          # 模式 4: 仅 IPv6 走 WARP，IPv4 走赛风原生
-          .route.rules = [
-            {"inbound": $inbound_tags, "action": "sniff"},
-            {"inbound": $inbound_tags, "action": "resolve", "strategy": "prefer_ipv6"},
-            {"inbound": $inbound_tags, "ip_cidr": ["::/0"], "action": "route", "outbound": $psi_warp_tag},
-            {"inbound": $inbound_tags, "ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": $out_tag}
-          ] + .route.rules
-        else
-          # 模式 1: 纯赛风原生出站
-          .route.rules = [
-            {"inbound": $inbound_tags, "action": "route", "outbound": $out_tag}
-          ] + .route.rules
-        end
+      if ($inbound_tags | length) > 0 and $socks_port > 0 then
+        .route.rules = ([{"inbound": $inbound_tags, "action": "route", "outbound": $out_tag}] + .route.rules)
       else . end
       ' "$cfg" > "$tmp_json" 2>/dev/null && jq -e . "$tmp_json" >/dev/null 2>&1; then
         mv -f "$tmp_json" "$cfg"
@@ -3366,31 +3432,27 @@ repair_single_psiphon_instance() {
 psiphon_instance_egress_test() {
     local cc="${1^^}"
     local cname=$(get_country_name "$cc")
+    local mode=$(get_psiphon_egress_mode "$cc")
+    local mode_desc=$(get_psiphon_egress_desc "$cc")
     local socks_p=$(cat "${PSI_INSTANCES_DIR}/$cc/socks_port.txt" 2>/dev/null)
-    local warp_m=$(get_psiphon_warp_mode "$cc")
-
-    local mode_desc="纯赛风原生出站"
-    case "$warp_m" in
-        2) mode_desc="WARP 双栈全局出站" ;;
-        3) mode_desc="WARP 仅 IPv4 出站 (IPv4走WARP，IPv6走赛风)" ;;
-        4) mode_desc="WARP 仅 IPv6 出站 (IPv6走WARP，IPv4走赛风)" ;;
-    esac
 
     echo
     echo "============================================================"
-    green "  【赛风副节点出口 IP 检测】 [$cc - $cname] 当前模式: ${mode_desc}"
+    green "  【赛风副节点出口 IP 检测】 [$cc - $cname]"
+    yellow "  当前出站模式: ${mode_desc}"
+    [[ "$mode" == "cfon" ]] && cyan "  说明: Cfon 底座由 WARP 加密前置建立隧道，最终出口归属所选国家"
     echo "============================================================"
 
     local test_p=$(cat "${PSI_INSTANCES_DIR}/$cc/test_socks_port.txt" 2>/dev/null)
-    [[ -z "$test_p" || "$test_p" == "0" ]] && test_p=$(cat "${PSI_INSTANCES_DIR}/$cc/socks_port.txt" 2>/dev/null)
+    [[ -z "$test_p" || "$test_p" == "0" ]] && test_p="$socks_p"
 
     # 1. 探测 IPv4
     yellow "[*] 正在探测 IPv4 出口路由..."
     local ipv4="" country4="" region4="" city4="" isp4="" json4=""
     if [[ -n "$test_p" && "$test_p" -gt 0 ]]; then
-        json4=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/geoip" 2>/dev/null)
+        json4=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 4 -m 6 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/geoip" 2>/dev/null)
         if [[ -z "$json4" || ! "$json4" =~ ip ]]; then
-            ipv4=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+            ipv4=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 4 -m 6 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
         fi
     fi
 
@@ -3407,7 +3469,7 @@ psiphon_instance_egress_test() {
         [[ -n "$country4" || -n "$city4" ]] && blue "      出口国家地区 : ${country4:-未知} - ${region4} ${city4}"
         [[ -n "$isp4" ]] && blue "      网络运营商   : ${isp4}"
     else
-        yellow "  [!] IPv4 出口    : 未获取到"
+        yellow "  [!] IPv4 出口    : 未获取到 (可能远端正在重连，请稍后重试)"
     fi
 
     echo "  ----------------------------------------------------------"
@@ -3416,9 +3478,9 @@ psiphon_instance_egress_test() {
     yellow "[*] 正在探测 IPv6 出口路由..."
     local ipv6="" country6="" region6="" city6="" isp6="" json6=""
     if [[ -n "$test_p" && "$test_p" -gt 0 ]]; then
-        json6=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/geoip" 2>/dev/null)
+        json6=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 4 -m 6 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/geoip" 2>/dev/null)
         if [[ -z "$json6" || ! "$json6" =~ ip ]]; then
-            ipv6=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 3 -m 5 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+            ipv6=$(curl -sx "socks5h://127.0.0.1:${test_p}" -s --connect-timeout 4 -m 6 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
         fi
     fi
 
@@ -3435,12 +3497,12 @@ psiphon_instance_egress_test() {
         [[ -n "$country6" || -n "$city6" ]] && blue "      出口国家地区 : ${country6:-未知} - ${region6} ${city6}"
         [[ -n "$isp6" ]] && blue "      网络运营商   : ${isp6}"
     else
-        yellow "  [!] IPv6 出口    : 未获取到"
+        yellow "  [-] IPv6 出口    : 远端节点未分配 IPv6 (非错误，以 IPv4 赛风出口为主)"
     fi
     echo "============================================================"
 }
 
-configure_psiphon_instance_warp_menu() {
+configure_psiphon_instance_egress_menu() {
     local insts
     mapfile -t insts < <(get_all_psiphon_instances)
     if [[ ${#insts[@]} -eq 0 ]]; then
@@ -3449,18 +3511,12 @@ configure_psiphon_instance_warp_menu() {
     fi
 
     echo
-    green "==== 选择要配置 WARP 出站的赛风副节点 ===="
+    green "==== 选择要配置出站模式的赛风副节点 ===="
     local idx=1
     for cc in "${insts[@]}"; do
         local cname=$(get_country_name "$cc")
-        local wm=$(get_psiphon_warp_mode "$cc")
-        local wm_desc="纯赛风原生"
-        case "$wm" in
-            2) wm_desc="双栈 WARP" ;;
-            3) wm_desc="仅 IPv4 WARP" ;;
-            4) wm_desc="仅 IPv6 WARP" ;;
-        esac
-        echo -e "  ${green}[$idx] [$cc] $cname${re} (当前: ${blue}${wm_desc}${re})"
+        local edesc=$(get_psiphon_egress_desc "$cc")
+        echo -e "  ${green}[$idx] [$cc] $cname${re} (当前: ${blue}${edesc}${re})"
         ((idx++))
     done
     echo "------------------------------------------------------------"
@@ -3480,111 +3536,97 @@ configure_psiphon_instance_warp_menu() {
     fi
 
     local cname=$(get_country_name "$target_cc")
+    local idir="${PSI_INSTANCES_DIR}/${target_cc}"
+    local socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null || echo "0")
+
     while true; do
         [[ -t 1 ]] && clear 2>/dev/null || true
-        local cur_m=$(get_psiphon_warp_mode "$target_cc")
-        local cur_desc="纯赛风原生出站"
-        case "$cur_m" in
-            2) cur_desc="WARP 双栈全局出站" ;;
-            3) cur_desc="WARP 仅 IPv4 出站 (IPv4走WARP，IPv6走赛风)" ;;
-            4) cur_desc="WARP 仅 IPv6 出站 (IPv6走WARP，IPv4走赛风)" ;;
-        esac
+        local cur_desc=$(get_psiphon_egress_desc "$target_cc")
 
         echo
         green "============================================================"
-        green "  赛风副节点 [$target_cc - $cname] WARP 出站模式配置"
+        green "  赛风副节点 [$target_cc - $cname] 出站模式管理"
         green "============================================================"
-        yellow "  说明: 本设置仅对当前副节点生效，主节点与其他副节点完全隔离"
-        green "------------------------------------------------------------"
         yellow "  当前出站状态: ${cur_desc}"
-        green "------------------------------------------------------------"
-        green "  1. 纯赛风原生出站 (IPv4/IPv6 均走赛风出口)"
-        green "  2. WARP 双栈全局出站 (IPv4/IPv6 全部走 WARP 出口)"
-        green "  3. WARP 仅 IPv4 出站 (IPv4走WARP，IPv6走赛风出口)"
-        green "  4. WARP 仅 IPv6 出站 (IPv6走WARP，IPv4走赛风出口)"
-        green "------------------------------------------------------------"
-        blue  "  5. 优选该副节点 WARP 接入 Endpoint"
-        blue  "  6. 恢复该副节点默认 WARP Endpoint"
-        purple "  7. 实时检测该副节点出口 IP"
-        green "------------------------------------------------------------"
+        echo "------------------------------------------------------------"
+        green "  1. 切换为: 纯赛风原生出站 (Psiphon 原生传输)"
+        green "  2. 切换为: 赛风（WARP 前置 / Cfon 出站 - 防阻断底座）"
+        echo "------------------------------------------------------------"
+        purple "  3. 实时检测该副节点出口 IP"
+        blue  "  4. 查看该副节点运行日志"
+        echo "------------------------------------------------------------"
         red   "  0. 返回上一级"
-        green "============================================================"
-        reading "请选择 [0-7]: " w_choice
+        echo "============================================================"
+        reading "请选择 [0-4]: " mode_choice
 
-        case "$w_choice" in
+        case "$mode_choice" in
             1)
-                set_psiphon_warp_mode "$target_cc" "1"
-                if sync_psiphon_instance_to_singbox "$target_cc" && apply_changes; then
-                    green "[✓] [$target_cc - $cname] 已切换为: 纯赛风原生出站"
-                else
-                    red "[✗] 切换失败: 配置校验或服务重启异常！"
-                fi
+                yellow "[*] 正在切换 [$target_cc - $cname] 为【纯赛风原生出站】..."
+                stop_cfon_instance "$target_cc"
+                set_psiphon_egress_mode "$target_cc" "psiphon"
+                write_psiphon_config "$socks_p" "$target_cc" "$idir/psiphon.config" "$idir/data"
+                start_psiphon_instance "$target_cc"
+                sync_psiphon_instance_to_singbox "$target_cc"
+                apply_changes
+                green "[✓] [$target_cc - $cname] 已切换为: 纯赛风原生出站"
                 echo
                 reading "按回车继续..." _
                 ;;
             2)
-                set_psiphon_warp_mode "$target_cc" "2"
-                if sync_psiphon_instance_to_singbox "$target_cc" && apply_changes; then
-                    green "[✓] [$target_cc - $cname] 已切换为: WARP 双栈全局出站"
+                yellow "[*] 正在切换 [$target_cc - $cname] 为【赛风（WARP 前置 / Cfon）】..."
+                if ! download_warp_plus_core; then
+                    red "[!] 下载 warp-plus 核心失败，切换终止"
                 else
-                    red "[✗] 切换失败: 配置校验或服务重启异常！"
+                    stop_psiphon_instance "$target_cc"
+                    set_psiphon_egress_mode "$target_cc" "cfon"
+                    start_cfon_instance "$target_cc"
+                    
+                    # 握手验证
+                    yellow "[*] 正在验证 Cfon 本地监听与连接..."
+                    local ok=0
+                    for ((i=1; i<=8; i++)); do
+                        if timeout 3 curl -sx "socks5h://127.0.0.1:${socks_p}" -s4 --connect-timeout 2 -m 2 "http://api.ipify.org" >/dev/null 2>&1; then
+                            ok=1
+                            break
+                        fi
+                        sleep 1
+                    done
+
+                    if [[ $ok -eq 1 ]]; then
+                        sync_psiphon_instance_to_singbox "$target_cc"
+                        apply_changes
+                        green "[✓] [$target_cc - $cname] 成功切换为: 赛风（WARP 前置 / Cfon）！"
+                    else
+                        yellow "[!] Cfon 握手耗时较长，守护进程已在后台持续同步"
+                        sync_psiphon_instance_to_singbox "$target_cc"
+                        apply_changes
+                        green "[✓] 配置已应用，后台服务持续拉起中"
+                    fi
                 fi
                 echo
                 reading "按回车继续..." _
                 ;;
             3)
-                set_psiphon_warp_mode "$target_cc" "3"
-                if sync_psiphon_instance_to_singbox "$target_cc" && apply_changes; then
-                    green "[✓] [$target_cc - $cname] 已切换为: WARP 仅 IPv4 出站 (IPv4走WARP，IPv6走赛风)"
-                else
-                    red "[✗] 切换失败: 配置校验或服务重启异常！"
-                fi
+                psiphon_instance_egress_test "$target_cc"
                 echo
                 reading "按回车继续..." _
                 ;;
             4)
-                set_psiphon_warp_mode "$target_cc" "4"
-                if sync_psiphon_instance_to_singbox "$target_cc" && apply_changes; then
-                    green "[✓] [$target_cc - $cname] 已切换为: WARP 仅 IPv6 出站 (IPv6走WARP，IPv4走赛风)"
-                else
-                    red "[✗] 切换失败: 配置校验或服务重启异常！"
-                fi
                 echo
-                reading "按回车继续..." _
-                ;;
-            5)
-                yellow "正在测试最优 WARP Endpoint..."
-                local best_ep="162.159.192.1"
-                local candidates=("162.159.192.1" "162.159.193.10" "162.159.195.2" "188.114.96.1" "188.114.97.1")
-                for ep in "${candidates[@]}"; do
-                    if ping -c 1 -W 1 "$ep" >/dev/null 2>&1; then
-                        best_ep="$ep"
-                        break
+                local cur_mode=$(get_psiphon_egress_mode "$target_cc")
+                if [[ "$cur_mode" == "cfon" ]]; then
+                    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+                        journalctl -u "psiphon-cfon@${target_cc}" -n 50 --no-pager
+                    else
+                        tail -n 50 "$idir/cfon.log" 2>/dev/null || yellow "暂无日志"
                     fi
-                done
-                local wdir="${PSI_INSTANCES_DIR}/${target_cc}/warp"
-                mkdir -p "$wdir"
-                echo "$best_ep" > "$wdir/endpoint.txt"
-                echo "2408" > "$wdir/port.txt"
-                sync_psiphon_instance_to_singbox "$target_cc"
-                apply_changes
-                green "[✓] 已设置 [$target_cc] 专属优选 Endpoint: ${best_ep}:2408"
-                echo
-                reading "按回车继续..." _
-                ;;
-            6)
-                local wdir="${PSI_INSTANCES_DIR}/${target_cc}/warp"
-                mkdir -p "$wdir"
-                echo "162.159.192.1" > "$wdir/endpoint.txt"
-                echo "2408" > "$wdir/port.txt"
-                sync_psiphon_instance_to_singbox "$target_cc"
-                apply_changes
-                green "[✓] 已恢复 [$target_cc] 默认 Endpoint: 162.159.192.1:2408"
-                echo
-                reading "按回车继续..." _
-                ;;
-            7)
-                psiphon_instance_egress_test "$target_cc"
+                else
+                    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+                        journalctl -u "psiphon-instance@${target_cc}" -n 50 --no-pager
+                    else
+                        tail -n 50 "$idir/psiphon.log" 2>/dev/null || yellow "暂无日志"
+                    fi
+                fi
                 echo
                 reading "按回车继续..." _
                 ;;
@@ -3608,7 +3650,7 @@ psiphon_multigroup_menu() {
         green "  副节点 - 赛风多出口组管理"
         green "============================================================"
         yellow "  说明: 副节点拥有独立入站端口与专属路由，出站走赛风对应国家"
-        yellow "        与主节点完全平行独立，互不干扰"
+        yellow "        支持原生赛风出站与 WARP 前置 (Cfon) 防阻断双模式"
         green "============================================================"
         echo
 
@@ -3624,23 +3666,22 @@ psiphon_multigroup_menu() {
                 local hp=$(cat "${PSI_INSTANCES_DIR}/$cc/hy2_port.txt" 2>/dev/null || echo "0")
                 local tp=$(cat "${PSI_INSTANCES_DIR}/$cc/tuic_port.txt" 2>/dev/null || echo "0")
                 local vp=$(cat "${PSI_INSTANCES_DIR}/$cc/vless_port.txt" 2>/dev/null || echo "0")
-                local wm=$(get_psiphon_warp_mode "$cc")
-                local wm_tag="[原生]"
-                case "$wm" in
-                    2) wm_tag="${blue}[双栈WARP]${re}" ;;
-                    3) wm_tag="${blue}[仅IPv4 WARP]${re}" ;;
-                    4) wm_tag="${blue}[仅IPv6 WARP]${re}" ;;
-                    *) wm_tag="${green}[纯赛风原生]${re}" ;;
-                esac
+                local emode=$(get_psiphon_egress_mode "$cc")
+                local emode_tag="[纯赛风原生]"
+                if [[ "$emode" == "cfon" ]]; then
+                    emode_tag="${blue}[WARP前置/Cfon]${re}"
+                else
+                    emode_tag="${green}[纯赛风原生]${re}"
+                fi
                 local p_info=""
                 [[ "$hp" -gt 0 ]] && p_info="${p_info}Hy2:$hp "
                 [[ "$tp" -gt 0 ]] && p_info="${p_info}TUIC:$tp "
                 [[ "$vp" -gt 0 ]] && p_info="${p_info}VLESS:$vp "
                 local st_str="${red}[✗ 未运行]${re}"
-                if is_psiphon_instance_running "$cc"; then
+                if is_secondary_egress_running "$cc"; then
                     st_str="${green}[✓ 运行中]${re}"
                 fi
-                echo -e "  ${green}[$idx] [$cc] $cname${re} $st_str  ${wm_tag}"
+                echo -e "  ${green}[$idx] [$cc] $cname${re} $st_str  ${emode_tag}"
                 echo -e "      ${blue}入站端口: [ ${p_info:-无} ]${re}"
                 ((idx++))
             done
@@ -3655,7 +3696,7 @@ psiphon_multigroup_menu() {
         red    "  3. 删除赛风出口组"
         blue   "  4. 重启/修复指定赛风出口组"
         blue   "  5. 重启所有赛风实例"
-        purple "  6. 配置赛风副节点 WARP 出站"
+        purple "  6. 配置赛风副节点出站模式 (纯赛风 / Cfon)"
         echo "------------------------------------------------------------"
         red    "  0. 返回上一级菜单"
         echo "============================================================"
@@ -3673,7 +3714,7 @@ psiphon_multigroup_menu() {
                     reading "请输入要删除的国家码 (如 US): " del_cc
                     del_cc="${del_cc^^}"
                     if [[ -d "${PSI_INSTANCES_DIR}/$del_cc" ]] || grep -qix "$del_cc" "$PSI_INSTANCES_DIR/instances.txt" 2>/dev/null; then
-                        stop_psiphon_instance "$del_cc"
+                        stop_secondary_egress "$del_cc"
                         rm -rf "${PSI_INSTANCES_DIR:?}/$del_cc"
                         sed -i "/^${del_cc}$/Id" "$PSI_INSTANCES_DIR/instances.txt"
                         local tmp_j=$(mktemp)
@@ -3718,18 +3759,23 @@ psiphon_multigroup_menu() {
                 for cc in "${insts[@]}"; do
                     [[ -z "$cc" ]] && continue
                     local idir="${PSI_INSTANCES_DIR}/${cc}"
-                    stop_psiphon_instance "$cc"
-                    rm -rf "$idir/data" 2>/dev/null || true
-                    mkdir -p "$idir/data" 2>/dev/null
-                    local socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
-                    [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
-                    echo "$socks_p" > "$idir/socks_port.txt"
-                    write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data"
-                    start_psiphon_instance "$cc"
+                    stop_secondary_egress "$cc"
+                    local mode=$(get_psiphon_egress_mode "$cc")
+                    if [[ "$mode" == "cfon" ]]; then
+                        start_cfon_instance "$cc"
+                    else
+                        rm -rf "$idir/data" 2>/dev/null || true
+                        mkdir -p "$idir/data" 2>/dev/null
+                        local socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
+                        [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
+                        echo "$socks_p" > "$idir/socks_port.txt"
+                        write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data"
+                        start_psiphon_instance "$cc"
+                    fi
                 done
-                green "所有赛风实例已重启、清空旧缓存并重新载入种子守护！"
+                green "所有赛风实例已按照各自模式重启并重新载入！"
                 ;;
-            6) configure_psiphon_instance_warp_menu ;;
+            6) configure_psiphon_instance_egress_menu ;;
             0) return 0 ;;
             *) red "无效选项" ;;
         esac
@@ -4584,7 +4630,13 @@ menu() {
                     service_stop argo-tunnel
                     service_disable sing-box 2>/dev/null
                     service_disable argo-tunnel 2>/dev/null
+                    systemctl disable --now 'psiphon-main' 2>/dev/null || true
+                    systemctl disable --now 'psiphon-instance@*' 2>/dev/null || true
+                    systemctl disable --now 'psiphon-cfon@*' 2>/dev/null || true
+                    rm -f /etc/systemd/system/psiphon-main.service /etc/systemd/system/psiphon-instance@.service /etc/systemd/system/psiphon-cfon@.service
+                    systemctl daemon-reload 2>/dev/null || true
                     pkill -9 -f "psiphon-tunnel-core" 2>/dev/null || true
+                    pkill -9 -f "warp-plus" 2>/dev/null || true
                     rm -rf /etc/s-box /usr/local/bin/cloudflared /usr/local/bin/sb /usr/local/bin/t
                     crontab -l 2>/dev/null | grep -v "sb cron" | crontab - 2>/dev/null || true
                     green "Sing-box 环境已彻底卸载清理！"

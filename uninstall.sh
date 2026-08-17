@@ -88,6 +88,11 @@ service_stop sing-box
 service_stop argo-tunnel
 service_disable sing-box
 service_disable argo-tunnel
+systemctl disable --now 'psiphon-main' 2>/dev/null || true
+systemctl disable --now 'psiphon-instance@*' 2>/dev/null || true
+systemctl disable --now 'psiphon-cfon@*' 2>/dev/null || true
+pkill -9 -f "psiphon-tunnel-core" 2>/dev/null || true
+pkill -9 -f "warp-plus" 2>/dev/null || true
 
 # 2. 清理服务定义文件
 log_info "正在清理服务定义文件..."
@@ -98,7 +103,10 @@ elif $IS_DIRECT; then
 else
     rm -f /etc/systemd/system/sing-box.service
     rm -f /etc/systemd/system/argo-tunnel.service
-    systemctl daemon-reload
+    rm -f /etc/systemd/system/psiphon-main.service
+    rm -f /etc/systemd/system/psiphon-instance@.service
+    rm -f /etc/systemd/system/psiphon-cfon@.service
+    systemctl daemon-reload 2>/dev/null || true
 fi
 
 # 3. 彻底卸载并清理 Nginx 服务
