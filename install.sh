@@ -664,7 +664,7 @@ get_warp_endpoint() {
 
 warp_egress_test() {
     echo
-    purple "正在检测主节点出口 IP (经由当前出站路由)..."
+    purple "正在检测主节点出口 IP..."
     local loop_port
     loop_port=$(jq -r '.inbounds[]? | select(.tag=="socks-loopback") | .listen_port // empty' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
     [[ -z "$loop_port" ]] && loop_port="20080"
@@ -676,69 +676,106 @@ warp_egress_test() {
     local mode_desc="原生直连出站"
     if [[ "$psi_en" == "true" ]]; then
         local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
-        mode_desc="赛风出站 [${cur_reg}]"
+        mode_desc="赛风出站 ${cur_reg}"
     elif [[ "$warp_en" == "true" ]]; then
         case "$warp_m" in
             ipv4) mode_desc="WARP 仅 IPv4 出站" ;;
             ipv6) mode_desc="WARP 仅 IPv6 出站" ;;
             google|rules) mode_desc="WARP 规则分流出站" ;;
-            *) mode_desc="WARP 全局双栈出站" ;;
+            *) mode_desc="WARP 双栈全局出站" ;;
         esac
     fi
 
     echo "============================================================"
-    green "  【主节点出口 IP 检测】 (当前路由模式: ${mode_desc})"
+    green "  【主节点出口 IP 检测】 当前模式: ${mode_desc}"
     echo "============================================================"
 
-    # 1. 探测 IPv4 出口
+    # 1. 探测 IPv4 出口 (使用 ip.sb 官方专用 IPv4 端点)
     yellow "[*] 正在探测 IPv4 出口路由..."
-    local ipv4="" info4=""
-    ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m6 https://api.ipify.org 2>/dev/null || \
-           curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m6 https://ip.sb 2>/dev/null || \
-           curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m6 http://ip-api.com/line/?fields=query 2>/dev/null)
+    local ipv4="" country4="" region4="" city4="" isp4="" json4=""
+    
+    # 优先请求 api-ipv4.ip.sb/geoip 一步获取 IP 和归属地
+    json4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/geoip" 2>/dev/null)
+    if [[ -n "$json4" ]] && echo "$json4" | jq -e '.ip' >/dev/null 2>&1; then
+        ipv4=$(echo "$json4" | jq -r '.ip // empty' 2>/dev/null)
+        country4=$(echo "$json4" | jq -r '.country // empty' 2>/dev/null)
+        region4=$(echo "$json4" | jq -r '.region // empty' 2>/dev/null)
+        city4=$(echo "$json4" | jq -r '.city // empty' 2>/dev/null)
+        isp4=$(echo "$json4" | jq -r '.isp // .organization // .asn_organization // empty' 2>/dev/null)
+    fi
 
+    # 纯文本端点重试
+    if [[ -z "$ipv4" ]]; then
+        ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+        [[ -z "$ipv4" || ! "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
+            ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api.ipify.org" 2>/dev/null | tr -d ' \r\n')
+        [[ -z "$ipv4" || ! "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
+            ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "http://ip-api.com/line/?fields=query" 2>/dev/null | tr -d ' \r\n')
+    fi
+
+    # 赛风模式备用探测
     if [[ -z "$ipv4" && "$psi_en" == "true" ]]; then
         local psi_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
-        ipv4=$(curl -sx "socks5h://127.0.0.1:${psi_port}" -s4m6 https://api.ipify.org 2>/dev/null || curl -sx "socks5h://127.0.0.1:${psi_port}" -s4m6 https://ip.sb 2>/dev/null)
+        ipv4=$(curl -sx "socks5h://127.0.0.1:${psi_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api-ipv4.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
     fi
 
     if [[ -n "$ipv4" && "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        info4=$(curl -s4m5 "http://ip-api.com/json/${ipv4}?lang=zh-CN" 2>/dev/null || curl -s4m5 "https://api.ip.sb/geoip/${ipv4}" 2>/dev/null)
-        local country4 region4 city4 isp4
-        country4=$(echo "$info4" | jq -r '.country // .country_name // empty' 2>/dev/null)
-        region4=$(echo "$info4" | jq -r '.regionName // .region // empty' 2>/dev/null)
-        city4=$(echo "$info4" | jq -r '.city // empty' 2>/dev/null)
-        isp4=$(echo "$info4" | jq -r '.isp // empty' 2>/dev/null)
-        
+        if [[ -z "$country4" ]]; then
+            local info4
+            info4=$(curl -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api.ip.sb/geoip/${ipv4}" 2>/dev/null || curl -s --connect-timeout 2 -m 4 "http://ip-api.com/json/${ipv4}?lang=zh-CN" 2>/dev/null)
+            country4=$(echo "$info4" | jq -r '.country // .country_name // empty' 2>/dev/null)
+            region4=$(echo "$info4" | jq -r '.region // .regionName // empty' 2>/dev/null)
+            city4=$(echo "$info4" | jq -r '.city // empty' 2>/dev/null)
+            isp4=$(echo "$info4" | jq -r '.isp // .organization // empty' 2>/dev/null)
+        fi
+
         green "  [✓] IPv4 出口 IP : ${ipv4}"
-        [[ -n "$country4" || -n "$city4" ]] && blue  "      出口国家/地区: ${country4:-未知} - ${region4} ${city4}"
+        [[ -n "$country4" || -n "$city4" ]] && blue  "      出口国家地区 : ${country4:-未知} - ${region4} ${city4}"
         [[ -n "$isp4" ]] && blue  "      网络运营商   : ${isp4}"
     else
-        yellow "  [!] IPv4 出口    : 未获取到 (无 IPv4 路由或代理连接超时)"
+        yellow "  [!] IPv4 出口    : 未获取到"
     fi
 
     echo "  ----------------------------------------------------------"
 
-    # 2. 探测 IPv6 出口
+    # 2. 探测 IPv6 出口 (使用 ip.sb 官方专用 IPv6 端点，具备独立 AAAA 解析)
     yellow "[*] 正在探测 IPv6 出口路由..."
-    local ipv6="" info6=""
-    ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s6m6 https://api64.ipify.org 2>/dev/null || \
-           curl -sx "socks5h://127.0.0.1:${loop_port}" -s6m6 https://ip.sb 2>/dev/null || \
-           curl -sx "socks5h://127.0.0.1:${loop_port}" -s6m6 https://api6.ipify.org 2>/dev/null)
+    local ipv6="" country6="" region6="" city6="" isp6="" json6=""
+
+    # 优先请求 api-ipv6.ip.sb/geoip
+    json6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/geoip" 2>/dev/null)
+    if [[ -n "$json6" ]] && echo "$json6" | jq -e '.ip' >/dev/null 2>&1; then
+        ipv6=$(echo "$json6" | jq -r '.ip // empty' 2>/dev/null)
+        country6=$(echo "$json6" | jq -r '.country // empty' 2>/dev/null)
+        region6=$(echo "$json6" | jq -r '.region // empty' 2>/dev/null)
+        city6=$(echo "$json6" | jq -r '.city // empty' 2>/dev/null)
+        isp6=$(echo "$json6" | jq -r '.isp // .organization // .asn_organization // empty' 2>/dev/null)
+    fi
+
+    # 纯文本端点重试
+    if [[ -z "$ipv6" ]]; then
+        ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api-ipv6.ip.sb/ip" 2>/dev/null | tr -d ' \r\n')
+        [[ -z "$ipv6" || ! "$ipv6" =~ : ]] && \
+            ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api6.ipify.org" 2>/dev/null | tr -d ' \r\n')
+        [[ -z "$ipv6" || ! "$ipv6" =~ : ]] && \
+            ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://ipv6.icanhazip.com" 2>/dev/null | tr -d ' \r\n')
+    fi
 
     if [[ -n "$ipv6" && "$ipv6" =~ : ]]; then
-        info6=$(curl -s6m5 "https://api.ip.sb/geoip/${ipv6}" 2>/dev/null || curl -sm5 "http://ip-api.com/json/${ipv6}?lang=zh-CN" 2>/dev/null)
-        local country6 region6 city6 isp6
-        country6=$(echo "$info6" | jq -r '.country // .country_name // empty' 2>/dev/null)
-        region6=$(echo "$info6" | jq -r '.region // .regionName // empty' 2>/dev/null)
-        city6=$(echo "$info6" | jq -r '.city // empty' 2>/dev/null)
-        isp6=$(echo "$info6" | jq -r '.isp // empty' 2>/dev/null)
+        if [[ -z "$country6" ]]; then
+            local info6
+            info6=$(curl -s --connect-timeout 2 -m 4 -A "Mozilla/5.0" "https://api.ip.sb/geoip/${ipv6}" 2>/dev/null || curl -s --connect-timeout 2 -m 4 "http://ip-api.com/json/${ipv6}?lang=zh-CN" 2>/dev/null)
+            country6=$(echo "$info6" | jq -r '.country // .country_name // empty' 2>/dev/null)
+            region6=$(echo "$info6" | jq -r '.region // .regionName // empty' 2>/dev/null)
+            city6=$(echo "$info6" | jq -r '.city // empty' 2>/dev/null)
+            isp6=$(echo "$info6" | jq -r '.isp // .organization // empty' 2>/dev/null)
+        fi
 
         green "  [✓] IPv6 出口 IP : ${ipv6}"
-        [[ -n "$country6" || -n "$city6" ]] && blue  "      出口国家/地区: ${country6:-未知} - ${region6} ${city6}"
+        [[ -n "$country6" || -n "$city6" ]] && blue  "      出口国家地区 : ${country6:-未知} - ${region6} ${city6}"
         [[ -n "$isp6" ]] && blue  "      网络运营商   : ${isp6}"
     else
-        yellow "  [!] IPv6 出口    : 未获取到 (无 IPv6 路由或节点未通)"
+        yellow "  [!] IPv6 出口    : 未获取到"
     fi
 
     echo "============================================================"
