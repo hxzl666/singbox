@@ -647,6 +647,13 @@ init_warp_config() {
     return 0
 }
 
+ensure_warp_config() {
+    if [[ -s "$WORKDIR/warp_private_key.txt" && -s "$WORKDIR/warp_ipv6.txt" && -s "$WORKDIR/warp_reserved.txt" ]]; then
+        return 0
+    fi
+    init_warp_config
+}
+
 get_warp_endpoint() {
     if [ -f "$WORKDIR/warp_best_endpoint.txt" ]; then
         cat "$WORKDIR/warp_best_endpoint.txt" 2>/dev/null
@@ -660,47 +667,81 @@ warp_egress_test() {
     purple "正在检测主节点出口 IP (经由当前出站路由)..."
     local loop_port
     loop_port=$(jq -r '.inbounds[]? | select(.tag=="socks-loopback") | .listen_port // empty' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
+    [[ -z "$loop_port" ]] && loop_port="20080"
 
     local psi_en=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null || echo "false")
     local warp_en=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null || echo "false")
     local warp_m=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null || echo "all")
 
-    local ip="" info=""
-
-    if [[ -n "$loop_port" ]]; then
-        ip=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m6 https://api.ipify.org 2>/dev/null || curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m6 https://ip.sb 2>/dev/null)
+    local mode_desc="原生直连出站"
+    if [[ "$psi_en" == "true" ]]; then
+        local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
+        mode_desc="赛风出站 [${cur_reg}]"
+    elif [[ "$warp_en" == "true" ]]; then
+        case "$warp_m" in
+            ipv4) mode_desc="WARP 仅 IPv4 出站" ;;
+            ipv6) mode_desc="WARP 仅 IPv6 出站" ;;
+            google|rules) mode_desc="WARP 规则分流出站" ;;
+            *) mode_desc="WARP 全局双栈出站" ;;
+        esac
     fi
 
-    if [[ -z "$ip" && "$psi_en" == "true" ]]; then
+    echo "============================================================"
+    green "  【主节点出口 IP 检测】 (当前路由模式: ${mode_desc})"
+    echo "============================================================"
+
+    # 1. 探测 IPv4 出口
+    yellow "[*] 正在探测 IPv4 出口路由..."
+    local ipv4="" info4=""
+    ipv4=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m6 https://api.ipify.org 2>/dev/null || \
+           curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m6 https://ip.sb 2>/dev/null || \
+           curl -sx "socks5h://127.0.0.1:${loop_port}" -s4m6 http://ip-api.com/line/?fields=query 2>/dev/null)
+
+    if [[ -z "$ipv4" && "$psi_en" == "true" ]]; then
         local psi_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
-        ip=$(curl -sx "socks5h://127.0.0.1:${psi_port}" -s4m6 https://api.ipify.org 2>/dev/null || curl -sx "socks5h://127.0.0.1:${psi_port}" -s4m6 https://ip.sb 2>/dev/null)
+        ipv4=$(curl -sx "socks5h://127.0.0.1:${psi_port}" -s4m6 https://api.ipify.org 2>/dev/null || curl -sx "socks5h://127.0.0.1:${psi_port}" -s4m6 https://ip.sb 2>/dev/null)
     fi
 
-    if [[ -n "$ip" ]]; then
-        green "============================================================"
-        if [[ "$psi_en" == "true" ]]; then
-            green "  [✓] 主节点出口 IP (赛风出站) : $ip"
-        elif [[ "$warp_en" == "true" ]]; then
-            green "  [✓] 主节点出口 IP (WARP 出站) : $ip"
-        else
-            green "  [✓] 主节点出口 IP (直连出站) : $ip"
-        fi
-        info=$(curl -s4m5 "https://api.ip.sb/geoip/${ip}" 2>/dev/null)
-        if [[ -n "$info" ]]; then
-            local country=$(echo "$info" | jq -r '.country // empty' 2>/dev/null)
-            local region=$(echo "$info" | jq -r '.region // empty' 2>/dev/null)
-            local city=$(echo "$info" | jq -r '.city // empty' 2>/dev/null)
-            local isp=$(echo "$info" | jq -r '.isp // empty' 2>/dev/null)
-            blue  "      出口国家 / 地区 : ${country} - ${region} ${city}"
-            blue  "      网络运营商 (ISP): ${isp}"
-        fi
-        green "============================================================"
+    if [[ -n "$ipv4" && "$ipv4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        info4=$(curl -s4m5 "http://ip-api.com/json/${ipv4}?lang=zh-CN" 2>/dev/null || curl -s4m5 "https://api.ip.sb/geoip/${ipv4}" 2>/dev/null)
+        local country4 region4 city4 isp4
+        country4=$(echo "$info4" | jq -r '.country // .country_name // empty' 2>/dev/null)
+        region4=$(echo "$info4" | jq -r '.regionName // .region // empty' 2>/dev/null)
+        city4=$(echo "$info4" | jq -r '.city // empty' 2>/dev/null)
+        isp4=$(echo "$info4" | jq -r '.isp // empty' 2>/dev/null)
+        
+        green "  [✓] IPv4 出口 IP : ${ipv4}"
+        [[ -n "$country4" || -n "$city4" ]] && blue  "      出口国家/地区: ${country4:-未知} - ${region4} ${city4}"
+        [[ -n "$isp4" ]] && blue  "      网络运营商   : ${isp4}"
     else
-        local res=$(curl -s4m5 https://ip.sb 2>/dev/null || curl -s4m5 https://api.ipify.org 2>/dev/null)
-        yellow "============================================================"
-        yellow "  [!] 代理出站未响应或超时，当前 VPS 原生 IP: ${res:-未知}"
-        yellow "============================================================"
+        yellow "  [!] IPv4 出口    : 未获取到 (无 IPv4 路由或代理连接超时)"
     fi
+
+    echo "  ----------------------------------------------------------"
+
+    # 2. 探测 IPv6 出口
+    yellow "[*] 正在探测 IPv6 出口路由..."
+    local ipv6="" info6=""
+    ipv6=$(curl -sx "socks5h://127.0.0.1:${loop_port}" -s6m6 https://api64.ipify.org 2>/dev/null || \
+           curl -sx "socks5h://127.0.0.1:${loop_port}" -s6m6 https://ip.sb 2>/dev/null || \
+           curl -sx "socks5h://127.0.0.1:${loop_port}" -s6m6 https://api6.ipify.org 2>/dev/null)
+
+    if [[ -n "$ipv6" && "$ipv6" =~ : ]]; then
+        info6=$(curl -s6m5 "https://api.ip.sb/geoip/${ipv6}" 2>/dev/null || curl -sm5 "http://ip-api.com/json/${ipv6}?lang=zh-CN" 2>/dev/null)
+        local country6 region6 city6 isp6
+        country6=$(echo "$info6" | jq -r '.country // .country_name // empty' 2>/dev/null)
+        region6=$(echo "$info6" | jq -r '.region // .regionName // empty' 2>/dev/null)
+        city6=$(echo "$info6" | jq -r '.city // empty' 2>/dev/null)
+        isp6=$(echo "$info6" | jq -r '.isp // empty' 2>/dev/null)
+
+        green "  [✓] IPv6 出口 IP : ${ipv6}"
+        [[ -n "$country6" || -n "$city6" ]] && blue  "      出口国家/地区: ${country6:-未知} - ${region6} ${city6}"
+        [[ -n "$isp6" ]] && blue  "      网络运营商   : ${isp6}"
+    else
+        yellow "  [!] IPv6 出口    : 未获取到 (无 IPv6 路由或节点未通)"
+    fi
+
+    echo "============================================================"
 }
 
 # ==================== 赛风 Psiphon 模块 ====================
@@ -1636,8 +1677,12 @@ apply_main_node_outbound() {
       if any(.outbounds[]; .tag == "direct") then . else .outbounds += [{"type":"direct","tag":"direct"}] end |
       if any(.outbounds[]; .tag == "block") then . else .outbounds += [{"type":"block","tag":"block"}] end |
       
+      # 彻底清理旧的 warp-out 和 psiphon-main-out 出站 (Sing-box 1.11+ 规范中 WireGuard 配置在 endpoints 中)
       .outbounds = [.outbounds[] | select(.tag != "warp-out" and .tag != "psiphon-main-out")] |
       
+      # 清理 endpoints 中的历史 warp-out
+      .endpoints = [(.endpoints // [])[] | select(.tag != "warp-out")] |
+
       # 彻底清理历史的 socks-loopback 规则以及旧的 WARP/赛风 出站分流规则
       .route.rules = [(.route.rules // [])[] | select(
         (.inbound != ["socks-loopback"]) and
@@ -1645,39 +1690,54 @@ apply_main_node_outbound() {
         (.outbound != "psiphon-main-out")
       )] |
       
-      if $warp_en == "true" and $warp_mode == "all" then
-        .outbounds += [{
+      if $warp_en == "true" then
+        .endpoints += [{
           "type": "wireguard",
           "tag": "warp-out",
-          "server": $warp_ep,
-          "server_port": $warp_port,
-          "local_address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
+          "system": false,
+          "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
           "private_key": $warp_pvk,
-          "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-          "reserved": $warp_res
+          "peers": [{
+            "address": $warp_ep,
+            "port": $warp_port,
+            "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+            "allowed_ips": ["0.0.0.0/0", "::/0"],
+            "reserved": $warp_res
+          }]
         }] |
-        .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
-        .route.final = "warp-out"
-      elif $warp_en == "true" and $warp_mode == "google" then
-        .outbounds += [{
-          "type": "wireguard",
-          "tag": "warp-out",
-          "server": $warp_ep,
-          "server_port": $warp_port,
-          "local_address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
-          "private_key": $warp_pvk,
-          "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-          "reserved": $warp_res
-        }] |
-        .route.rules += [
-          {"inbound": ["socks-loopback"], "outbound": "warp-out"},
-          {
-            "geosite": ["google", "youtube", "netflix", "openai"],
-            "domain_suffix": ["google.com", "googlevideo.com", "youtube.com", "netflix.com", "openai.com", "chatgpt.com"],
-            "outbound": "warp-out"
-          }
-        ] |
-        .route.final = "direct"
+        if $warp_mode == "all" or $warp_mode == "dual" then
+          .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
+          .route.final = "warp-out"
+        elif $warp_mode == "ipv4" then
+          .route.rules += [
+            {"inbound": ["socks-loopback"], "ip_version": 4, "outbound": "warp-out"},
+            {"inbound": ["socks-loopback"], "ip_version": 6, "outbound": "direct"},
+            {"ip_version": 4, "outbound": "warp-out"},
+            {"ip_version": 6, "outbound": "direct"}
+          ] |
+          .route.final = "direct"
+        elif $warp_mode == "ipv6" then
+          .route.rules += [
+            {"inbound": ["socks-loopback"], "ip_version": 6, "outbound": "warp-out"},
+            {"inbound": ["socks-loopback"], "ip_version": 4, "outbound": "direct"},
+            {"ip_version": 6, "outbound": "warp-out"},
+            {"ip_version": 4, "outbound": "direct"}
+          ] |
+          .route.final = "direct"
+        elif $warp_mode == "google" or $warp_mode == "rules" then
+          .route.rules += [
+            {"inbound": ["socks-loopback"], "outbound": "warp-out"},
+            {
+              "geosite": ["google", "youtube", "netflix", "openai"],
+              "domain_suffix": ["google.com", "googlevideo.com", "youtube.com", "netflix.com", "openai.com", "chatgpt.com"],
+              "outbound": "warp-out"
+            }
+          ] |
+          .route.final = "direct"
+        else
+          .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
+          .route.final = "warp-out"
+        end
       elif $psi_en == "true" then
         .outbounds += [{
           "type": "socks",
@@ -1691,7 +1751,8 @@ apply_main_node_outbound() {
       else
         .route.rules += [{"inbound": ["socks-loopback"], "outbound": "direct"}] |
         .route.final = "direct"
-      end
+      end |
+      if (.endpoints | length) == 0 then del(.endpoints) else . end
       ' "$cfg" > "$tmp_json" && mv -f "$tmp_json" "$cfg"
 
     sync_all_secondary_nodes
@@ -2022,141 +2083,245 @@ EOF_BLANK
     sync_all_secondary_nodes
 }
 
+# ==================== WARP 出站模式选择子菜单 ====================
+configure_warp_mode_submenu() {
+    while true; do
+        [[ -t 1 ]] && clear 2>/dev/null || true
+        echo
+        green "============================================================"
+        green "  WARP 出站模式选择"
+        green "============================================================"
+        yellow "  说明: 本配置将主节点流量经由 Cloudflare WARP 出口进行路由"
+        echo "============================================================"
+
+        local cur_m cur_s
+        cur_s=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null || echo "false")
+        cur_m=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null || echo "all")
+        if [[ "$cur_s" == "true" ]]; then
+            case "$cur_m" in
+                ipv4) echo -e "  当前模式: ${green}已开启 - 仅 IPv4 走 WARP (IPv6 原生直连)${re}" ;;
+                ipv6) echo -e "  当前模式: ${green}已开启 - 仅 IPv6 走 WARP (IPv4 原生直连)${re}" ;;
+                google|rules) echo -e "  当前模式: ${green}已开启 - WARP 规则分流 (流媒体/AI走WARP)${re}" ;;
+                *) echo -e "  当前模式: ${green}已开启 - IPv4 + IPv6 全部走 WARP (双栈全局)${re}" ;;
+            esac
+        else
+            echo -e "  当前模式: ${yellow}未开启 (当前为主节点直连或赛风出站)${re}"
+        fi
+
+        echo "------------------------------------------------------------"
+        yellow "  1. IPv4 + IPv6 全部走 WARP (双栈全局出站，隐藏真实 IP)"
+        yellow "  2. 仅 IPv4 走 WARP 出站 (IPv4 走 WARP，IPv6 原生直连)"
+        yellow "  3. 仅 IPv6 走 WARP 出站 (IPv6 走 WARP，IPv4 原生直连，适合纯V4小鸡解锁V6)"
+        yellow "  4. WARP 规则分流出站 (仅 Google/OpenAI/Netflix 等走 WARP，其余直连)"
+        echo "------------------------------------------------------------"
+        red    "  0. 返回上一级"
+        echo "============================================================"
+        reading "请选择 [0-4]: " w_choice
+
+        case "$w_choice" in
+            1)
+                ensure_warp_config
+                echo "true" > "$WORKDIR/warp_enabled.txt"
+                echo "all" > "$WORKDIR/warp_mode.txt"
+                echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
+                stop_main_psiphon
+                apply_main_node_outbound
+                apply_changes
+                green "[✓] 已切换为主节点: WARP 全局双栈出站 (全部 IPv4 / IPv6 流量走 WARP)"
+                echo
+                reading "按回车继续..." _
+                return 0
+                ;;
+            2)
+                ensure_warp_config
+                echo "true" > "$WORKDIR/warp_enabled.txt"
+                echo "ipv4" > "$WORKDIR/warp_mode.txt"
+                echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
+                stop_main_psiphon
+                apply_main_node_outbound
+                apply_changes
+                green "[✓] 已切换为主节点: WARP 仅 IPv4 出站 (IPv4 走 WARP，IPv6 原生直连)"
+                echo
+                reading "按回车继续..." _
+                return 0
+                ;;
+            3)
+                ensure_warp_config
+                echo "true" > "$WORKDIR/warp_enabled.txt"
+                echo "ipv6" > "$WORKDIR/warp_mode.txt"
+                echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
+                stop_main_psiphon
+                apply_main_node_outbound
+                apply_changes
+                green "[✓] 已切换为主节点: WARP 仅 IPv6 出站 (IPv6 走 WARP，IPv4 原生直连)"
+                echo
+                reading "按回车继续..." _
+                return 0
+                ;;
+            4)
+                ensure_warp_config
+                echo "true" > "$WORKDIR/warp_enabled.txt"
+                echo "google" > "$WORKDIR/warp_mode.txt"
+                echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
+                stop_main_psiphon
+                apply_main_node_outbound
+                apply_changes
+                green "[✓] 已切换为主节点: WARP 规则分流出站 (流媒体 / AI 走 WARP，常规流量直连)"
+                echo
+                reading "按回车继续..." _
+                return 0
+                ;;
+            0|q|Q|"")
+                return 0
+                ;;
+            *)
+                red "无效输入"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 # ==================== 2. 主节点出站管理子菜单 ====================
 configure_warp_outbound() {
-    [[ -t 1 ]] && clear 2>/dev/null || true
-    echo
-    green "============================================================"
-    green "  主节点出站管理"
-    green "============================================================"
-    yellow "  说明: 本设置仅作用于【主节点】入站流量"
-    yellow "        副节点(外部代理出站、赛风副节点)为独立系统，不受影响"
-    echo "============================================================"
-    
-    if [ ! -f "$WORKDIR/sb.json" ]; then
-        red "未检测到已安装的 Sing-box 配置，请先安装主节点"
-        reading "按回车返回..." _
-        return 1
-    fi
-
-    local current_status current_mode current_psi
-    current_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null || echo "false")
-    current_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null || echo "all")
-    current_psi=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null || echo "false")
-
-    echo
-    purple "【主节点当前出站状态】"
-    if [[ "$current_status" == "true" ]]; then
-        if [[ "$current_mode" == "all" ]]; then
-            blue   "  出站类型 : WARP 全局出站"
-        else
-            blue   "  出站类型 : WARP 规则分流"
+    while true; do
+        [[ -t 1 ]] && clear 2>/dev/null || true
+        echo
+        green "============================================================"
+        green "  主节点出站管理"
+        green "============================================================"
+        yellow "  说明: 本设置仅作用于【主节点】入站流量"
+        yellow "        副节点(外部代理出站、赛风副节点)为独立系统，不受影响"
+        echo "============================================================"
+        
+        if [ ! -f "$WORKDIR/sb.json" ]; then
+            red "未检测到已安装的 Sing-box 配置，请先安装主节点"
+            reading "按回车返回..." _
+            return 1
         fi
-        local ep=$(get_warp_endpoint)
-        green  "  接入节点 : $ep"
-    elif [[ "$current_psi" == "true" ]]; then
-        local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
-        blue   "  出站类型 : Psiphon 赛风出站"
-        blue   "  出口国家 : $cur_reg - $(get_country_name "$cur_reg")"
-    else
-        green  "  出站类型 : 原生直连出站"
-    fi
 
-    echo
-    echo "------------------------------------------------------------"
-    yellow "  0. 切换为直连出站"
-    yellow "  1. 切换为 WARP 全局出站"
-    yellow "  2. 切换为 WARP 规则分流"
-    yellow "  3. 切换为赛风出站"
-    echo "------------------------------------------------------------"
-    green  "  4. 优选 WARP 接入节点"
-    blue   "  5. 恢复默认 WARP 节点"
-    blue   "  6. 重置 WARP 注册凭证"
-    green  "  7. 检测主节点出口 IP"
-    echo "------------------------------------------------------------"
-    red    "  q. 返回主菜单"
-    echo "============================================================"
-    reading "请选择 [0-7, q]: " new_choice
+        local current_status current_mode current_psi
+        current_status=$(cat "$WORKDIR/warp_enabled.txt" 2>/dev/null || echo "false")
+        current_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null || echo "all")
+        current_psi=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null || echo "false")
 
-    case "$new_choice" in
-        0)
-            echo "false" > "$WORKDIR/warp_enabled.txt"
-            echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
-            stop_main_psiphon
-            apply_main_node_outbound
-            apply_changes
-            green "已切换为主节点: 直连出站 (Direct)"
-            ;;
-        1)
-            init_warp_config
-            echo "true" > "$WORKDIR/warp_enabled.txt"
-            echo "all" > "$WORKDIR/warp_mode.txt"
-            echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
-            stop_main_psiphon
-            apply_main_node_outbound
-            apply_changes
-            green "已切换为主节点: WARP 全局出站 (全部流量走 WARP)"
-            ;;
-        2)
-            init_warp_config
-            echo "true" > "$WORKDIR/warp_enabled.txt"
-            echo "google" > "$WORKDIR/warp_mode.txt"
-            echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
-            stop_main_psiphon
-            apply_main_node_outbound
-            apply_changes
-            green "已切换为主节点: WARP 分流出站 (流媒体/AI 走 WARP)"
-            ;;
-        3)
-            echo "false" > "$WORKDIR/warp_enabled.txt"
-            echo "true" > "$WORKDIR/psiphon_main_enabled.txt"
-            start_main_psiphon
-            apply_main_node_outbound
-            apply_changes
-            green "已切换为主节点: 赛风出站 (Psiphon)"
-            ;;
-        4)
-            yellow "正在测试最优 WARP Endpoint..."
-            local best_ep="162.159.192.1"
-            local candidates=("162.159.192.1" "162.159.193.10" "162.159.195.2" "188.114.96.1" "188.114.97.1")
-            for ep in "${candidates[@]}"; do
-                if ping -c 1 -W 1 "$ep" >/dev/null 2>&1; then
-                    best_ep="$ep"
-                    break
-                fi
-            done
-            echo "$best_ep" > "$WORKDIR/warp_best_endpoint.txt"
-            echo "2408" > "$WORKDIR/warp_best_port.txt"
-            apply_main_node_outbound
-            apply_changes
-            green "已设置优选 Endpoint: ${best_ep}:2408"
-            ;;
-        5)
-            echo "162.159.192.1" > "$WORKDIR/warp_best_endpoint.txt"
-            echo "2408" > "$WORKDIR/warp_best_port.txt"
-            apply_main_node_outbound
-            apply_changes
-            green "已恢复 Cloudflare 默认 Endpoint (162.159.192.1:2408)"
-            ;;
-        6)
-            yellow "正在重新获取 WARP 凭据..."
-            init_warp_config
-            apply_main_node_outbound
-            apply_changes
-            green "WARP 凭据已刷新！"
-            ;;
-        7)
-            warp_egress_test
-            ;;
-        q|Q|"")
-            return 0
-            ;;
-        *)
-            red "无效输入"
-            ;;
-    esac
-    echo
-    reading "按回车继续..." _
+        echo
+        purple "【主节点当前出站状态】"
+        if [[ "$current_status" == "true" ]]; then
+            case "$current_mode" in
+                ipv4)
+                    blue   "  出站类型 : WARP 仅 IPv4 出站 (IPv4走WARP，IPv6原生直连)"
+                    ;;
+                ipv6)
+                    blue   "  出站类型 : WARP 仅 IPv6 出站 (IPv6走WARP，IPv4原生直连)"
+                    ;;
+                google|rules)
+                    blue   "  出站类型 : WARP 规则分流出站 (流媒体 / AI 走 WARP)"
+                    ;;
+                *)
+                    blue   "  出站类型 : WARP 全局双栈出站 (IPv4 + IPv6 全部走 WARP)"
+                    ;;
+            esac
+            local ep=$(get_warp_endpoint)
+            local wp_port=$(cat "$WORKDIR/warp_best_port.txt" 2>/dev/null || echo "2408")
+            green  "  接入节点 : ${ep}:${wp_port}"
+        elif [[ "$current_psi" == "true" ]]; then
+            local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
+            blue   "  出站类型 : Psiphon 赛风出站"
+            blue   "  出口国家 : $cur_reg - $(get_country_name "$cur_reg")"
+        else
+            green  "  出站类型 : 原生直连出站"
+        fi
+
+        echo
+        echo "------------------------------------------------------------"
+        yellow "  0. 切换为直连出站 (Direct)"
+        yellow "  1. 切换为 WARP 出站 (进入子菜单: 全局双栈 / 仅V4 / 仅V6 / 规则分流)"
+        yellow "  2. 切换为赛风出站 (Psiphon)"
+        echo "------------------------------------------------------------"
+        green  "  3. 优选 WARP 接入节点"
+        blue   "  4. 恢复默认 WARP 节点"
+        blue   "  5. 重置 WARP 注册凭证"
+        green  "  6. 检测主节点出口 IP (IPv4 / IPv6)"
+        echo "------------------------------------------------------------"
+        red    "  q. 返回主菜单"
+        echo "============================================================"
+        reading "请选择 [0-6, q]: " new_choice
+
+        case "$new_choice" in
+            0)
+                echo "false" > "$WORKDIR/warp_enabled.txt"
+                echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
+                stop_main_psiphon
+                apply_main_node_outbound
+                apply_changes
+                green "已切换为主节点: 直连出站 (Direct)"
+                echo
+                reading "按回车继续..." _
+                ;;
+            1)
+                configure_warp_mode_submenu
+                ;;
+            2)
+                echo "false" > "$WORKDIR/warp_enabled.txt"
+                echo "true" > "$WORKDIR/psiphon_main_enabled.txt"
+                start_main_psiphon
+                apply_main_node_outbound
+                apply_changes
+                green "已切换为主节点: 赛风出站 (Psiphon)"
+                echo
+                reading "按回车继续..." _
+                ;;
+            3)
+                yellow "正在测试最优 WARP Endpoint..."
+                local best_ep="162.159.192.1"
+                local candidates=("162.159.192.1" "162.159.193.10" "162.159.195.2" "188.114.96.1" "188.114.97.1")
+                for ep in "${candidates[@]}"; do
+                    if ping -c 1 -W 1 "$ep" >/dev/null 2>&1; then
+                        best_ep="$ep"
+                        break
+                    fi
+                done
+                echo "$best_ep" > "$WORKDIR/warp_best_endpoint.txt"
+                echo "2408" > "$WORKDIR/warp_best_port.txt"
+                apply_main_node_outbound
+                apply_changes
+                green "已设置优选 Endpoint: ${best_ep}:2408"
+                echo
+                reading "按回车继续..." _
+                ;;
+            4)
+                echo "162.159.192.1" > "$WORKDIR/warp_best_endpoint.txt"
+                echo "2408" > "$WORKDIR/warp_best_port.txt"
+                apply_main_node_outbound
+                apply_changes
+                green "已恢复 Cloudflare 默认 Endpoint (162.159.192.1:2408)"
+                echo
+                reading "按回车继续..." _
+                ;;
+            5)
+                yellow "正在重新获取 WARP 凭据..."
+                init_warp_config
+                apply_main_node_outbound
+                apply_changes
+                green "WARP 凭据已刷新！"
+                echo
+                reading "按回车继续..." _
+                ;;
+            6|7)
+                warp_egress_test
+                echo
+                reading "按回车继续..." _
+                ;;
+            q|Q|"")
+                return 0
+                ;;
+            *)
+                red "无效输入"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # ==================== 3. 副节点 - 自定义代理出站管理 ====================
@@ -3876,11 +4041,20 @@ menu() {
             local warp_mode=$(cat "$WORKDIR/warp_mode.txt" 2>/dev/null)
             local psi_main=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null)
             if [[ "$warp_status" == "true" ]]; then
-                if [[ "$warp_mode" == "all" ]]; then
-                    echo -e "  主节点出站模式: ${blue}WARP 全局出站${re}"
-                else
-                    echo -e "  主节点出站模式: ${blue}WARP 规则分流${re}"
-                fi
+                case "$warp_mode" in
+                    ipv4)
+                        echo -e "  主节点出站模式: ${blue}WARP 仅 IPv4 出站${re}"
+                        ;;
+                    ipv6)
+                        echo -e "  主节点出站模式: ${blue}WARP 仅 IPv6 出站${re}"
+                        ;;
+                    google|rules)
+                        echo -e "  主节点出站模式: ${blue}WARP 规则分流${re}"
+                        ;;
+                    *)
+                        echo -e "  主节点出站模式: ${blue}WARP 全局双栈出站${re}"
+                        ;;
+                esac
             elif [[ "$psi_main" == "true" ]]; then
                 local cur_reg=$(cat "$WORKDIR/psiphon_main_region.txt" 2>/dev/null || echo "AUTO")
                 echo -e "  主节点出站模式: ${blue}赛风出站 [${cur_reg}]${re}"

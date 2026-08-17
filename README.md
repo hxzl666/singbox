@@ -16,9 +16,11 @@
 
 ### 2. 主节点出站灵活调度
 - **原生直连出站 (Direct)**：使用 VPS 原生公网 IP 访问。
-- **WARP 全局出站**：主节点全部流量经 Cloudflare WARP 出口（支持自动优选 Endpoint IP）。
+- **WARP 全局双栈出站**：主节点全部 IPv4 与 IPv6 流量经 Cloudflare WARP 出口（全面隐藏真实 IP，支持 Endpoint 优选）。
+- **WARP 仅 IPv4 出站**：仅 IPv4 流量走 WARP 出口，IPv6 保持原生直连。
+- **WARP 仅 IPv6 出站**：仅 IPv6 流量走 WARP 出口，IPv4 保持原生直连（特别适合纯 IPv4 VPS 解锁 IPv6 网络服务）。
 - **WARP 规则分流**：Google / YouTube / Netflix / OpenAI 等流媒体与 AI 服务走 WARP，其余直连。
-- **Psiphon 赛风出站**：主节点流量经由 Psiphon 赛风隧道出口。
+- **Psiphon 赛风出站**：主节点流量经由 Psiphon 赛风隧道出口（支持 28 国地区切换与智能优选）。
 
 ### 3. 副节点系统 (平行独立、专属入站与出口)
 - **赛风多出口副节点组**：可自由添加指定国家（如 US, JP, SG, HK, KR, TW, DE, GB 等 28 国）的赛风副节点组，各出口组配备独立的本地入站端口（Hy2 / TUIC / Reality），与主节点互不干扰。
