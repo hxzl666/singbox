@@ -1720,57 +1720,112 @@ apply_main_node_outbound() {
       # 清理 endpoints 中的历史 warp-out
       .endpoints = [(.endpoints // [])[] | select(.tag != "warp-out")] |
 
-      # 彻底清理历史的 action: "resolve" 规则以及旧的 WARP/赛风 出站分流规则
+      # 清理旧的 WARP/赛风 出站分流规则
       .route.rules = [(.route.rules // [])[] | select(
-        (.action != "resolve") and
         (.inbound != ["socks-loopback"]) and
         (.outbound != "warp-out") and
         (.outbound != "psiphon-main-out")
       )] |
       
       if $warp_en == "true" then
-        .endpoints += [{
-          "type": "wireguard",
-          "tag": "warp-out",
-          "system": false,
-          "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
-          "private_key": $warp_pvk,
-          "peers": [{
-            "address": $warp_ep,
-            "port": $warp_port,
-            "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-            "allowed_ips": ["0.0.0.0/0", "::/0"],
-            "reserved": $warp_res
-          }]
-        }] |
         if $warp_mode == "all" or $warp_mode == "dual" then
+          # 双栈全局: allowed_ips 放行 IPv4+IPv6 全部流量, domain_strategy 优先 IPv6
+          .endpoints += [{
+            "type": "wireguard",
+            "tag": "warp-out",
+            "system": false,
+            "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
+            "private_key": $warp_pvk,
+            "domain_strategy": "prefer_ipv6",
+            "peers": [{
+              "address": $warp_ep,
+              "port": $warp_port,
+              "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+              "allowed_ips": ["0.0.0.0/0", "::/0"],
+              "reserved": $warp_res
+            }]
+          }] |
           .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
           .route.final = "warp-out"
         elif $warp_mode == "ipv4" then
-          # 前置 resolve 规则到数组开头：确保域名连接先被解析为 IP，routing 引擎才能根据 ip_version 精准分流
-          .route.rules = [{"action": "resolve", "strategy": "prefer_ipv4"}] + .route.rules + [
-            {"ip_version": 4, "outbound": "warp-out"},
-            {"ip_version": 6, "outbound": "direct"}
-          ] |
-          .route.final = "direct"
+          # 仅 IPv4 走 WARP: allowed_ips 仅放行 0.0.0.0/0, domain_strategy 强制 IPv4 解析
+          .endpoints += [{
+            "type": "wireguard",
+            "tag": "warp-out",
+            "system": false,
+            "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
+            "private_key": $warp_pvk,
+            "domain_strategy": "prefer_ipv4",
+            "peers": [{
+              "address": $warp_ep,
+              "port": $warp_port,
+              "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+              "allowed_ips": ["0.0.0.0/0"],
+              "reserved": $warp_res
+            }]
+          }] |
+          .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
+          .route.final = "warp-out"
         elif $warp_mode == "ipv6" then
-          # 前置 resolve 规则到数组开头：域名连接优先解析为 IPv6 后，ip_version: 6 规则才能匹配并路由到 WARP
-          .route.rules = [{"action": "resolve", "strategy": "prefer_ipv6"}] + .route.rules + [
-            {"ip_version": 6, "outbound": "warp-out"},
-            {"ip_version": 4, "outbound": "direct"}
-          ] |
-          .route.final = "direct"
+          # 仅 IPv6 走 WARP: allowed_ips 仅放行 ::/0, domain_strategy 优先 IPv6 解析
+          .endpoints += [{
+            "type": "wireguard",
+            "tag": "warp-out",
+            "system": false,
+            "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
+            "private_key": $warp_pvk,
+            "domain_strategy": "prefer_ipv6",
+            "peers": [{
+              "address": $warp_ep,
+              "port": $warp_port,
+              "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+              "allowed_ips": ["::/0"],
+              "reserved": $warp_res
+            }]
+          }] |
+          .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
+          .route.final = "warp-out"
         elif $warp_mode == "google" or $warp_mode == "rules" then
+          # 规则分流: allowed_ips 放行全部, 仅匹配特定域名走 WARP
+          .endpoints += [{
+            "type": "wireguard",
+            "tag": "warp-out",
+            "system": false,
+            "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
+            "private_key": $warp_pvk,
+            "domain_strategy": "prefer_ipv6",
+            "peers": [{
+              "address": $warp_ep,
+              "port": $warp_port,
+              "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+              "allowed_ips": ["0.0.0.0/0", "::/0"],
+              "reserved": $warp_res
+            }]
+          }] |
           .route.rules += [
             {"inbound": ["socks-loopback"], "outbound": "warp-out"},
             {
-              "geosite": ["google", "youtube", "netflix", "openai"],
               "domain_suffix": ["google.com", "googlevideo.com", "youtube.com", "netflix.com", "openai.com", "chatgpt.com"],
               "outbound": "warp-out"
             }
           ] |
           .route.final = "direct"
         else
+          .endpoints += [{
+            "type": "wireguard",
+            "tag": "warp-out",
+            "system": false,
+            "address": ["172.16.0.2/32", ($warp_ipv6 + "/128")],
+            "private_key": $warp_pvk,
+            "domain_strategy": "prefer_ipv6",
+            "peers": [{
+              "address": $warp_ep,
+              "port": $warp_port,
+              "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+              "allowed_ips": ["0.0.0.0/0", "::/0"],
+              "reserved": $warp_res
+            }]
+          }] |
           .route.rules += [{"inbound": ["socks-loopback"], "outbound": "warp-out"}] |
           .route.final = "warp-out"
         end
