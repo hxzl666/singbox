@@ -1747,6 +1747,16 @@ apply_main_node_outbound() {
       --arg psi_en "$psi_main_enabled" \
       --argjson psi_port "$psi_main_port" \
       '
+      .dns = {
+        "servers": [
+          {"type": "udp", "tag": "dns-remote", "server": "1.1.1.1"},
+          {"type": "udp", "tag": "dns-google", "server": "8.8.8.8"},
+          {"type": "local", "tag": "dns-direct"}
+        ],
+        "final": "dns-remote",
+        "strategy": (if $warp_mode == "ipv4" then "prefer_ipv4" else "prefer_ipv6" end)
+      } |
+      .route.default_domain_resolver = "dns-remote" |
       .route = (.route // {}) |
 
       # 确保 socks-loopback 入站存在 (赛风/WARP 出站路由链的关键桥梁)
@@ -1758,19 +1768,20 @@ apply_main_node_outbound() {
       if any(.outbounds[]; .tag == "direct") then . else .outbounds += [{"type":"direct","tag":"direct"}] end |
       if any(.outbounds[]; .tag == "block") then . else .outbounds += [{"type":"block","tag":"block"}] end |
       
-      # 彻底清理旧的 warp-out 和 psiphon-main-out 出站 (Sing-box 1.11+ 规范中 WireGuard 配置在 endpoints 中)
+      # 彻底清理旧的 warp-out 和 psiphon-main-out 出站
       .outbounds = [.outbounds[] | select(.tag != "warp-out" and .tag != "psiphon-main-out")] |
       
       # 清理 endpoints 中的历史 warp-out
       .endpoints = [(.endpoints // [])[] | select(.tag != "warp-out")] |
 
-      # 彻底清理旧的 sniff、resolve、分流 ip_cidr 规则及 WARP/赛风分流规则
+      # 彻底清理旧的 sniff、resolve、DNS 规则、分流 ip_cidr 规则及 WARP/赛风分流规则
       .route.rules = [(.route.rules // [])[] | select(
         (.action != "sniff") and
         (.action != "resolve") and
         (.inbound != ["socks-loopback"]) and
         (.outbound != "warp-out") and
         (.outbound != "psiphon-main-out") and
+        (.protocol != "dns" and .port != 53 and .port != [53]) and
         ((.ip_cidr == ["0.0.0.0/0"] or .ip_cidr == ["::/0"]) | not)
       )] |
       
@@ -1794,6 +1805,8 @@ apply_main_node_outbound() {
           # 双栈全局: 优先 IPv6 解析，双栈流量均走 WARP
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
+            {"protocol": "dns", "action": "route", "outbound": "direct"},
+            {"port": 53, "action": "route", "outbound": "direct"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
             {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"},
@@ -1805,6 +1818,8 @@ apply_main_node_outbound() {
           # 仅 IPv4 走 WARP: IPv4 走 WARP，IPv6 走直连
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
+            {"protocol": "dns", "action": "route", "outbound": "direct"},
+            {"port": 53, "action": "route", "outbound": "direct"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv4"},
             {"ip_cidr": ["0.0.0.0/0"], "action": "route", "outbound": "warp-out"},
@@ -1817,6 +1832,8 @@ apply_main_node_outbound() {
           # 仅 IPv6 走 WARP: IPv6 走 WARP，IPv4 走直连
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
+            {"protocol": "dns", "action": "route", "outbound": "direct"},
+            {"port": 53, "action": "route", "outbound": "direct"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
             {"ip_cidr": ["::/0"], "action": "route", "outbound": "warp-out"},
@@ -1829,6 +1846,8 @@ apply_main_node_outbound() {
           # 规则分流: 仅特定媒体/AI 域名走 WARP, 其余直连
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
+            {"protocol": "dns", "action": "route", "outbound": "direct"},
+            {"port": 53, "action": "route", "outbound": "direct"},
             {"action": "sniff"},
             {
               "domain_suffix": ["google.com", "googlevideo.com", "youtube.com", "netflix.com", "openai.com", "chatgpt.com"],
@@ -1840,6 +1859,8 @@ apply_main_node_outbound() {
         else
           .outbounds = [.outbounds[] | if .tag == "direct" then del(.domain_strategy) else . end] |
           .route.rules = [
+            {"protocol": "dns", "action": "route", "outbound": "direct"},
+            {"port": 53, "action": "route", "outbound": "direct"},
             {"action": "sniff"},
             {"action": "resolve", "strategy": "prefer_ipv6"},
             {"ip_cidr": ["::/0", "0.0.0.0/0"], "action": "route", "outbound": "warp-out"},
