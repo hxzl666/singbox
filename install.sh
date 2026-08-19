@@ -1627,7 +1627,7 @@ sync_psiphon_instance_to_singbox() {
       --arg warp_ipv6 "$warp_ipv6" \
       --argjson warp_res "$warp_res" \
       '
-      # 清理旧的副节点 WARP endpoint（Cfon 由底座自身管理，无需 singbox endpoint）
+      # 清理旧的副节点 Cfon WARP endpoint，避免与主节点 warp-out 重叠
       .endpoints = [(.endpoints // [])[] | select(.tag != ("psiphon-warp-" + $cc))] |
       if $cfon_en == "true" and $cfon_port > 0 then
         .endpoints += [{
@@ -1788,6 +1788,194 @@ sync_all_secondary_nodes() {
 }
 
 # ==================== 主节点多协议配置与出站应用 ====================
+legacy_main_services_active() {
+    local svc
+    for svc in xray hysteria2 tuic; do
+        if $IS_DIRECT; then
+            pgrep -f "/(xray|hysteria|tuic)( |-)" >/dev/null 2>&1 && return 0
+        elif $IS_OPENRC; then
+            rc-service "$svc" status >/dev/null 2>&1 && return 0
+        elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$svc.service" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+stop_legacy_main_services() {
+    local svc
+    for svc in xray hysteria2 tuic; do
+        if $IS_DIRECT || $IS_OPENRC; then
+            service_stop "$svc" >/dev/null 2>&1 || true
+        elif command -v systemctl >/dev/null 2>&1; then
+            systemctl disable --now "$svc.service" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+legacy_yaml_value() {
+    local file="$1" key="$2"
+    awk -v key="$key" '
+        $0 ~ "^[[:space:]]*" key ":" {
+            sub("^[[:space:]]*" key ":[[:space:]]*", "", $0)
+            gsub(/^['"'"']|['"'"']$/, "", $0)
+            print $0
+            exit
+        }
+    ' "$file" 2>/dev/null
+}
+
+legacy_yaml_nested_value() {
+    local file="$1" section="$2" key="$3"
+    awk -v section="$section" -v key="$key" '
+        $0 ~ "^[[:space:]]*" section ":[[:space:]]*$" {inside=1; next}
+        inside && $0 ~ "^[^[:space:]]" {inside=0}
+        inside && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {
+            sub("^[[:space:]]+" key ":[[:space:]]*", "", $0)
+            gsub(/^['"'"']|['"'"']$/, "", $0)
+            print $0
+            exit
+        }
+    ' "$file" 2>/dev/null
+}
+
+migrate_legacy_main_inbounds() {
+    local cfg="$WORKDIR/sb.json"
+    local marker="$WORKDIR/legacy_main_migrated_v1"
+    local backup_root="$WORKDIR/legacy-main-backup"
+    [[ -f "$cfg" ]] || return 1
+
+    if [[ -f "$marker" ]] && ! legacy_main_services_active; then
+        return 0
+    fi
+
+    local xray_cfg="${LEGACY_XRAY_CONFIG:-/etc/xray/config.json}"
+    local hy2_cfg="${LEGACY_HYSTERIA_CONFIG:-/etc/hysteria/config.yaml}"
+    local tuic_cfg="${LEGACY_TUIC_CONFIG:-/etc/tuic/config.json}"
+    if [[ ! -s "$xray_cfg" && ! -s "$hy2_cfg" && ! -s "$tuic_cfg" ]]; then
+        return 0
+    fi
+    local vless_port=0 vless_uuid="" vless_flow="xtls-rprx-vision"
+    local reality_private_key="" reality_short_id="" reality_server_name="" reality_handshake_server="www.apple.com" reality_handshake_port=443
+    local hy2_port=0 hy2_password="" hy2_obfs_password="" hy2_cert="" hy2_key=""
+    local tuic_port=0 tuic_uuid="" tuic_password="" tuic_cert="" tuic_key=""
+
+    if [[ -s "$xray_cfg" ]] && jq -e . "$xray_cfg" >/dev/null 2>&1; then
+        vless_port=$(jq -r 'first(.inbounds[]? | select(.protocol=="vless") | .port // 0)' "$xray_cfg" 2>/dev/null)
+        vless_uuid=$(jq -r 'first(.inbounds[]? | select(.protocol=="vless") | .settings.clients[0].id // "")' "$xray_cfg" 2>/dev/null)
+        vless_flow=$(jq -r 'first(.inbounds[]? | select(.protocol=="vless") | .settings.clients[0].flow // "xtls-rprx-vision")' "$xray_cfg" 2>/dev/null)
+        reality_private_key=$(jq -r 'first(.inbounds[]? | select(.protocol=="vless") | .streamSettings.realitySettings.privateKey // "")' "$xray_cfg" 2>/dev/null)
+        reality_short_id=$(jq -r 'first(.inbounds[]? | select(.protocol=="vless") | .streamSettings.realitySettings.shortIds[0] // "")' "$xray_cfg" 2>/dev/null)
+        reality_server_name=$(jq -r 'first(.inbounds[]? | select(.protocol=="vless") | .streamSettings.realitySettings.serverNames[0] // "www.apple.com")' "$xray_cfg" 2>/dev/null)
+        local reality_dest
+        reality_dest=$(jq -r 'first(.inbounds[]? | select(.protocol=="vless") | .streamSettings.realitySettings.dest // "www.apple.com:443")' "$xray_cfg" 2>/dev/null)
+        reality_handshake_server="${reality_dest%:*}"
+        reality_handshake_port="${reality_dest##*:}"
+    fi
+
+    if [[ -s "$hy2_cfg" ]]; then
+        hy2_port=$(legacy_yaml_value "$hy2_cfg" "listen" | sed -E 's/^:?([0-9]+).*$/\1/' | head -n1)
+        hy2_password=$(legacy_yaml_nested_value "$hy2_cfg" "auth" "password")
+        hy2_obfs_password=$(legacy_yaml_nested_value "$hy2_cfg" "salamander" "password")
+        [[ -z "$hy2_obfs_password" ]] && hy2_obfs_password=$(legacy_yaml_nested_value "$hy2_cfg" "obfs" "password")
+        hy2_cert=$(legacy_yaml_nested_value "$hy2_cfg" "tls" "cert")
+        hy2_key=$(legacy_yaml_nested_value "$hy2_cfg" "tls" "key")
+    fi
+
+    if [[ -s "$tuic_cfg" ]] && jq -e . "$tuic_cfg" >/dev/null 2>&1; then
+        tuic_port=$(jq -r 'first(.server_port // (.server | capture(":(?<p>[0-9]+)$").p | tonumber) // 0)' "$tuic_cfg" 2>/dev/null)
+        tuic_uuid=$(jq -r 'first(.users | to_entries[0].key // "")' "$tuic_cfg" 2>/dev/null)
+        tuic_password=$(jq -r 'first(.users | to_entries[0].value // "")' "$tuic_cfg" 2>/dev/null)
+        tuic_cert=$(jq -r '.certificate // ""' "$tuic_cfg" 2>/dev/null)
+        tuic_key=$(jq -r '.private_key // ""' "$tuic_cfg" 2>/dev/null)
+    fi
+
+    [[ "$vless_port" =~ ^[0-9]+$ ]] || vless_port=0
+    [[ "$hy2_port" =~ ^[0-9]+$ ]] || hy2_port=0
+    [[ "$tuic_port" =~ ^[0-9]+$ ]] || tuic_port=0
+    [[ "$reality_handshake_port" =~ ^[0-9]+$ ]] || reality_handshake_port=443
+    [[ -z "$hy2_cert" ]] && hy2_cert="$WORKDIR/cert.pem"
+    [[ -z "$hy2_key" ]] && hy2_key="$WORKDIR/private.key"
+    [[ -z "$tuic_cert" ]] && tuic_cert="$WORKDIR/cert.pem"
+    [[ -z "$tuic_key" ]] && tuic_key="$WORKDIR/private.key"
+
+    if [[ ! -f "$marker" ]]; then
+        local backup_dir="$backup_root/$(date +%Y%m%d%H%M%S)"
+        mkdir -p "$backup_dir"
+        for f in "$xray_cfg" "$hy2_cfg" "$tuic_cfg"; do
+            [[ -f "$f" ]] && cp -a "$f" "$backup_dir/"
+        done
+        for f in /etc/systemd/system/xray.service /etc/systemd/system/hysteria2.service /etc/systemd/system/tuic.service; do
+            [[ -f "$f" ]] && cp -a "$f" "$backup_dir/"
+        done
+        chmod 700 "$backup_dir"
+        printf '%s\n' "$backup_dir" > "$marker"
+        chmod 600 "$marker"
+    fi
+
+    local tmp_json
+    tmp_json=$(mktemp)
+    if ! jq \
+      --arg listen_addr "${LISTEN_ADDR:-::}" \
+      --argjson vless_port "${vless_port:-0}" \
+      --arg vless_uuid "$vless_uuid" \
+      --arg vless_flow "$vless_flow" \
+      --arg reality_private_key "$reality_private_key" \
+      --arg reality_short_id "$reality_short_id" \
+      --arg reality_server_name "${reality_server_name:-www.apple.com}" \
+      --arg reality_handshake_server "${reality_handshake_server:-www.apple.com}" \
+      --argjson reality_handshake_port "${reality_handshake_port:-443}" \
+      --argjson hy2_port "${hy2_port:-0}" \
+      --arg hy2_password "$hy2_password" \
+      --arg hy2_obfs_password "$hy2_obfs_password" \
+      --arg hy2_cert "$hy2_cert" \
+      --arg hy2_key "$hy2_key" \
+      --argjson tuic_port "${tuic_port:-0}" \
+      --arg tuic_uuid "$tuic_uuid" \
+      --arg tuic_password "$tuic_password" \
+      --arg tuic_cert "$tuic_cert" \
+      --arg tuic_key "$tuic_key" \
+      '
+      . as $root |
+      (($root.inbounds // []) | map(select(.tag != "vless-reality-in" and .tag != "hy2-in" and .tag != "tuic-in"))) as $existing |
+      (
+        [] |
+        if $vless_port > 0 and $vless_uuid != "" and $reality_private_key != "" then . + [{
+          "tag":"vless-reality-in", "type":"vless", "listen":$listen_addr, "listen_port":$vless_port,
+          "users":[{"uuid":$vless_uuid,"flow":$vless_flow}],
+          "tls":{"enabled":true,"server_name":$reality_server_name,"reality":{"enabled":true,"handshake":{"server":$reality_handshake_server,"server_port":$reality_handshake_port},"private_key":$reality_private_key,"short_id":[$reality_short_id]}}
+        }] else . end |
+        if $hy2_port > 0 and $hy2_password != "" then . + [{
+          "tag":"hy2-in", "type":"hysteria2", "listen":$listen_addr, "listen_port":$hy2_port,
+          "users":[{"password":$hy2_password}], "masquerade":{"type":"proxy","url":"https://www.bing.com"},
+          "obfs":(if $hy2_obfs_password != "" then {"type":"salamander","password":$hy2_obfs_password} else null end),
+          "tls":{"enabled":true,"alpn":["h3"],"certificate_path":$hy2_cert,"key_path":$hy2_key}
+        } | with_entries(select(.value != null))] else . end |
+        if $tuic_port > 0 and $tuic_uuid != "" and $tuic_password != "" then . + [{
+          "tag":"tuic-in", "type":"tuic", "listen":$listen_addr, "listen_port":$tuic_port,
+          "users":[{"uuid":$tuic_uuid,"password":$tuic_password}], "congestion_control":"bbr",
+          "tls":{"enabled":true,"alpn":["h3"],"certificate_path":$tuic_cert,"key_path":$tuic_key}
+        }] else . end
+      ) as $legacy |
+      $root | .inbounds = (($legacy + $existing) | unique_by(.tag))
+      ' "$cfg" > "$tmp_json"; then
+        rm -f "$tmp_json"
+        return 1
+    fi
+    mv -f "$tmp_json" "$cfg"
+
+    # 让后续 show/links 输出仍然使用旧 Reality 参数。
+    [[ -n "$reality_short_id" ]] && printf '%s\n' "$reality_short_id" > "$WORKDIR/short_id.txt"
+    [[ -n "$reality_server_name" ]] && printf '%s\n' "$reality_server_name" > "$WORKDIR/reym.txt"
+
+    if [[ -n "$reality_private_key" ]] && command -v xray >/dev/null 2>&1; then
+        local reality_public_key
+        reality_public_key=$(xray x25519 -i "$reality_private_key" 2>/dev/null | awk -F': ' '/Password/{print $2; exit}')
+        [[ -n "$reality_public_key" ]] && printf '%s\n' "$reality_public_key" > "$WORKDIR/public_key.txt"
+    fi
+    return 0
+}
+
 apply_main_node_outbound() {
     local cfg="$WORKDIR/sb.json"
     [[ -f "$cfg" ]] || return 1
@@ -1800,6 +1988,9 @@ apply_main_node_outbound() {
     warp_pvk=$(cat "$WORKDIR/warp_private_key.txt" 2>/dev/null || echo "52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A=")
     warp_ipv6=$(cat "$WORKDIR/warp_ipv6.txt" 2>/dev/null || echo "2606:4700:110:8d8d:1845:c39f:2dd5:a03a")
     warp_res=$(cat "$WORKDIR/warp_reserved.txt" 2>/dev/null || echo "[215, 69, 233]")
+
+    # 旧版 Xray/Hysteria/TUIC 的主入站先迁入 Sing-box，保持端口和认证不变。
+    migrate_legacy_main_inbounds || return 1
 
     local psi_main_enabled psi_main_port
     psi_main_enabled=$(cat "$WORKDIR/psiphon_main_enabled.txt" 2>/dev/null || echo "false")
@@ -1985,6 +2176,7 @@ apply_changes() {
                 if download_singbox_core force; then
                     if /etc/s-box/sing-box check -c /etc/s-box/sb.json >/dev/null 2>&1; then
                         green "[+] Sing-box 核心升级完成，AnyTLS 语法校验通过！"
+                        [[ -f "$WORKDIR/legacy_main_migrated_v1" ]] && stop_legacy_main_services
                         service_restart sing-box
                         return 0
                     fi
@@ -1995,6 +2187,8 @@ apply_changes() {
             return 1
         fi
     fi
+    # 只有新配置已通过 sing-box check，才停用旧核心，避免迁移失败时中断现有链接。
+    [[ -f "$WORKDIR/legacy_main_migrated_v1" ]] && stop_legacy_main_services
     service_restart sing-box
     sleep 1
     if ! service_is_active sing-box; then
@@ -2133,6 +2327,11 @@ configure_main_node_protocols() {
 build_and_apply_main_inbounds() {
     local p_vless="$1" p_vmess="$2" p_trojan="$3" p_hy2="$4" p_tuic="$5" p_anytls="$6" p_loop="$7"
     local cfg="$WORKDIR/sb.json"
+    local preserve_legacy="false"
+    if [[ -f "$WORKDIR/legacy_main_migrated_v1" || -s /etc/xray/config.json || -s /etc/hysteria/config.yaml || -s /etc/tuic/config.json ]]; then
+        migrate_legacy_main_inbounds >/dev/null 2>&1 || return 1
+        preserve_legacy="true"
+    fi
     local uuid reality_pvk reym
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
     [[ -z "$uuid" ]] && uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null)
@@ -2198,10 +2397,11 @@ EOF_BLANK
       --argjson ptu "${p_tuic:-0}" \
       --argjson pan "${p_anytls:-0}" \
       --argjson ploop "${p_loop:-20080}" \
+      --arg preserve_legacy "$preserve_legacy" \
       --arg listen_addr "${LISTEN_ADDR:-"::"}" \
       '
       # 保留所有副节点入站 (包含 custom / proxy / psi 的入站)
-      .inbounds = [.inbounds[]? | select(.tag | contains("proxy") or contains("psi") or contains("custom"))] |
+      .inbounds = [.inbounds[]? | select((.tag | contains("proxy") or contains("psi") or contains("custom")) or ($preserve_legacy == "true" and (.tag == "vless-reality-in" or .tag == "hy2-in" or .tag == "tuic-in")))] |
 
       (
         [] |
@@ -2278,7 +2478,7 @@ EOF_BLANK
           "listen_port": $ploop
         }]
       ) as $main_inbounds |
-      .inbounds = ($main_inbounds + .inbounds) | unique_by(.tag)
+      .inbounds = ((.inbounds + $main_inbounds) | unique_by(.tag))
       ' "$cfg" > "$tmp_json" && mv -f "$tmp_json" "$cfg"
 
     sync_all_secondary_nodes
@@ -3758,6 +3958,16 @@ show_links() {
     local uuid ip pbk sid reym
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
     [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$cfg" 2>/dev/null | head -n1)
+    local vless_uuid hy2_password hy2_obfs_password tuic_uuid tuic_password
+    vless_uuid=$(jq -r '.inbounds[]? | select(.tag=="vless-reality-in") | .users[0].uuid // empty' "$cfg" 2>/dev/null | head -n1)
+    hy2_password=$(jq -r '.inbounds[]? | select(.tag=="hy2-in" or .tag=="hysteria2-in") | .users[0].password // empty' "$cfg" 2>/dev/null | head -n1)
+    hy2_obfs_password=$(jq -r '.inbounds[]? | select(.tag=="hy2-in" or .tag=="hysteria2-in") | .obfs.password // empty' "$cfg" 2>/dev/null | head -n1)
+    tuic_uuid=$(jq -r '.inbounds[]? | select(.tag=="tuic-in" or .tag=="tuic-in-1") | .users[0].uuid // empty' "$cfg" 2>/dev/null | head -n1)
+    tuic_password=$(jq -r '.inbounds[]? | select(.tag=="tuic-in" or .tag=="tuic-in-1") | .users[0].password // empty' "$cfg" 2>/dev/null | head -n1)
+    [[ -z "$vless_uuid" ]] && vless_uuid="$uuid"
+    [[ -z "$hy2_password" ]] && hy2_password="$uuid"
+    [[ -z "$tuic_uuid" ]] && tuic_uuid="$uuid"
+    [[ -z "$tuic_password" ]] && tuic_password="$uuid"
     ip="${ALL_IPS[0]:-202.73.4.182}"
     pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.public_key != null) | .tls.reality.public_key' "$cfg" 2>/dev/null | head -n1)
     sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.short_id != null) | .tls.reality.short_id[0] // empty' "$cfg" 2>/dev/null | head -n1)
@@ -3782,11 +3992,15 @@ show_links() {
     local tuic_p=$(jq -r '.inbounds[]? | select((.tag=="tuic-in" or .tag=="tuic-in-1") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
     local anytls_p=$(jq -r '.inbounds[]? | select((.tag=="anytls-in") and (.tag | contains("custom") or contains("proxy") or contains("psi") | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
 
-    [[ -n "$vless_p" ]] && echo "1. VLESS-Reality: vless://${uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#SB-VLESS-Reality"
+    [[ -n "$vless_p" ]] && echo "1. VLESS-Reality: vless://${vless_uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#SB-VLESS-Reality"
     [[ -n "$vmess_p" ]] && echo "2. VMess-WS: $(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess\",\"add\":\"${ip}\",\"port\":\"${vmess_p}\",\"id\":\"${uuid}\",\"net\":\"ws\",\"path\":\"${vmess_path}\"}")"
     [[ -n "$trojan_p" ]] && echo "3. Trojan-WS-TLS: trojan://${uuid}@${ip}:${trojan_p}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=$(url_encode "${trojan_path}")#SB-Trojan-TLS"
-    [[ -n "$hy2_p" ]] && echo "4. Hysteria2: hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&sni=www.bing.com#SB-Hysteria2"
-    [[ -n "$tuic_p" ]] && echo "5. TUIC v5: tuic://${uuid}:${uuid}@${ip}:${tuic_p}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5"
+    local hy2_auth_uri hy2_obfs_uri
+    hy2_auth_uri=$(url_encode "$hy2_password")
+    hy2_obfs_uri=""
+    [[ -n "$hy2_obfs_password" ]] && hy2_obfs_uri="&obfs=salamander&obfs-password=$(url_encode "$hy2_obfs_password")"
+    [[ -n "$hy2_p" ]] && echo "4. Hysteria2: hysteria2://${hy2_auth_uri}@${ip}:${hy2_p}?insecure=1&sni=www.bing.com${hy2_obfs_uri}#SB-Hysteria2"
+    [[ -n "$tuic_p" ]] && echo "5. TUIC v5: tuic://${tuic_uuid}:$(url_encode "$tuic_password")@${ip}:${tuic_p}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5"
     [[ -n "$anytls_p" ]] && echo "6. AnyTLS: anytls://${uuid}@${ip}:${anytls_p}?security=tls&sni=www.bing.com&allowInsecure=1#SB-AnyTLS"
 
     # 检查 Argo
