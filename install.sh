@@ -367,22 +367,30 @@ download_psiphon_core() {
         return 1
     fi
 
-    # 预载 Psiphon 种子服务器列表
-    if [[ ! -f "$WORKDIR/server_list_compressed" ]]; then
-        yellow "[*] 正在预载 Psiphon 种子服务器列表..."
+    fetch_psiphon_server_list 0
+
+    green "[+] Psiphon 核心已安装: $WORKDIR/psiphon-tunnel-core"
+    setup_psiphon_systemd_services
+    return 0
+}
+
+fetch_psiphon_server_list() {
+    local force="${1:-0}"
+    if [[ "$force" -eq 1 || ! -f "$WORKDIR/server_list_compressed" ]]; then
         local s_urls=(
             "https://s3.amazonaws.com/psiphon/web/mjr4-p23r-puwl/server_list_compressed"
             "https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
             "https://ghproxy.net/https://raw.githubusercontent.com/Psiphon-Labs/psiphon-tunnel-core/master/psiphon/server_list_compressed"
         )
         for surl in "${s_urls[@]}"; do
-            echo -e "${blue}--> 尝试下载节点列表: ${surl}${re}"
-            curl -# -fSL --connect-timeout 10 --max-time 60 "$surl" -o "$WORKDIR/server_list_compressed" && break
+            if curl -fsSL --connect-timeout 8 --max-time 20 "$surl" -o "$WORKDIR/server_list_compressed.tmp" 2>/dev/null; then
+                mv -f "$WORKDIR/server_list_compressed.tmp" "$WORKDIR/server_list_compressed" 2>/dev/null
+                return 0
+            fi
         done
+        rm -f "$WORKDIR/server_list_compressed.tmp" 2>/dev/null
+        return 1
     fi
-
-    green "[+] Psiphon 核心已安装: $WORKDIR/psiphon-tunnel-core"
-    setup_psiphon_systemd_services
     return 0
 }
 
@@ -493,6 +501,82 @@ restart_psiphon_instance() {
     stop_psiphon_instance "$cc"
     sleep 1
     start_psiphon_instance "$cc"
+}
+
+check_psiphon_instance_health() {
+    local cc="${1^^}"
+    local idir="${PSI_INSTANCES_DIR}/${cc}"
+    [[ -d "$idir" ]] || return 1
+
+    local socks_p
+    socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
+    [[ -z "$socks_p" || ! "$socks_p" =~ ^[0-9]+$ || "$socks_p" -le 0 ]] && return 1
+
+    # 1. 快速检查本地端口是否在监听
+    if ! (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -qE "(:${socks_p}\s|127\.0\.0\.1:${socks_p}\s)"; then
+        return 1
+    fi
+
+    # 2. 多探针实际出口连通性探测 (严密控制超时，不阻塞主流程)
+    local success=0
+    # 探针 1: ipify
+    if timeout 4 curl -s4 --socks5-hostname "127.0.0.1:${socks_p}" --connect-timeout 2 -m 3 "http://api.ipify.org" >/dev/null 2>&1; then
+        ((success++))
+    fi
+    # 探针 2: ip.sb
+    if [[ $success -eq 0 ]] && timeout 4 curl -s4 --socks5-hostname "127.0.0.1:${socks_p}" --connect-timeout 2 -m 3 "https://api-ipv4.ip.sb/ip" >/dev/null 2>&1; then
+        ((success++))
+    fi
+    # 探针 3: Cloudflare Trace
+    if [[ $success -eq 0 ]] && timeout 4 curl -s4 --socks5-hostname "127.0.0.1:${socks_p}" --connect-timeout 2 -m 3 "http://1.1.1.1/cdn-cgi/trace" >/dev/null 2>&1; then
+        ((success++))
+    fi
+
+    [[ $success -gt 0 ]]
+}
+
+heal_psiphon_instance() {
+    local cc="${1^^}"
+    local level="${2:-1}"  # 1: 软重启当前节点; 2: 清空 data 深度重置 (更新服务器列表并强制换路)
+    local idir="${PSI_INSTANCES_DIR}/${cc}"
+    local log_file="/etc/s-box/monitor.log"
+    [[ -d "$idir" ]] || return 1
+
+    local socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
+    [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
+    echo "$socks_p" > "$idir/socks_port.txt"
+
+    local up_proxy=""
+    [[ "$(get_psiphon_egress_mode "$cc")" == "cfon" ]] && up_proxy="socks5://127.0.0.1:$(get_psiphon_cfon_socks_port "$cc")"
+
+    stop_psiphon_instance "$cc"
+    sleep 1
+
+    if [[ "$level" -ge 2 ]]; then
+        # 二级深度修复：抹除失效的历史服务器缓存，拉取最新纯净种子，迫使 Psiphon 重新选路
+        fetch_psiphon_server_list 1 >/dev/null 2>&1 || true
+        rm -rf "$idir/data" 2>/dev/null || true
+        mkdir -p "$idir/data" 2>/dev/null
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] 实例 [$cc] 执行二级深度自愈（彻底清空历史 data 并载入最新种子服务器列表）" >> "$log_file"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] 实例 [$cc] 执行一级轻度重启自愈" >> "$log_file"
+    fi
+
+    write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data" "$up_proxy"
+    start_psiphon_instance "$cc"
+
+    # 等待隧道建立并探测连通性
+    local wait_sec=$([ "$level" -ge 2 ] && echo 12 || echo 6)
+    for ((i=1; i<=wait_sec; i++)); do
+        sleep 1
+        if check_psiphon_instance_health "$cc"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] 实例 [$cc] 恢复成功，出口连通就绪！(耗时约 ${i}s)" >> "$log_file"
+            echo "0" > "$idir/fail_count.txt"
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 # ==================== IP 与端口获取 ====================
@@ -950,6 +1034,59 @@ stop_main_psiphon() {
         rm -f "$psi_pid_file"
     fi
     pkill -9 -f "${WORKDIR}/psiphon-tunnel-core --config ${WORKDIR}/psiphon.config" 2>/dev/null || true
+}
+
+check_main_psiphon_health() {
+    local socks_port
+    socks_port=$(cat "$WORKDIR/psiphon_socks_port.txt" 2>/dev/null || echo "20800")
+    [[ -z "$socks_port" || ! "$socks_port" =~ ^[0-9]+$ || "$socks_port" -le 0 ]] && return 1
+
+    if ! (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -qE "(:${socks_port}\s|127\.0\.0\.1:${socks_port}\s)"; then
+        return 1
+    fi
+
+    local success=0
+    if timeout 4 curl -s4 --socks5-hostname "127.0.0.1:${socks_port}" --connect-timeout 2 -m 3 "http://api.ipify.org" >/dev/null 2>&1; then
+        ((success++))
+    fi
+    if [[ $success -eq 0 ]] && timeout 4 curl -s4 --socks5-hostname "127.0.0.1:${socks_port}" --connect-timeout 2 -m 3 "https://api-ipv4.ip.sb/ip" >/dev/null 2>&1; then
+        ((success++))
+    fi
+    if [[ $success -eq 0 ]] && timeout 4 curl -s4 --socks5-hostname "127.0.0.1:${socks_port}" --connect-timeout 2 -m 3 "http://1.1.1.1/cdn-cgi/trace" >/dev/null 2>&1; then
+        ((success++))
+    fi
+
+    [[ $success -gt 0 ]]
+}
+
+heal_main_psiphon() {
+    local level="${1:-1}"
+    local log_file="/etc/s-box/monitor.log"
+
+    stop_main_psiphon
+    sleep 1
+
+    if [[ "$level" -ge 2 ]]; then
+        fetch_psiphon_server_list 1 >/dev/null 2>&1 || true
+        rm -rf "$WORKDIR/psiphon-data" 2>/dev/null || true
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] 主节点 Psiphon 执行二级深度自愈（清空 data 缓存并更新种子列表强制换路）" >> "$log_file"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] 主节点 Psiphon 执行一级轻度重启自愈" >> "$log_file"
+    fi
+
+    start_main_psiphon
+
+    local wait_sec=$([ "$level" -ge 2 ] && echo 12 || echo 6)
+    for ((i=1; i<=wait_sec; i++)); do
+        sleep 1
+        if check_main_psiphon_health; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] 主节点 Psiphon 恢复成功，出口连通就绪！(耗时约 ${i}s)" >> "$log_file"
+            echo "0" > "$WORKDIR/psiphon_main_fail_count.txt"
+            return 0
+        fi
+    done
+
+    return 1
 }
 
 # ==================== 副节点目录与旧配置迁移 ====================
@@ -1747,21 +1884,28 @@ sync_psiphon_instance_to_singbox() {
 }
 
 ensure_all_psiphon_instances_running() {
+    local force="${1:-0}"
     local psi_insts
     mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
     for cc in "${psi_insts[@]}"; do
         [[ -z "$cc" ]] && continue
         local idir="${PSI_INSTANCES_DIR}/${cc}"
-        local socks_p=$(jq -r '.LocalSocksProxyPort // empty' "$idir/psiphon.config" 2>/dev/null)
-        [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
+        [[ -d "$idir" ]] || continue
+        local socks_p=$(cat "$idir/socks_port.txt" 2>/dev/null)
         [[ -z "$socks_p" || "$socks_p" == "0" ]] && socks_p=$(get_free_loopback_port)
         echo "$socks_p" > "$idir/socks_port.txt"
-        local upstream_proxy=""
-        if [[ "$(get_psiphon_egress_mode "$cc")" == "cfon" ]]; then
-            upstream_proxy="socks5://127.0.0.1:$(get_psiphon_cfon_socks_port "$cc")"
+
+        if [[ "$force" -eq 1 || ! -f "$idir/psiphon.config" ]]; then
+            local upstream_proxy=""
+            if [[ "$(get_psiphon_egress_mode "$cc")" == "cfon" ]]; then
+                upstream_proxy="socks5://127.0.0.1:$(get_psiphon_cfon_socks_port "$cc")"
+            fi
+            write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data" "$upstream_proxy"
         fi
-        write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data" "$upstream_proxy"
-        start_psiphon_instance "$cc"
+
+        if ! is_psiphon_instance_running "$cc"; then
+            start_psiphon_instance "$cc"
+        fi
     done
 }
 
@@ -3521,21 +3665,23 @@ repair_single_psiphon_instance() {
     fi
 
     # 3. 彻底重置历史脏数据并载入纯净种子服务器列表
-    echo -e "${blue}--> [3/5] 彻底重置历史脏数据并载入纯净种子列表...${re}"
+    echo -e "${blue}--> [3/5] 彻底重置历史脏数据并载入最新纯净种子列表...${re}"
+    fetch_psiphon_server_list 1 >/dev/null 2>&1 || true
+    rm -rf "$inst_dir/data" 2>/dev/null || true
+    mkdir -p "$inst_dir/data" 2>/dev/null
     local up_proxy=""
     [[ "$(get_psiphon_egress_mode "$target_cc")" == "cfon" ]] && up_proxy="socks5://127.0.0.1:$(get_psiphon_cfon_socks_port "$target_cc")"
     write_psiphon_config "$socks_p" "$target_cc" "$inst_dir/psiphon.config" "$inst_dir/data" "$up_proxy"
 
-    # 4. 同步 Sing-box 路由与入站
-    echo -e "${blue}--> [4/5] 同步 Sing-box 出站与分流路由规则...${re}"
-    sync_psiphon_instance_to_singbox "$target_cc"
-    apply_changes
+    # 4. 同步 Sing-box 出站映射 (端口不变无需重启 Sing-box，避免震荡其他节点)
+    echo -e "${blue}--> [4/5] 校验 Sing-box 出站与分流路由映射...${re}"
+    sync_psiphon_instance_to_singbox "$target_cc" >/dev/null 2>&1 || true
 
     # 5. 启动服务并执行平滑动态出口连通性探测
     echo -e "${blue}--> [5/5] 拉起守护进程并执行实时出口连通性探测...${re}"
     start_psiphon_instance "$target_cc"
     local out_ip=""
-    local max_wait=10
+    local max_wait=15
     local elapsed=0
 
     for ((i=1; i<=max_wait; i++)); do
@@ -3872,7 +4018,8 @@ psiphon_multigroup_menu() {
                 ;;
             4) repair_single_psiphon_instance ;;
             5)
-                yellow "正在重启并重置所有赛风实例..."
+                yellow "正在更新种子服务器列表并重启重置所有赛风实例..."
+                fetch_psiphon_server_list 1 >/dev/null 2>&1 || true
                 for cc in "${insts[@]}"; do
                     [[ -z "$cc" ]] && continue
                     local idir="${PSI_INSTANCES_DIR}/${cc}"
@@ -3887,7 +4034,7 @@ psiphon_multigroup_menu() {
                     write_psiphon_config "$socks_p" "$cc" "$idir/psiphon.config" "$idir/data" "$up_proxy"
                     start_psiphon_instance "$cc"
                 done
-                green "所有赛风实例已按照各自模式重启并重新载入！"
+                green "所有赛风实例已按照最新纯净种子列表重启并重新载入！"
                 ;;
             6) configure_psiphon_instance_egress_menu ;;
             0) return 0 ;;
@@ -4200,14 +4347,68 @@ run_cron_check() {
         fi
     fi
 
+    # 2. 主节点赛风出站真实出口健康巡检与独立阶梯自愈
     if [[ -f "$WORKDIR/psiphon_main_enabled.txt" && "$(cat "$WORKDIR/psiphon_main_enabled.txt")" == "true" ]]; then
+        local m_fail_file="$WORKDIR/psiphon_main_fail_count.txt"
+        local m_fail_count=$(cat "$m_fail_file" 2>/dev/null || echo "0")
+        [[ "$m_fail_count" =~ ^[0-9]+$ ]] || m_fail_count=0
+
         if ! is_main_psiphon_running; then
             start_main_psiphon
             echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Psiphon 主进程未运行，已自动拉起！" >> "$log_file"
         fi
+
+        if check_main_psiphon_health; then
+            [[ "$m_fail_count" -ne 0 ]] && echo "0" > "$m_fail_file"
+        else
+            ((m_fail_count++))
+            echo "$m_fail_count" > "$m_fail_file"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈巡检] 主节点 Psiphon 出口探测失败 (连续第 ${m_fail_count} 次)" >> "$log_file"
+
+            if [[ "$m_fail_count" -eq 2 ]]; then
+                heal_main_psiphon 1
+            elif [[ "$m_fail_count" -ge 3 ]]; then
+                if ! heal_main_psiphon 2; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈告警] 主节点 Psiphon 深度自愈后仍未恢复，保持后台重试" >> "$log_file"
+                fi
+            fi
+        fi
     fi
 
+    # 3. 确保所有副节点配置与基础进程正常
     ensure_all_psiphon_instances_running
+
+    # 赛风副节点真实出口健康巡检与独立阶梯自愈 (按国家隔离，互不影响)
+    local psi_insts
+    mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
+    for cc in "${psi_insts[@]}"; do
+        [[ -z "$cc" ]] && continue
+        local idir="${PSI_INSTANCES_DIR}/${cc}"
+        [[ -d "$idir" ]] || continue
+
+        local fail_file="$idir/fail_count.txt"
+        local fail_count=$(cat "$fail_file" 2>/dev/null || echo "0")
+        [[ "$fail_count" =~ ^[0-9]+$ ]] || fail_count=0
+
+        if check_psiphon_instance_health "$cc"; then
+            # 探测正常，若之前有失败计数则重置
+            [[ "$fail_count" -ne 0 ]] && echo "0" > "$fail_file"
+        else
+            ((fail_count++))
+            echo "$fail_count" > "$fail_file"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈巡检] 赛风副节点 [$cc] 出口探测失败 (连续第 ${fail_count} 次)" >> "$log_file"
+
+            if [[ "$fail_count" -eq 2 ]]; then
+                # 连续 2 次失败：触发一级软重启自愈
+                heal_psiphon_instance "$cc" 1
+            elif [[ "$fail_count" -ge 3 ]]; then
+                # 连续 3 次及以上失败：触发二级深度清障自愈 (拉取最新种子列表 + 清空 data + 强制 Psiphon 换新服务器)
+                if ! heal_psiphon_instance "$cc" 2; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈告警] 赛风副节点 [$cc] 深度自愈后仍未恢复，保持后台重试" >> "$log_file"
+                fi
+            fi
+        fi
+    done
 }
 
 # ==================== 8. TCP / UDP / BBR 网络深度调优模块 ====================
