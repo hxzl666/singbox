@@ -236,29 +236,44 @@ install_system_dependencies() {
     fi
 }
 
+get_latest_singbox_tag() {
+    local tag=""
+    # 1. 优先从 GitHub API 获取 1.14+ (含 pre-release / beta / rc 等 1.14+ 预发布版本)
+    tag=$(curl -sL -m 5 "https://api.github.com/repos/SagerNet/sing-box/releases" 2>/dev/null | grep '"tag_name":' | grep -E 'v1\.(1[4-9]|[2-9][0-9])\.' | head -n1 | sed -E 's/.*"v([^"]+)".*/\1/' 2>/dev/null)
+    # 2. 若 API 被限流，尝试从 releases 页面正则抓取最新 1.14+ tag
+    if [[ -z "$tag" ]]; then
+        tag=$(curl -sL -m 5 "https://github.com/SagerNet/sing-box/releases" 2>/dev/null | grep -oE '/releases/tag/v1\.(1[4-9]|[2-9][0-9])\.[^"]+' | head -n1 | sed 's|/releases/tag/v||' 2>/dev/null)
+    fi
+    # 3. 兜底获取任意第一条最新 Release tag
+    if [[ -z "$tag" ]]; then
+        tag=$(curl -sL -m 5 "https://api.github.com/repos/SagerNet/sing-box/releases" 2>/dev/null | grep '"tag_name":' | head -n1 | sed -E 's/.*"v([^"]+)".*/\1/' 2>/dev/null)
+    fi
+    # 4. 若无法连接 GitHub API，默认锁定最新的 1.14.0 预发布版本
+    [[ -z "$tag" ]] && tag="1.14.0-beta.17"
+    echo "$tag"
+}
+
 download_singbox_core() {
     local force="$1"
     local arch=$(detect_arch)
     mkdir -p "$WORKDIR"
 
-    local sb_ver="1.14.0"
-    local latest_tag
-    latest_tag=$(curl -sL -m 4 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | grep '"tag_name":' | head -n1 | sed -E 's/.*"v([^"]+)".*/\1/' 2>/dev/null)
-    [[ -n "$latest_tag" ]] && sb_ver="$latest_tag"
+    local sb_ver
+    sb_ver=$(get_latest_singbox_tag)
 
     local need_download=0
     if [[ ! -x "$WORKDIR/sing-box" || "$force" == "force" ]]; then
         need_download=1
     else
-        # 检查当前核心版本，若低于 1.12.0 (不支持 AnyTLS) 或指定 force 则自动更新至最新版本
+        # 检查当前核心版本，若低于 1.14.0 或指定 force 则自动更新至 1.14+ 最新版本
         local current_ver
         current_ver=$("$WORKDIR/sing-box" version 2>/dev/null | head -n 1 | awk '{print $3}' | sed 's/^v//')
         if [[ -n "$current_ver" ]]; then
             local major minor
             major=$(echo "$current_ver" | awk -F. '{print $1}')
             minor=$(echo "$current_ver" | awk -F. '{print $2}')
-            if [[ "$major" -lt 1 || ( "$major" -eq 1 && "$minor" -lt 12 ) ]]; then
-                yellow "[*] 检测到当前 Sing-box 核心版本 (v${current_ver}) 低于 v1.12.0，正在自动升级至最新版 (v${sb_ver})..."
+            if [[ "$major" -lt 1 || ( "$major" -eq 1 && "$minor" -lt 14 ) ]]; then
+                yellow "[*] 检测到当前 Sing-box 核心版本 (v${current_ver}) 低于 v1.14.0，正在自动升级至最新 1.14+ 核心 (v${sb_ver})..."
                 need_download=1
             fi
         else
@@ -271,6 +286,8 @@ download_singbox_core() {
         local sb_urls=(
             "https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${arch}.tar.gz"
             "https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v${sb_ver}/sing-box-${sb_ver}-linux-${arch}.tar.gz"
+            "https://github.com/SagerNet/sing-box/releases/download/v1.14.0-beta.17/sing-box-1.14.0-beta.17-linux-${arch}.tar.gz"
+            "https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v1.14.0-beta.17/sing-box-1.14.0-beta.17-linux-${arch}.tar.gz"
             "https://raw.githubusercontent.com/hxzl666/singbox/main/sing-box-linux-${arch}"
         )
         local tmp_d="/tmp/sb_bin_tmp"
@@ -307,7 +324,14 @@ download_singbox_core() {
 check_singbox_openvpn_support() {
     local force="$1"
     if [[ -f "$OPENVPN_CHECK_FILE" && "$force" != "force" ]]; then
-        return 0
+        local current_ver
+        current_ver=$("$WORKDIR/sing-box" version 2>/dev/null | head -n 1 | awk '{print $3}' | sed 's/^v//')
+        local major minor
+        major=$(echo "$current_ver" | awk -F. '{print $1}')
+        minor=$(echo "$current_ver" | awk -F. '{print $2}')
+        if [[ "$major" -gt 1 || ( "$major" -eq 1 && "$minor" -ge 14 ) ]]; then
+            return 0
+        fi
     fi
 
     if [[ ! -x "$WORKDIR/sing-box" ]]; then
@@ -325,19 +349,20 @@ check_singbox_openvpn_support() {
     major=$(echo "$current_ver" | awk -F. '{print $1}')
     minor=$(echo "$current_ver" | awk -F. '{print $2}')
 
+    # 严格要求 Sing-box 1.14+ (含 1.14.0-alpha / beta / rc 等预发布版本)
     if [[ "$major" -gt 1 || ( "$major" -eq 1 && "$minor" -ge 14 ) ]]; then
         touch "$OPENVPN_CHECK_FILE"
         return 0
     fi
 
-    yellow "[*] 检测到当前 Sing-box 版本 (v${current_ver}) 低于 v1.14.0，正在自动升级以支持 OpenVPN 出站..."
+    yellow "[*] 检测到当前 Sing-box 版本 (v${current_ver}) 低于 v1.14.0，正在自动升级至 1.14+ 预发布核心..."
     if download_singbox_core force; then
         current_ver=$("$WORKDIR/sing-box" version 2>/dev/null | head -n 1 | awk '{print $3}' | sed 's/^v//')
         major=$(echo "$current_ver" | awk -F. '{print $1}')
         minor=$(echo "$current_ver" | awk -F. '{print $2}')
         if [[ "$major" -gt 1 || ( "$major" -eq 1 && "$minor" -ge 14 ) ]]; then
             touch "$OPENVPN_CHECK_FILE"
-            green "[+] Sing-box 核心已成功升级至 v${current_ver}，OpenVPN 能力校验通过！"
+            green "[+] Sing-box 核心已成功升级至 1.14+ (v${current_ver})，OpenVPN 能力校验通过！"
             return 0
         fi
     fi
@@ -630,7 +655,7 @@ heal_psiphon_instance() {
 
 # ==================== OpenVPN Provider 核心管理模块 (VPNGate) ====================
 init_openvpn_dirs() {
-    mkdir -p "$OPENVPN_DIR" "$OPENVPN_INSTANCES_DIR" "$OPENVPN_CONFIGS_DIR" "${OPENVPN_DIR}/logs"
+    mkdir -p "$OPENVPN_DIR" "$OPENVPN_INSTANCES_DIR" "$OPENVPN_CONFIGS_DIR" "${OPENVPN_DIR}/logs" /run 2>/dev/null || true
     [[ -f "$OPENVPN_DIR/instances.txt" ]] || touch "$OPENVPN_DIR/instances.txt"
     [[ -f "$OPENVPN_DIR/penalties.txt" ]] || touch "$OPENVPN_DIR/penalties.txt"
     if [[ ! -f "$OPENVPN_DIR/auth.txt" ]]; then
@@ -638,7 +663,13 @@ init_openvpn_dirs() {
 vpn
 vpn
 EOF_AUTH
-        chmod 600 "$OPENVPN_DIR/auth.txt" 2>/dev/null || true
+    fi
+    chmod 644 "$OPENVPN_DIR/auth.txt" 2>/dev/null || true
+    # 确保 /dev/net/tun 虚拟设备节点存在 (兼容各类 VPS/容器环境)
+    if [[ ! -c /dev/net/tun ]]; then
+        mkdir -p /dev/net 2>/dev/null || true
+        mknod /dev/net/tun c 10 200 2>/dev/null || true
+        chmod 666 /dev/net/tun 2>/dev/null || true
     fi
 }
 
@@ -889,20 +920,27 @@ generate_openvpn_ovpn_file() {
             }
             next
         }
-        !/^(dev |dev-type|redirect-gateway|route-gateway|dhcp-option|auth-user-pass|nobind|persist-key|persist-tun|route-nopull)/ { print $0 }
+        !/^(dev |dev-type|redirect-gateway|route-gateway|dhcp-option|auth-user-pass|nobind|persist-key|persist-tun|route-nopull|data-ciphers|data-ciphers-fallback|cipher |auth |verb )/ { print $0 }
         ' "$tmp_decoded" > "$target_ovpn"
     else
         # 保持 UDP 模式
         awk '
         /^proto / { print "proto udp"; next }
-        !/^(dev |dev-type|redirect-gateway|route-gateway|dhcp-option|auth-user-pass|nobind|persist-key|persist-tun|route-nopull)/ { print $0 }
+        !/^(dev |dev-type|redirect-gateway|route-gateway|dhcp-option|auth-user-pass|nobind|persist-key|persist-tun|route-nopull|data-ciphers|data-ciphers-fallback|cipher |auth |verb )/ { print $0 }
         ' "$tmp_decoded" > "$target_ovpn"
     fi
 
-    # 追加安全隔离与专属网卡参数
+    local ovpn_ver_str
+    ovpn_ver_str=$(openvpn --version 2>/dev/null | head -n1)
+    local cipher_compat_block="cipher AES-128-CBC"
+    if echo "$ovpn_ver_str" | grep -qE 'OpenVPN 2\.[5-9]|OpenVPN [3-9]\.'; then
+        cipher_compat_block="data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC:AES-128-CBC:BF-CBC"$'\n'"data-ciphers-fallback AES-128-CBC"$'\n'"cipher AES-128-CBC"
+    fi
+
+    # 追加安全隔离、加密算法兼容性与专属网卡参数
     cat >> "$target_ovpn" << EOF_OVPN_EXTRA
 
-# Sing-box OpenVPN 多出口安全隔离与防网关劫持参数
+# Sing-box OpenVPN 多出口安全隔离与兼容性加固参数
 dev ${dev_name}
 dev-type tun
 nobind
@@ -912,6 +950,13 @@ route-nopull
 auth-user-pass ${auth_file}
 script-security 2
 verb 3
+${cipher_compat_block}
+auth SHA1
+auth-nocache
+tls-version-min 1.0
+resolv-retry infinite
+connect-retry 2
+hand-window 15
 EOF_OVPN_EXTRA
 
     rm -f "$tmp_decoded"
@@ -922,6 +967,7 @@ setup_openvpn_systemd_services() {
     if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
         local ovpn_bin
         ovpn_bin=$(command -v openvpn || echo "/usr/sbin/openvpn")
+        mkdir -p /etc/s-box/openvpn/logs /run 2>/dev/null || true
 
         cat > /etc/systemd/system/openvpn-main.service <<EOF_OVPN_MAIN
 [Unit]
@@ -932,6 +978,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${ovpn_bin} --config /etc/s-box/openvpn/configs/main.ovpn --writepid /run/openvpn-main.pid
+StandardOutput=append:/etc/s-box/openvpn/logs/main.log
+StandardError=append:/etc/s-box/openvpn/logs/main.log
 Restart=always
 RestartSec=3
 LimitNOFILE=infinity
@@ -949,6 +997,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=${ovpn_bin} --config /etc/s-box/openvpn/configs/%i.ovpn --writepid /run/openvpn-%i.pid
+StandardOutput=append:/etc/s-box/openvpn/logs/%i.log
+StandardError=append:/etc/s-box/openvpn/logs/%i.log
 Restart=always
 RestartSec=3
 LimitNOFILE=infinity
@@ -987,54 +1037,89 @@ start_main_openvpn() {
         target_country=$(cat "$OPENVPN_DIR/main_region.txt" 2>/dev/null || echo "JP")
     fi
     echo "$target_country" > "$OPENVPN_DIR/main_region.txt"
-    echo "$fallback_idx" > "$OPENVPN_DIR/main_fallback_idx.txt"
-    echo "$proto_mode" > "$OPENVPN_DIR/main_proto.txt"
 
     fetch_openvpn_nodes 0 || return 1
-    local node_data
-    node_data=$(get_openvpn_node_data "$target_country" "$fallback_idx")
-    if [[ -z "$node_data" ]]; then
-        red "[!] 未在 VPNGate 数据库中找到国家 [$target_country] 的可用 OpenVPN 节点"
-        return 1
-    fi
 
-    local wscore cc ip score ping spd_mbps sess up host b64
-    IFS=$'\t' read -r wscore cc ip score ping spd_mbps sess up host b64 <<< "$node_data"
-    echo "$node_data" > "$OPENVPN_DIR/main_current_node.txt"
+    local max_tries=5
+    local current_try=0
+    local cur_idx="$fallback_idx"
+    local cur_proto="$proto_mode"
+    local found_working=0
 
-    yellow "[*] 正在准备主节点 OpenVPN 出口配置 ($cc - $ip [${proto_mode^^}], 综合评分: $wscore, 延迟: ${ping}ms)..."
-    generate_openvpn_ovpn_file "main" "$b64" "$proto_mode" || { red "[!] 生成 main.ovpn 配置文件失败"; return 1; }
+    while [[ $current_try -lt $max_tries ]]; do
+        ((current_try++))
+        echo "$cur_idx" > "$OPENVPN_DIR/main_fallback_idx.txt"
+        echo "$cur_proto" > "$OPENVPN_DIR/main_proto.txt"
 
-    stop_main_openvpn
-    sleep 1
+        local node_data
+        node_data=$(get_openvpn_node_data "$target_country" "$cur_idx")
+        if [[ -z "$node_data" ]]; then
+            red "[!] 未在 VPNGate 数据库中找到国家 [$target_country] 的可用 OpenVPN 节点"
+            return 1
+        fi
 
-    local openvpn_bin
-    openvpn_bin=$(command -v openvpn || echo "openvpn")
+        local wscore cc ip score ping spd_mbps sess up host b64
+        IFS=$'\t' read -r wscore cc ip score ping spd_mbps sess up host b64 <<< "$node_data"
+        echo "$node_data" > "$OPENVPN_DIR/main_current_node.txt"
 
-    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
-        systemctl stop openvpn-main >/dev/null 2>&1 || true
-        systemctl enable openvpn-main >/dev/null 2>&1 || true
-        systemctl start openvpn-main >/dev/null 2>&1 || true
-    else
-        nohup "$openvpn_bin" --config "$OPENVPN_CONFIGS_DIR/main.ovpn" --writepid "/run/openvpn-main.pid" >> "$OPENVPN_DIR/logs/main.log" 2>&1 &
-    fi
+        yellow "[*] 正在准备主节点 OpenVPN 出口配置 ($cc - $ip [${cur_proto^^}], 优选第 ${cur_idx} 节点)..."
+        generate_openvpn_ovpn_file "main" "$b64" "$cur_proto" || { ((cur_idx++)); continue; }
 
-    local ok=0
-    for ((i=1; i<=8; i++)); do
-        sleep 1
-        if ip link show dev "tun-ovpn-main" >/dev/null 2>&1 || ifconfig "tun-ovpn-main" >/dev/null 2>&1; then
-            ok=1
-            setup_openvpn_tun_sysctl "tun-ovpn-main"
+        stop_main_openvpn
+        sleep 0.5
+        : > "$OPENVPN_DIR/logs/main.log" 2>/dev/null || true
+
+        local openvpn_bin
+        openvpn_bin=$(command -v openvpn || echo "openvpn")
+
+        if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+            systemctl reset-failed openvpn-main >/dev/null 2>&1 || true
+            systemctl stop openvpn-main >/dev/null 2>&1 || true
+            systemctl enable openvpn-main >/dev/null 2>&1 || true
+            systemctl start openvpn-main >/dev/null 2>&1 || true
+        else
+            nohup "$openvpn_bin" --config "$OPENVPN_CONFIGS_DIR/main.ovpn" --writepid "/run/openvpn-main.pid" >> "$OPENVPN_DIR/logs/main.log" 2>&1 &
+        fi
+
+        local if_ok=0
+        for ((i=1; i<=12; i++)); do
+            sleep 1
+            if ip link show dev "tun-ovpn-main" >/dev/null 2>&1 || ifconfig "tun-ovpn-main" >/dev/null 2>&1; then
+                if_ok=1
+                setup_openvpn_tun_sysctl "tun-ovpn-main"
+                break
+            fi
+        done
+
+        if [[ $if_ok -eq 1 ]]; then
+            green "[+] 主节点 OpenVPN 隧道网卡已就绪: tun-ovpn-main ($ip [${cur_proto^^}])"
+            clear_openvpn_penalty "$ip"
+            found_working=1
             break
+        else
+            red "[✗] 节点 $ip [${cur_proto^^}] 建立隧道失败！"
+            echo -e "${yellow}--- [OpenVPN 调试日志 (最近 10 行)] ---${re}"
+            if [[ -s "$OPENVPN_DIR/logs/main.log" ]]; then
+                tail -n 10 "$OPENVPN_DIR/logs/main.log"
+            elif command -v journalctl >/dev/null 2>&1; then
+                journalctl -u openvpn-main -n 10 --no-pager 2>/dev/null
+            fi
+            echo -e "${yellow}---------------------------------------${re}"
+            record_openvpn_penalty "$ip"
+            if [[ "$cur_proto" == "udp" ]]; then
+                cur_proto="tcp"
+            else
+                cur_proto="udp"
+                cur_idx=$((cur_idx + 1))
+            fi
         fi
     done
 
-    if [[ $ok -eq 1 ]]; then
-        green "[+] 主节点 OpenVPN 隧道网卡已就绪: tun-ovpn-main ($ip [${proto_mode^^}])"
+    if [[ $found_working -eq 1 ]]; then
         return 0
     else
-        yellow "[!] 正在后台建立 OpenVPN 隧道连接..."
-        return 0
+        red "[!] 连续尝试 $max_tries 次均未能建立 tun-ovpn-main 隧道，请检查网络或更换其他国家！"
+        return 1
     fi
 }
 
@@ -1181,47 +1266,89 @@ start_openvpn_instance() {
     install_openvpn_dependencies || return 1
     setup_openvpn_systemd_services
 
-    echo "$fallback_idx" > "$idir/fallback_idx.txt"
-    echo "$proto_mode" > "$idir/proto.txt"
-
     fetch_openvpn_nodes 0 || return 1
-    local node_data
-    node_data=$(get_openvpn_node_data "$cc" "$fallback_idx")
-    if [[ -z "$node_data" ]]; then
-        red "[!] 未在 VPNGate 找到国家 [$cc] 的可用 OpenVPN 节点"
-        return 1
-    fi
 
-    local wscore ncc ip score ping spd_mbps sess up host b64
-    IFS=$'\t' read -r wscore ncc ip score ping spd_mbps sess up host b64 <<< "$node_data"
-    echo "$node_data" > "$idir/current_node.txt"
+    local max_tries=5
+    local current_try=0
+    local cur_idx="$fallback_idx"
+    local cur_proto="$proto_mode"
+    local found_working=0
 
-    generate_openvpn_ovpn_file "$cc_lower" "$b64" "$proto_mode" || return 1
+    while [[ $current_try -lt $max_tries ]]; do
+        ((current_try++))
+        echo "$cur_idx" > "$idir/fallback_idx.txt"
+        echo "$cur_proto" > "$idir/proto.txt"
 
-    stop_openvpn_instance "$cc"
-    sleep 1
+        local node_data
+        node_data=$(get_openvpn_node_data "$cc" "$cur_idx")
+        if [[ -z "$node_data" ]]; then
+            red "[!] 未在 VPNGate 找到国家 [$cc] 的可用 OpenVPN 节点"
+            return 1
+        fi
 
-    local openvpn_bin
-    openvpn_bin=$(command -v openvpn || echo "openvpn")
+        local wscore ncc ip score ping spd_mbps sess up host b64
+        IFS=$'\t' read -r wscore ncc ip score ping spd_mbps sess up host b64 <<< "$node_data"
+        echo "$node_data" > "$idir/current_node.txt"
 
-    if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
-        systemctl stop "openvpn-instance@${cc_lower}" >/dev/null 2>&1 || true
-        systemctl enable "openvpn-instance@${cc_lower}" >/dev/null 2>&1 || true
-        systemctl start "openvpn-instance@${cc_lower}" >/dev/null 2>&1 || true
-    else
-        nohup "$openvpn_bin" --config "$OPENVPN_CONFIGS_DIR/${cc_lower}.ovpn" --writepid "/run/openvpn-${cc_lower}.pid" >> "$OPENVPN_DIR/logs/${cc_lower}.log" 2>&1 &
-    fi
+        yellow "[*] 正在连接 OpenVPN 副节点 [$cc] - $ip [${cur_proto^^}] (优选第 ${cur_idx} 节点)..."
+        generate_openvpn_ovpn_file "$cc_lower" "$b64" "$cur_proto" || { ((cur_idx++)); continue; }
 
-    local ok=0
-    for ((i=1; i<=8; i++)); do
-        sleep 1
-        if ip link show dev "tun-ovpn-${cc_lower}" >/dev/null 2>&1 || ifconfig "tun-ovpn-${cc_lower}" >/dev/null 2>&1; then
-            ok=1
-            setup_openvpn_tun_sysctl "tun-ovpn-${cc_lower}"
+        stop_openvpn_instance "$cc"
+        sleep 0.5
+        : > "$OPENVPN_DIR/logs/${cc_lower}.log" 2>/dev/null || true
+
+        local openvpn_bin
+        openvpn_bin=$(command -v openvpn || echo "openvpn")
+
+        if command -v systemctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+            systemctl reset-failed "openvpn-instance@${cc_lower}" >/dev/null 2>&1 || true
+            systemctl stop "openvpn-instance@${cc_lower}" >/dev/null 2>&1 || true
+            systemctl enable "openvpn-instance@${cc_lower}" >/dev/null 2>&1 || true
+            systemctl start "openvpn-instance@${cc_lower}" >/dev/null 2>&1 || true
+        else
+            nohup "$openvpn_bin" --config "$OPENVPN_CONFIGS_DIR/${cc_lower}.ovpn" --writepid "/run/openvpn-${cc_lower}.pid" >> "$OPENVPN_DIR/logs/${cc_lower}.log" 2>&1 &
+        fi
+
+        local if_ok=0
+        for ((i=1; i<=12; i++)); do
+            sleep 1
+            if ip link show dev "tun-ovpn-${cc_lower}" >/dev/null 2>&1 || ifconfig "tun-ovpn-${cc_lower}" >/dev/null 2>&1; then
+                if_ok=1
+                setup_openvpn_tun_sysctl "tun-ovpn-${cc_lower}"
+                break
+            fi
+        done
+
+        if [[ $if_ok -eq 1 ]]; then
+            green "[+] 副节点 OpenVPN 隧道网卡已就绪: tun-ovpn-${cc_lower} ($ip [${cur_proto^^}])"
+            clear_openvpn_penalty "$ip"
+            found_working=1
             break
+        else
+            red "[✗] 节点 $ip [${cur_proto^^}] 建立隧道失败！"
+            echo -e "${yellow}--- [OpenVPN 调试日志 (最近 10 行)] ---${re}"
+            if [[ -s "$OPENVPN_DIR/logs/${cc_lower}.log" ]]; then
+                tail -n 10 "$OPENVPN_DIR/logs/${cc_lower}.log"
+            elif command -v journalctl >/dev/null 2>&1; then
+                journalctl -u "openvpn-instance@${cc_lower}" -n 10 --no-pager 2>/dev/null
+            fi
+            echo -e "${yellow}---------------------------------------${re}"
+            record_openvpn_penalty "$ip"
+            if [[ "$cur_proto" == "udp" ]]; then
+                cur_proto="tcp"
+            else
+                cur_proto="udp"
+                cur_idx=$((cur_idx + 1))
+            fi
         fi
     done
-    return 0
+
+    if [[ $found_working -eq 1 ]]; then
+        return 0
+    else
+        red "[!] 连续尝试 $max_tries 次均未能建立 tun-ovpn-${cc_lower} 隧道，请检查网络或更换其他国家！"
+        return 1
+    fi
 }
 
 stop_openvpn_instance() {
@@ -3708,8 +3835,10 @@ configure_warp_outbound() {
                 [[ -z "$reg_in" ]] && reg_in="JP"
                 show_openvpn_nodes_table "$reg_in" 10
                 echo
-                yellow "正在连接国家 [$reg_in] 综合评分最高的第一优选 OpenVPN 节点..."
-                if start_main_openvpn "$reg_in" 1; then
+                reading "请选择要连接的节点序号 [1-10, 回车默认第 1 高分节点]: " sel_node_idx
+                [[ -z "$sel_node_idx" || ! "$sel_node_idx" =~ ^[0-9]+$ || "$sel_node_idx" -lt 1 ]] && sel_node_idx="1"
+                yellow "正在连接国家 [$reg_in] 第 ${sel_node_idx} 优选 OpenVPN 节点..."
+                if start_main_openvpn "$reg_in" "$sel_node_idx" "udp"; then
                     echo "false" > "$WORKDIR/warp_enabled.txt"
                     echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
                     echo "true" > "$OPENVPN_DIR/main_enabled.txt"
@@ -5050,6 +5179,8 @@ add_openvpn_instance() {
 
     show_openvpn_nodes_table "$cc" 10
     echo
+    reading "请选择要连接的节点序号 [1-10, 回车默认第 1 高分节点]: " sel_node_idx
+    [[ -z "$sel_node_idx" || ! "$sel_node_idx" =~ ^[0-9]+$ || "$sel_node_idx" -lt 1 ]] && sel_node_idx="1"
 
     local inst_dir="${OPENVPN_INSTANCES_DIR}/${cc}"
     mkdir -p "$inst_dir"
@@ -5084,12 +5215,17 @@ add_openvpn_instance() {
     echo "$tuic_p" > "$inst_dir/tuic_port.txt"
     echo "$vless_p" > "$inst_dir/vless_port.txt"
 
+    yellow "[*] 正在启动 OpenVPN 副节点实例 [$cc] 并连接第 ${sel_node_idx} 优选节点..."
+    if ! start_openvpn_instance "$cc" "$sel_node_idx"; then
+        red "[✗] 未能成功与国家 [$cc] 建立 OpenVPN 隧道，已取消添加！请稍后重试或更换其他国家！"
+        rm -rf "$inst_dir"
+        sed -i "/^${cc}$/Id" "$OPENVPN_DIR/instances.txt" 2>/dev/null || true
+        return 1
+    fi
+
     if ! grep -qix "$cc" "$OPENVPN_DIR/instances.txt" 2>/dev/null; then
         echo "$cc" >> "$OPENVPN_DIR/instances.txt"
     fi
-
-    yellow "[*] 正在启动 OpenVPN 副节点实例 [$cc] 并连接第一优选节点..."
-    start_openvpn_instance "$cc" 1
 
     sync_openvpn_instance_to_singbox "$cc"
     apply_changes
@@ -5161,12 +5297,25 @@ repair_single_openvpn_instance() {
     [[ -z "$choice_idx" || ! "$choice_idx" =~ ^[0-9]+$ || "$choice_idx" -lt 1 || "$choice_idx" -gt "${#insts[@]}" ]] && return 1
 
     local target_cc="${insts[$((choice_idx-1))]}"
-    yellow "[*] 正在对 OpenVPN 副节点 [$target_cc] 执行 Fallback 故障转移换路..."
-    if heal_openvpn_instance "$target_cc" 1; then
-        green "[✓] 副节点 [$target_cc] 换路成功，已切换至新可用节点！"
+    show_openvpn_nodes_table "$target_cc" 10
+    echo
+    reading "请选择要切换的节点序号 [1-10, 回车自动 Fallback 到下一可用节点]: " sel_node_idx
+    if [[ -n "$sel_node_idx" && "$sel_node_idx" =~ ^[0-9]+$ && "$sel_node_idx" -ge 1 ]]; then
+        yellow "[*] 正在对 OpenVPN 副节点 [$target_cc] 切换至第 ${sel_node_idx} 优选节点..."
+        if start_openvpn_instance "$target_cc" "$sel_node_idx"; then
+            green "[✓] 副节点 [$target_cc] 已成功切换至第 ${sel_node_idx} 优选节点！"
+        else
+            red "[✗] 副节点 [$target_cc] 切换失败，已自动执行 Fallback 换路自愈..."
+            heal_openvpn_instance "$target_cc" 1
+        fi
     else
-        red "[✗] 副节点 [$target_cc] 自动修复失败，尝试强制刷新 VPNGate 数据库重试..."
-        heal_openvpn_instance "$target_cc" 2
+        yellow "[*] 正在对 OpenVPN 副节点 [$target_cc] 执行 Fallback 故障转移换路..."
+        if heal_openvpn_instance "$target_cc" 1; then
+            green "[✓] 副节点 [$target_cc] 换路成功，已切换至新可用节点！"
+        else
+            red "[✗] 副节点 [$target_cc] 自动修复失败，尝试强制刷新 VPNGate 数据库重试..."
+            heal_openvpn_instance "$target_cc" 2
+        fi
     fi
 }
 
@@ -5391,8 +5540,11 @@ openvpn_management_menu() {
                 new_cc="${new_cc^^}"
                 [[ -z "$new_cc" ]] && new_cc="JP"
                 show_openvpn_nodes_table "$new_cc" 10
-                yellow "正在切换至国家 [$new_cc] 第一高分节点..."
-                if start_main_openvpn "$new_cc" 1 "udp"; then
+                echo
+                reading "请选择要连接的节点序号 [1-10, 回车默认第 1 高分节点]: " sel_node_idx
+                [[ -z "$sel_node_idx" || ! "$sel_node_idx" =~ ^[0-9]+$ || "$sel_node_idx" -lt 1 ]] && sel_node_idx="1"
+                yellow "正在切换至国家 [$new_cc] 第 ${sel_node_idx} 优选节点..."
+                if start_main_openvpn "$new_cc" "$sel_node_idx" "udp"; then
                     echo "false" > "$WORKDIR/warp_enabled.txt"
                     echo "false" > "$WORKDIR/psiphon_main_enabled.txt"
                     echo "true" > "$OPENVPN_DIR/main_enabled.txt"
