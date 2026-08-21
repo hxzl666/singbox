@@ -91,7 +91,10 @@ service_disable argo-tunnel
 systemctl disable --now 'psiphon-main' 2>/dev/null || true
 systemctl disable --now 'psiphon-instance@*' 2>/dev/null || true
 systemctl disable --now 'psiphon-cfon@*' 2>/dev/null || true
+systemctl disable --now 'openvpn-main' 2>/dev/null || true
+systemctl disable --now 'openvpn-instance@*' 2>/dev/null || true
 pkill -9 -f "psiphon-tunnel-core" 2>/dev/null || true
+pkill -9 -f "openvpn.*configs/" 2>/dev/null || true
 pkill -9 -f "warp-plus" 2>/dev/null || true
 
 # 2. 清理服务定义文件
@@ -106,6 +109,8 @@ else
     rm -f /etc/systemd/system/psiphon-main.service
     rm -f /etc/systemd/system/psiphon-instance@.service
     rm -f /etc/systemd/system/psiphon-cfon@.service
+    rm -f /etc/systemd/system/openvpn-main.service
+    rm -f /etc/systemd/system/openvpn-instance@.service
     systemctl daemon-reload 2>/dev/null || true
 fi
 
