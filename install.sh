@@ -2368,7 +2368,7 @@ EOF_BLANK
           "listen_port": $ploop
         }]
       ) as $main_inbounds |
-      .inbounds = (([$main_inbounds[], .inbounds[]?] | select(type == "object") | unique_by(.tag // "")))
+      .inbounds = (($main_inbounds + (.inbounds // [])) | unique_by(.tag))
       ' "$cfg" > "$tmp_json" && jq -e . "$tmp_json" >/dev/null 2>&1 && mv -f "$tmp_json" "$cfg"
 
     sync_all_secondary_nodes
