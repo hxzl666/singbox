@@ -181,6 +181,16 @@ service_is_active() {
     fi
 }
 
+service_disable() {
+    local name=$1
+    if $IS_OPENRC; then
+        rc-update del "$name" default >/dev/null 2>&1 || true
+        rm -f "/etc/init.d/$name" 2>/dev/null || true
+    elif ! $IS_DIRECT; then
+        systemctl disable "$name" >/dev/null 2>&1 || true
+    fi
+}
+
 # ==================== 依赖与核心自动安装 ====================
 install_system_dependencies() {
     log_info "正在检测系统基础依赖..."
@@ -207,7 +217,9 @@ install_system_dependencies() {
         elif command -v apk >/dev/null 2>&1; then
             echo -e "${blue}--> 正在更新 APK 软件源并安装依赖...${re}"
             apk update
-            apk add curl wget tar jq openssl git net-tools unzip ca-certificates
+            # Alpine 使用 musl libc，需要 gcompat 提供 glibc 兼容层以运行预编译二进制
+            apk add curl wget tar jq openssl git net-tools unzip ca-certificates \
+                     bash grep procps util-linux gcompat libc6-compat
         elif command -v pacman >/dev/null 2>&1; then
             echo -e "${blue}--> 正在安装 Pacman 基础依赖包...${re}"
             pacman -Sy --noconfirm curl wget tar jq openssl net-tools unzip cronie ca-certificates
@@ -520,7 +532,7 @@ get_all_ips() {
     fi
 
     local ipv6_list
-    ipv6_list=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-fA-F:]+' | grep -vE '^(fe80|::1|fd)')
+    ipv6_list=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}' | sed 's/\/.*$//' | grep -vE '^(fe80|::1|fd)')
     if [[ -n "$ipv6_list" ]]; then
         while read -r ip6; do
             [[ -n "$ip6" ]] && ALL_IPS+=("$ip6")
@@ -4003,6 +4015,11 @@ LIMITS_TCP_OPT="/etc/security/limits.d/99-singbox-network-performance.conf"
 set_ipv4_priority() {
     echo
     yellow "[*] 正在调整系统互联网协议解析优先级..."
+    # Alpine (musl libc) 不支持 /etc/gai.conf，该文件仅对 glibc 生效
+    if command -v apk >/dev/null 2>&1; then
+        yellow "[!] 检测到 Alpine Linux (musl libc)，/etc/gai.conf 在此环境下无效，跳过该优化。"
+        return 0
+    fi
     if [[ ! -f /etc/gai.conf ]]; then
         cat > /etc/gai.conf <<'EOF_GAI'
 label ::1/128       0
@@ -4037,7 +4054,12 @@ enable_bbr_tune() {
     mkdir -p /etc/sysctl.d
     echo "net.core.default_qdisc = fq" > /etc/sysctl.d/10-bbr.conf
     echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.d/10-bbr.conf
-    sysctl --system &>/dev/null
+    # 兼容 Alpine Busybox sysctl（不支持 --system）
+    if sysctl --system &>/dev/null 2>&1; then
+        : # systemd 环境，--system 直接加载所有 sysctl.d 配置
+    else
+        for _f in /etc/sysctl.d/*.conf; do [[ -f "$_f" ]] && sysctl -p "$_f" &>/dev/null || true; done
+    fi
 
     echo
     cyan "[*] 正在与 Linux 内核交换握手信号，激活 BBR 加速引擎..."
@@ -4125,7 +4147,12 @@ net.ipv4.tcp_retries2 = 8
 net.ipv4.tcp_fastopen = 3
 EOF_SYSCTL
 
-    sysctl --system &>/dev/null
+    # 兼容 Alpine Busybox sysctl（不支持 --system）
+    if sysctl --system &>/dev/null 2>&1; then
+        : # systemd 环境，--system 直接加载所有 sysctl.d 配置
+    else
+        for _f in /etc/sysctl.d/*.conf; do [[ -f "$_f" ]] && sysctl -p "$_f" &>/dev/null || true; done
+    fi
 
     echo
     cyan "[*] 正在加载跨境物理链路专项调优补丁..."
@@ -4243,7 +4270,12 @@ rollback_tcp_tune() {
     done
 
     ulimit -n 1024 2>/dev/null || true
-    sysctl --system &>/dev/null || true
+    # 兼容 Alpine Busybox sysctl（不支持 --system）
+    if sysctl --system &>/dev/null 2>&1; then
+        : # systemd 环境，--system 直接加载所有 sysctl.d 配置
+    else
+        for _f in /etc/sysctl.d/*.conf; do [[ -f "$_f" ]] && sysctl -p "$_f" &>/dev/null || true; done
+    fi
     echo
     green "[✓] 回退完成！所有网络独立配置文件已清理，内存参数已恢复为系统默认状态。"
 }
@@ -4544,11 +4576,19 @@ menu() {
                     service_stop argo-tunnel
                     service_disable sing-box 2>/dev/null
                     service_disable argo-tunnel 2>/dev/null
-                    systemctl disable --now 'psiphon-main' 2>/dev/null || true
-                    systemctl disable --now 'psiphon-instance@*' 2>/dev/null || true
-                    systemctl disable --now 'psiphon-cfon@*' 2>/dev/null || true
-                    rm -f /etc/systemd/system/psiphon-main.service /etc/systemd/system/psiphon-instance@.service /etc/systemd/system/psiphon-cfon@.service
-                    systemctl daemon-reload 2>/dev/null || true
+                    if $IS_OPENRC; then
+                        # 清理 OpenRC 服务注册
+                        for _svc in sing-box argo-tunnel; do
+                            rc-update del "$_svc" default >/dev/null 2>&1 || true
+                            rm -f "/etc/init.d/$_svc" 2>/dev/null || true
+                        done
+                    else
+                        systemctl disable --now 'psiphon-main' 2>/dev/null || true
+                        systemctl disable --now 'psiphon-instance@*' 2>/dev/null || true
+                        systemctl disable --now 'psiphon-cfon@*' 2>/dev/null || true
+                        rm -f /etc/systemd/system/psiphon-main.service /etc/systemd/system/psiphon-instance@.service /etc/systemd/system/psiphon-cfon@.service
+                        systemctl daemon-reload 2>/dev/null || true
+                    fi
                     pkill -9 -f "psiphon-tunnel-core" 2>/dev/null || true
                     pkill -9 -f "warp-plus" 2>/dev/null || true
                     rm -rf /etc/s-box /usr/local/bin/cloudflared /usr/local/bin/sb /usr/local/bin/t
@@ -4677,9 +4717,53 @@ pidfile="/run/sing-box.pid"
 command_background=true
 output_log="/var/log/sing-box.log"
 error_log="/var/log/sing-box.err"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true
+    export ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true
+}
 EOF_INIT
         chmod +x /etc/init.d/sing-box
         rc-update add sing-box default >/dev/null 2>&1
+        # 为 Argo Tunnel 创建 OpenRC 服务脚本
+        cat > /etc/init.d/argo-tunnel <<'EOF_ARGO_INIT'
+#!/sbin/openrc-run
+description="Cloudflare Argo Tunnel Service"
+command="/usr/local/bin/cloudflared"
+pidfile="/run/argo-tunnel.pid"
+command_background=true
+output_log="/var/log/argo-tunnel.log"
+error_log="/var/log/argo-tunnel.err"
+
+depend() {
+    need net
+    after sing-box
+}
+
+start_pre() {
+    local _am="" _at="" _ap="8401"
+    if [ -f /etc/s-box/argo.conf ]; then
+        . /etc/s-box/argo.conf
+    fi
+    _am="${ARGO_MODE:-temp}"; _at="${ARGO_TOKEN}"; _ap="${ARGO_PORT:-8401}"
+    if [ "$_am" = "token" ] && [ -n "$_at" ]; then
+        command_args="tunnel --no-autoupdate run --token $_at"
+    else
+        command_args="tunnel --url http://127.0.0.1:${_ap}"
+    fi
+}
+EOF_ARGO_INIT
+        chmod +x /etc/init.d/argo-tunnel
+        # 确保 Alpine 的 crond 已启动并加入开机自启
+        if command -v crond >/dev/null 2>&1; then
+            rc-update add crond default >/dev/null 2>&1 || true
+            rc-service crond start >/dev/null 2>&1 || true
+        fi
     elif ! $IS_DIRECT; then
         cat > /etc/systemd/system/sing-box.service <<'EOF_SYSTEMD'
 [Unit]
