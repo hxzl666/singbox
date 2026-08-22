@@ -88,6 +88,36 @@ detect_arch() {
     esac
 }
 
+# Alpine Linux 兼容性保障与依赖自愈
+ensure_alpine_compatibility() {
+    if command -v apk >/dev/null 2>&1; then
+        local need_apk=0
+        for _pkg in bash grep procps util-linux gcompat libc6-compat ca-certificates curl jq tar; do
+            if ! apk info -e "$_pkg" >/dev/null 2>&1; then
+                need_apk=1
+                break
+            fi
+        done
+        if [[ $need_apk -eq 1 ]]; then
+            yellow "[*] 检测到 Alpine Linux 环境，正在自动补全基础依赖与 glibc 兼容层 (gcompat, libc6-compat)..."
+            apk update >/dev/null 2>&1 || true
+            apk add --no-cache bash grep procps util-linux gcompat libc6-compat ca-certificates curl jq tar wget >/dev/null 2>&1 || true
+        fi
+        
+        # 确保 /lib64 ld-linux 兼容链接存在
+        if [[ ! -d /lib64 && -d /lib ]]; then
+            mkdir -p /lib64 2>/dev/null || true
+        fi
+        if [[ -f /lib/ld-linux-x86-64.so.2 && ! -f /lib64/ld-linux-x86-64.so.2 ]]; then
+            ln -sf /lib/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2 2>/dev/null || true
+        fi
+        if [[ -f /lib/ld-musl-x86_64.so.1 && ! -f /lib/ld-linux-x86-64.so.2 ]]; then
+            ln -sf /lib/ld-musl-x86_64.so.1 /lib/ld-linux-x86-64.so.2 2>/dev/null || true
+            ln -sf /lib/ld-musl-x86_64.so.1 /lib64/ld-linux-x86-64.so.2 2>/dev/null || true
+        fi
+    fi
+}
+
 # 平台与服务自适应
 IS_OPENRC=false
 IS_DIRECT=false
@@ -101,7 +131,31 @@ fi
 service_start() {
     local name=$1
     if $IS_OPENRC; then
-        rc-service "$name" start >/dev/null 2>&1
+        if [[ -x "/etc/init.d/$name" ]]; then
+            rc-service "$name" restart >/dev/null 2>&1 || rc-service "$name" start >/dev/null 2>&1
+        else
+            case "$name" in
+                sing-box)
+                    nohup /etc/s-box/sing-box run -c /etc/s-box/sb.json >> /var/log/sing-box.log 2>&1 &
+                    echo $! > /etc/s-box/sing-box.pid
+                    ;;
+                argo-tunnel)
+                    local _cf_args
+                    _cf_args=$(
+                        local _am="" _at="" _ap="8401"
+                        [[ -f /etc/s-box/argo.conf ]] && source /etc/s-box/argo.conf
+                        _am="${ARGO_MODE:-temp}"; _at="${ARGO_TOKEN}"; _ap="${ARGO_PORT:-8401}"
+                        if [[ "$_am" == "token" && -n "$_at" ]]; then
+                            echo "tunnel --no-autoupdate run --token $_at"
+                        else
+                            echo "tunnel --url http://127.0.0.1:${_ap}"
+                        fi
+                    )
+                    nohup /usr/local/bin/cloudflared $_cf_args >> /var/log/argo-tunnel.log 2>&1 &
+                    echo $! > /etc/s-box/argo-tunnel.pid
+                    ;;
+            esac
+        fi
     elif $IS_DIRECT; then
         service_stop "$name" 2>/dev/null
         case "$name" in
@@ -246,6 +300,7 @@ download_singbox_core() {
     local force="$1"
     local arch=$(detect_arch)
     mkdir -p "$WORKDIR"
+    ensure_alpine_compatibility
 
     local sb_ver="1.13.18"
     local latest_tag
@@ -301,8 +356,13 @@ download_singbox_core() {
         chmod +x "$WORKDIR/sing-box" 2>/dev/null
     fi
 
-    if [[ ! -x "$WORKDIR/sing-box" ]]; then
-        red "[!] Sing-box 核心程序下载失败，请检查 VPS 网络！"
+    # 验证是否可执行，在 Alpine 下若执行失败则再次尝试修复兼容层
+    if [[ -f "$WORKDIR/sing-box" ]] && ! "$WORKDIR/sing-box" version >/dev/null 2>&1; then
+        ensure_alpine_compatibility
+    fi
+
+    if [[ ! -x "$WORKDIR/sing-box" ]] || ! "$WORKDIR/sing-box" version >/dev/null 2>&1; then
+        red "[!] Sing-box 核心程序下载失败或在当前系统架构下无法执行，请检查 VPS 网络与 libc 兼容层！"
         return 1
     fi
     green "[+] Sing-box 核心就绪: $WORKDIR/sing-box ($("$WORKDIR/sing-box" version 2>/dev/null | head -n1))"
@@ -314,7 +374,8 @@ download_cloudflared_core() {
     local cf_arch="$arch"
     [[ "$arch" == "armv7" ]] && cf_arch="arm"
     mkdir -p /usr/local/bin
-    if [[ ! -x "/usr/local/bin/cloudflared" ]]; then
+    ensure_alpine_compatibility
+    if [[ ! -x "/usr/local/bin/cloudflared" ]] || ! /usr/local/bin/cloudflared version >/dev/null 2>&1; then
         yellow "[*] 正在下载 Cloudflared 核心 (Linux-${cf_arch})..."
         local cf_urls=(
             "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"
@@ -340,7 +401,8 @@ download_psiphon_core() {
     local psi_arch="$arch"
     [[ "$arch" == "armv7" ]] && psi_arch="arm"
     mkdir -p "$WORKDIR"
-    if [[ -x "$WORKDIR/psiphon-tunnel-core" ]]; then
+    ensure_alpine_compatibility
+    if [[ -x "$WORKDIR/psiphon-tunnel-core" ]] && "$WORKDIR/psiphon-tunnel-core" --version >/dev/null 2>&1; then
         green "[+] Psiphon 核心已就绪"
         return 0
     fi
@@ -1970,20 +2032,34 @@ apply_changes() {
         return 1
     fi
 
-    # 适配 Sing-box 1.12.0+ / 1.13.0+ 语法校验与 inbounds 入站去重
+    ensure_alpine_compatibility
+
+    # 适配 Sing-box 1.12.0+ / 1.13.0+ 语法校验与 inbounds 入站去重（防御性结构修复）
     if command -v jq >/dev/null 2>&1; then
         local tmp_fix=$(mktemp)
-        jq '
-          if (.inbounds // null) != null then
-            .inbounds = (.inbounds | unique_by(.tag))
+        if jq '
+          # 确保顶层为对象
+          if type != "object" then {} else . end |
+          if (.inbounds // null) != null and (.inbounds | type == "array") then
+            .inbounds = ([.inbounds[] | select(type == "object")] | unique_by(.tag // ""))
           else . end |
-          if (.dns.servers // null) != null then
-            .dns.servers = [.dns.servers[] | del(.detour)]
+          if (.dns.servers // null) != null and (.dns.servers | type == "array") then
+            .dns.servers = [.dns.servers[] | select(type == "object") | del(.detour)]
           else . end |
           if (.route // null) != null and (.dns // null) != null then
             .route.default_domain_resolver = (.route.default_domain_resolver // "dns-direct")
           else . end
-        ' /etc/s-box/sb.json > "$tmp_fix" 2>/dev/null && mv -f "$tmp_fix" /etc/s-box/sb.json
+        ' /etc/s-box/sb.json > "$tmp_fix" 2>/dev/null && jq -e . "$tmp_fix" >/dev/null 2>&1; then
+            mv -f "$tmp_fix" /etc/s-box/sb.json
+        else
+            rm -f "$tmp_fix"
+        fi
+    fi
+
+    # 检查核心是否真实可正常运行，不可用则自动重载核心
+    if [[ ! -x /etc/s-box/sing-box ]] || ! /etc/s-box/sing-box version >/dev/null 2>&1; then
+        yellow "[*] 检测到 Sing-box 核心缺失或在当前系统下无法执行，正在尝试自动安装/修复核心与兼容层..."
+        download_singbox_core force
     fi
 
     if [[ -x /etc/s-box/sing-box ]]; then
@@ -2212,8 +2288,10 @@ EOF_BLANK
       --argjson ploop "${p_loop:-20080}" \
       --arg listen_addr "${LISTEN_ADDR:-"::"}" \
       '
+      # 确保顶层为对象
+      if type != "object" then {} else . end |
       # 保留所有副节点入站 (包含 custom / proxy / psi 的入站)
-      .inbounds = [.inbounds[]? | select(.tag | contains("proxy") or contains("psi") or contains("custom"))] |
+      .inbounds = [.inbounds[]? | select(type == "object" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom"))))] |
 
       (
         [] |
@@ -2290,8 +2368,8 @@ EOF_BLANK
           "listen_port": $ploop
         }]
       ) as $main_inbounds |
-      .inbounds = ($main_inbounds + .inbounds) | unique_by(.tag)
-      ' "$cfg" > "$tmp_json" && mv -f "$tmp_json" "$cfg"
+      .inbounds = (([$main_inbounds[], .inbounds[]?] | select(type == "object") | unique_by(.tag // "")))
+      ' "$cfg" > "$tmp_json" && jq -e . "$tmp_json" >/dev/null 2>&1 && mv -f "$tmp_json" "$cfg"
 
     sync_all_secondary_nodes
 }
@@ -4406,6 +4484,7 @@ EOF_SB
 
 # ==================== 主菜单 ====================
 menu() {
+    ensure_alpine_compatibility
     auto_migrate_legacy_nodes
     create_sb_tool
     while true; do
