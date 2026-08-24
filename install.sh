@@ -77,6 +77,29 @@ make_vmess_link() {
     printf 'vmess://%s' "$(b64_no_wrap "$json")"
 }
 
+# 终端二维码输出工具函数 (自动安装 qrencode 依赖并以 ANSI/UTF8 显示)
+show_qr() {
+    local text="$1"
+    [[ -z "$text" ]] && return 0
+    if ! command -v qrencode >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y >/dev/null 2>&1 && apt-get install -y --no-install-recommends qrencode >/dev/null 2>&1 || true
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y qrencode >/dev/null 2>&1 || true
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y qrencode >/dev/null 2>&1 || true
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache qrencode >/dev/null 2>&1 || true
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm qrencode >/dev/null 2>&1 || true
+        fi
+    fi
+    if command -v qrencode >/dev/null 2>&1; then
+        echo -e "${yellow}   [二维码 / QR Code (扫码导入)]${re}"
+        qrencode -t ANSIUTF8 "${text}" 2>/dev/null || qrencode -t UTF8 "${text}" 2>/dev/null || true
+    fi
+}
+
 # 架构探测
 detect_arch() {
     case "$(uname -m)" in
@@ -92,16 +115,16 @@ detect_arch() {
 ensure_alpine_compatibility() {
     if command -v apk >/dev/null 2>&1; then
         local need_apk=0
-        for _pkg in bash grep procps util-linux gcompat libc6-compat ca-certificates curl jq tar; do
+        for _pkg in bash grep procps util-linux gcompat libc6-compat ca-certificates curl jq tar qrencode; do
             if ! apk info -e "$_pkg" >/dev/null 2>&1; then
                 need_apk=1
                 break
             fi
         done
         if [[ $need_apk -eq 1 ]]; then
-            yellow "[*] 检测到 Alpine Linux 环境，正在自动补全基础依赖与 glibc 兼容层 (gcompat, libc6-compat)..."
+            yellow "[*] 检测到 Alpine Linux 环境，正在自动补全基础依赖与 glibc 兼容层 (gcompat, libc6-compat, qrencode)..."
             apk update >/dev/null 2>&1 || true
-            apk add --no-cache bash grep procps util-linux gcompat libc6-compat ca-certificates curl jq tar wget >/dev/null 2>&1 || true
+            apk add --no-cache bash grep procps util-linux gcompat libc6-compat ca-certificates curl jq tar wget qrencode >/dev/null 2>&1 || true
         fi
         
         # 确保 /lib64 ld-linux 兼容链接存在
@@ -251,7 +274,7 @@ install_system_dependencies() {
     export DEBIAN_FRONTEND=noninteractive
 
     local need_install=0
-    for cmd in curl wget jq openssl tar git net-tools unzip; do
+    for cmd in curl wget jq openssl tar git net-tools unzip qrencode; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             need_install=1
             break
@@ -259,24 +282,24 @@ install_system_dependencies() {
     done
 
     if [[ $need_install -eq 1 ]]; then
-        yellow "[*] 正在安装系统基础依赖 (curl, wget, jq, openssl, git, net-tools, unzip, ca-certificates)..."
+        yellow "[*] 正在安装系统基础依赖 (curl, wget, jq, openssl, git, net-tools, unzip, ca-certificates, qrencode)..."
         if command -v apt-get >/dev/null 2>&1; then
             echo -e "${blue}--> 正在更新 APT 软件包列表...${re}"
             apt-get update -y || yellow "[!] APT 源更新存在部分失败，尝试继续安装依赖..."
             echo -e "${blue}--> 正在安装基础依赖软件包...${re}"
-            apt-get install -y --no-install-recommends curl wget tar jq openssl git net-tools unzip cron ca-certificates
+            apt-get install -y --no-install-recommends curl wget tar jq openssl git net-tools unzip cron ca-certificates qrencode
         elif command -v yum >/dev/null 2>&1; then
             echo -e "${blue}--> 正在安装 YUM 基础依赖包...${re}"
-            yum install -y curl wget tar jq openssl git net-tools unzip cronie ca-certificates
+            yum install -y curl wget tar jq openssl git net-tools unzip cronie ca-certificates epel-release qrencode
         elif command -v apk >/dev/null 2>&1; then
             echo -e "${blue}--> 正在更新 APK 软件源并安装依赖...${re}"
             apk update
             # Alpine 使用 musl libc，需要 gcompat 提供 glibc 兼容层以运行预编译二进制
             apk add curl wget tar jq openssl git net-tools unzip ca-certificates \
-                     bash grep procps util-linux gcompat libc6-compat
+                     bash grep procps util-linux gcompat libc6-compat qrencode
         elif command -v pacman >/dev/null 2>&1; then
             echo -e "${blue}--> 正在安装 Pacman 基础依赖包...${re}"
-            pacman -Sy --noconfirm curl wget tar jq openssl net-tools unzip cronie ca-certificates
+            pacman -Sy --noconfirm curl wget tar jq openssl net-tools unzip cronie ca-certificates qrencode
         fi
         green "[+] 系统依赖包安装完成"
     else
@@ -2691,18 +2714,25 @@ generate_proxy_group_links() {
         local hy2_link="hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&allowInsecure=1&sni=www.bing.com#${remark}-Hy2"
         green "1. Hysteria2 节点链接:"
         echo "   $hy2_link"
+        show_qr "$hy2_link"
+        echo
     fi
     if [[ "$tuic_p" -gt 0 ]]; then
         local tuic_link="tuic://${uuid}:${uuid}@${ip}:${tuic_p}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#${remark}-TUIC"
         green "2. TUIC v5 节点链接:"
         echo "   $tuic_link"
+        show_qr "$tuic_link"
+        echo
     fi
     if [[ "$vless_p" -gt 0 ]]; then
         local pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.public_key != null) | .tls.reality.public_key' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
+        local sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.short_id != null) | .tls.reality.short_id[0] // empty' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
         local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
-        local vless_link="vless://${uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=#${remark}-Reality"
+        local vless_link="vless://${uuid}@${ip}:${vless_p}?type=tcp&encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#${remark}-Reality"
         green "3. VLESS-Reality 节点链接:"
         echo "   $vless_link"
+        show_qr "$vless_link"
+        echo
     fi
     blue "============================================================"
 }
@@ -3321,18 +3351,25 @@ generate_psiphon_instance_links() {
         local hy2_link="hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&sni=www.bing.com#Psi-${cc}-Hy2"
         green "1. Hysteria2 节点链接:"
         echo "   $hy2_link"
+        show_qr "$hy2_link"
+        echo
     fi
     if [[ "$tuic_p" -gt 0 ]]; then
         local tuic_link="tuic://${uuid}:${uuid}@${ip}:${tuic_p}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#Psi-${cc}-TUIC"
         green "2. TUIC v5 节点链接:"
         echo "   $tuic_link"
+        show_qr "$tuic_link"
+        echo
     fi
     if [[ "$vless_p" -gt 0 ]]; then
         local pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.public_key != null) | .tls.reality.public_key' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
+        local sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.short_id != null) | .tls.reality.short_id[0] // empty' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
         local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
-        local vless_link="vless://${uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=#Psi-${cc}-Reality"
+        local vless_link="vless://${uuid}@${ip}:${vless_p}?type=tcp&encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#Psi-${cc}-Reality"
         green "3. VLESS-Reality 节点链接:"
         echo "   $vless_link"
+        show_qr "$vless_link"
+        echo
     fi
     purple "============================================================"
 }
@@ -3872,12 +3909,48 @@ show_links() {
     local tuic_p=$(jq -r '.inbounds[]? | select(.tag=="tuic-in" or .tag=="tuic-in-1") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
     local anytls_p=$(jq -r '.inbounds[]? | select(.tag=="anytls-in") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
 
-    [[ -n "$vless_p" ]] && echo "1. VLESS-Reality: vless://${uuid}@${ip}:${vless_p}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#SB-VLESS-Reality"
-    [[ -n "$vmess_p" ]] && echo "2. VMess-WS: $(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess\",\"add\":\"${ip}\",\"port\":\"${vmess_p}\",\"id\":\"${uuid}\",\"net\":\"ws\",\"path\":\"${vmess_path}\"}")"
-    [[ -n "$trojan_p" ]] && echo "3. Trojan-WS-TLS: trojan://${uuid}@${ip}:${trojan_p}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=$(url_encode "${trojan_path}")#SB-Trojan-TLS"
-    [[ -n "$hy2_p" ]] && echo "4. Hysteria2: hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&sni=www.bing.com#SB-Hysteria2"
-    [[ -n "$tuic_p" ]] && echo "5. TUIC v5: tuic://${uuid}:${uuid}@${ip}:${tuic_p}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5"
-    [[ -n "$anytls_p" ]] && echo "6. AnyTLS: anytls://${uuid}@${ip}:${anytls_p}?security=tls&sni=www.bing.com&allowInsecure=1#SB-AnyTLS"
+    if [[ -n "$vless_p" ]]; then
+        local vless_link="vless://${uuid}@${ip}:${vless_p}?type=tcp&encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#SB-VLESS-Reality"
+        green "1. VLESS-Reality 节点链接:"
+        echo "   $vless_link"
+        show_qr "$vless_link"
+        echo
+    fi
+    if [[ -n "$vmess_p" ]]; then
+        local vmess_link="$(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess\",\"add\":\"${ip}\",\"port\":\"${vmess_p}\",\"id\":\"${uuid}\",\"net\":\"ws\",\"path\":\"${vmess_path}\"}")"
+        green "2. VMess-WS 节点链接:"
+        echo "   $vmess_link"
+        show_qr "$vmess_link"
+        echo
+    fi
+    if [[ -n "$trojan_p" ]]; then
+        local trojan_link="trojan://${uuid}@${ip}:${trojan_p}?security=tls&sni=www.bing.com&allowInsecure=1&type=ws&path=$(url_encode "${trojan_path}")#SB-Trojan-TLS"
+        green "3. Trojan-WS-TLS 节点链接:"
+        echo "   $trojan_link"
+        show_qr "$trojan_link"
+        echo
+    fi
+    if [[ -n "$hy2_p" ]]; then
+        local hy2_link="hysteria2://${uuid}@${ip}:${hy2_p}?insecure=1&sni=www.bing.com#SB-Hysteria2"
+        green "4. Hysteria2 节点链接:"
+        echo "   $hy2_link"
+        show_qr "$hy2_link"
+        echo
+    fi
+    if [[ -n "$tuic_p" ]]; then
+        local tuic_link="tuic://${uuid}:${uuid}@${ip}:${tuic_p}?alpn=h3&congestion_control=bbr&udp_relay=1&allow_insecure=1#SB-TUIC-v5"
+        green "5. TUIC v5 节点链接:"
+        echo "   $tuic_link"
+        show_qr "$tuic_link"
+        echo
+    fi
+    if [[ -n "$anytls_p" ]]; then
+        local anytls_link="anytls://${uuid}@${ip}:${anytls_p}?security=tls&sni=www.bing.com&allowInsecure=1#SB-AnyTLS"
+        green "6. AnyTLS 节点链接:"
+        echo "   $anytls_link"
+        show_qr "$anytls_link"
+        echo
+    fi
 
     # 检查 Argo
     local argo_d=""
@@ -3890,8 +3963,17 @@ show_links() {
         echo
         purple "--- Argo 隧道穿透节点 ---"
         echo "Argo 域名: $argo_d"
-        echo "Argo VMess (80): $(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess-Argo-80\",\"add\":\"${argo_d}\",\"port\":\"80\",\"id\":\"${uuid}\",\"net\":\"ws\",\"host\":\"${argo_d}\",\"path\":\"${vmess_path}\"}")"
-        echo "Argo VMess (443/TLS): $(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess-Argo-443\",\"add\":\"${argo_d}\",\"port\":\"443\",\"id\":\"${uuid}\",\"net\":\"ws\",\"tls\":\"tls\",\"sni\":\"${argo_d}\",\"host\":\"${argo_d}\",\"path\":\"${vmess_path}\"}")"
+        echo
+        local argo_80_link="$(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess-Argo-80\",\"add\":\"${argo_d}\",\"port\":\"80\",\"id\":\"${uuid}\",\"net\":\"ws\",\"host\":\"${argo_d}\",\"path\":\"${vmess_path}\"}")"
+        green "Argo VMess (80) 节点链接:"
+        echo "   $argo_80_link"
+        show_qr "$argo_80_link"
+        echo
+        local argo_443_link="$(make_vmess_link "{\"v\":\"2\",\"ps\":\"SB-VMess-Argo-443\",\"add\":\"${argo_d}\",\"port\":\"443\",\"id\":\"${uuid}\",\"net\":\"ws\",\"tls\":\"tls\",\"sni\":\"${argo_d}\",\"host\":\"${argo_d}\",\"path\":\"${vmess_path}\"}")"
+        green "Argo VMess (443/TLS) 节点链接:"
+        echo "   $argo_443_link"
+        show_qr "$argo_443_link"
+        echo
     fi
     green "=================================================="
 }
