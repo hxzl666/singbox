@@ -2169,12 +2169,12 @@ configure_main_node_protocols() {
 
     local cfg="$WORKDIR/sb.json"
     local cur_vless cur_vmess cur_trojan cur_hy2 cur_tuic cur_anytls
-    cur_vless=$(jq -r '.inbounds[]? | select(.tag=="vless-in" or .tag=="vless-reality-in") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-    cur_vmess=$(jq -r '.inbounds[]? | select(.tag=="vmess-in" or .tag=="vmess-ws-in") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-    cur_trojan=$(jq -r '.inbounds[]? | select(.tag=="trojan-tls-in" or .tag=="trojan-ws-in" or .tag=="trojan-in") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-    cur_hy2=$(jq -r '.inbounds[]? | select(.tag=="hy2-in" or .tag=="hysteria2-in") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-    cur_tuic=$(jq -r '.inbounds[]? | select(.tag=="tuic-in" or .tag=="tuic-in-1") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-    cur_anytls=$(jq -r '.inbounds[]? | select(.tag=="anytls-in") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    cur_vless=$(jq -r '.inbounds[]? | select(.type=="vless" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    cur_vmess=$(jq -r '.inbounds[]? | select(.type=="vmess" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    cur_trojan=$(jq -r '.inbounds[]? | select(.type=="trojan" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    cur_hy2=$(jq -r '.inbounds[]? | select((.type=="hysteria2" or .type=="hy2") and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    cur_tuic=$(jq -r '.inbounds[]? | select(.type=="tuic" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    cur_anytls=$(jq -r '.inbounds[]? | select(.type=="anytls" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
 
     purple "当前主节点已开启协议与端口:"
     [[ -n "$cur_vless" ]] && green "  [✓] VLESS-Reality   : 端口 ${cur_vless}" || yellow "  [✗] VLESS-Reality   : 未开启"
@@ -3929,17 +3929,17 @@ show_links() {
     echo "UUID / Password: $uuid"
     echo
 
-    # 兼容历史各种主入站 tag 命名
-    local vless_p=$(jq -r '.inbounds[]? | select(.tag=="vless-in" or .tag=="vless-reality-in") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-    local vmess_p=$(jq -r '.inbounds[]? | select(.tag=="vmess-in" or .tag=="vmess-ws-in") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-    local vmess_path=$(jq -r '.inbounds[]? | select(.tag=="vmess-in" or .tag=="vmess-ws-in") | .transport.path // empty' "$cfg" 2>/dev/null | head -n1)
+    # 通用兼容匹配主入站协议与端口 (排除 proxy/psi/custom 等副节点及回环)
+    local vless_p=$(jq -r '.inbounds[]? | select(.type=="vless" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    local vmess_p=$(jq -r '.inbounds[]? | select(.type=="vmess" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    local vmess_path=$(jq -r '.inbounds[]? | select(.type=="vmess" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .transport.path // empty' "$cfg" 2>/dev/null | head -n1)
     [[ -z "$vmess_path" ]] && vmess_path="/${uuid}-vm"
-    local trojan_p=$(jq -r '.inbounds[]? | select(.tag=="trojan-tls-in" or .tag=="trojan-ws-in" or .tag=="trojan-in") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-    local trojan_path=$(jq -r '.inbounds[]? | select(.tag=="trojan-tls-in" or .tag=="trojan-ws-in" or .tag=="trojan-in") | .transport.path // empty' "$cfg" 2>/dev/null | head -n1)
+    local trojan_p=$(jq -r '.inbounds[]? | select(.type=="trojan" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    local trojan_path=$(jq -r '.inbounds[]? | select(.type=="trojan" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .transport.path // empty' "$cfg" 2>/dev/null | head -n1)
     [[ -z "$trojan_path" ]] && trojan_path="/${uuid}-tr"
-    local hy2_p=$(jq -r '.inbounds[]? | select(.tag=="hy2-in" or .tag=="hysteria2-in") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-    local tuic_p=$(jq -r '.inbounds[]? | select(.tag=="tuic-in" or .tag=="tuic-in-1") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
-    local anytls_p=$(jq -r '.inbounds[]? | select(.tag=="anytls-in") | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    local hy2_p=$(jq -r '.inbounds[]? | select((.type=="hysteria2" or .type=="hy2") and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    local tuic_p=$(jq -r '.inbounds[]? | select(.type=="tuic" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
+    local anytls_p=$(jq -r '.inbounds[]? | select(.type=="anytls" and ((.tag // "") | (contains("proxy") or contains("psi") or contains("custom")) | not)) | .listen_port // empty' "$cfg" 2>/dev/null | head -n1)
 
     if [[ -n "$vless_p" ]]; then
         local vless_link="vless://${uuid}@${ip}:${vless_p}?type=tcp&encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#SB-VLESS-Reality"
