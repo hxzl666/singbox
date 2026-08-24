@@ -100,6 +100,38 @@ show_qr() {
     fi
 }
 
+# 获取 Reality 公钥 (若丢失则自动重新生成密钥对并同步更新配置文件与服务端)
+get_reality_pbk() {
+    local pbk=""
+    if [[ -f "$WORKDIR/public_key.txt" && -s "$WORKDIR/public_key.txt" ]]; then
+        pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null | tr -d '\r\n')
+    fi
+    if [[ -z "$pbk" && -x "$WORKDIR/sing-box" ]]; then
+        local kp=$("$WORKDIR/sing-box" generate reality-keypair 2>/dev/null)
+        local new_pvk=$(echo "$kp" | awk '/PrivateKey:/{print $2}' | tr -d '\r\n')
+        local new_pbk=$(echo "$kp" | awk '/PublicKey:/{print $2}' | tr -d '\r\n')
+        if [[ -n "$new_pbk" && -n "$new_pvk" ]]; then
+            pbk="$new_pbk"
+            echo "$new_pbk" > "$WORKDIR/public_key.txt"
+            echo "$new_pvk" > "$WORKDIR/private_key.txt"
+            if [[ -f "$WORKDIR/sb.json" ]] && command jq -e '.inbounds' "$WORKDIR/sb.json" >/dev/null 2>&1; then
+                local tmp_json=$(command jq --arg pvk "$new_pvk" '
+                  .inbounds |= map(
+                    if .tls?.reality? != null then
+                      .tls.reality.private_key = $pvk
+                    else . end
+                  )
+                ' "$WORKDIR/sb.json" 2>/dev/null)
+                if [[ -n "$tmp_json" ]]; then
+                    echo "$tmp_json" > "$WORKDIR/sb.json"
+                    service_restart sing-box >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+    fi
+    echo "$pbk"
+}
+
 # 架构探测
 detect_arch() {
     case "$(uname -m)" in
@@ -2725,7 +2757,7 @@ generate_proxy_group_links() {
         echo
     fi
     if [[ "$vless_p" -gt 0 ]]; then
-        local pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.public_key != null) | .tls.reality.public_key' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
+        local pbk=$(get_reality_pbk)
         local sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.short_id != null) | .tls.reality.short_id[0] // empty' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
         local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
         local vless_link="vless://${uuid}@${ip}:${vless_p}?type=tcp&encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#${remark}-Reality"
@@ -3362,7 +3394,7 @@ generate_psiphon_instance_links() {
         echo
     fi
     if [[ "$vless_p" -gt 0 ]]; then
-        local pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.public_key != null) | .tls.reality.public_key' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
+        local pbk=$(get_reality_pbk)
         local sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.short_id != null) | .tls.reality.short_id[0] // empty' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
         local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
         local vless_link="vless://${uuid}@${ip}:${vless_p}?type=tcp&encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#Psi-${cc}-Reality"
@@ -3886,7 +3918,7 @@ show_links() {
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
     [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$cfg" 2>/dev/null | head -n1)
     ip="${ALL_IPS[0]:-202.73.4.182}"
-    pbk=$(cat "$WORKDIR/public_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.public_key != null) | .tls.reality.public_key' "$cfg" 2>/dev/null | head -n1)
+    pbk=$(get_reality_pbk)
     sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.short_id != null) | .tls.reality.short_id[0] // empty' "$cfg" 2>/dev/null | head -n1)
     reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.handshake.server != null) | .tls.reality.handshake.server' "$cfg" 2>/dev/null | head -n1)
     [[ -z "$reym" ]] && reym="apple.com"
