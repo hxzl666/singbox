@@ -89,7 +89,9 @@ show_qr() {
         elif command -v dnf >/dev/null 2>&1; then
             dnf install -y qrencode >/dev/null 2>&1 || true
         elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache qrencode >/dev/null 2>&1 || true
+            [[ -f /etc/apk/repositories ]] && sed -i 's/^#\(.*\/community\)/\1/' /etc/apk/repositories 2>/dev/null || true
+            apk update >/dev/null 2>&1 || true
+            apk add --no-cache libqrencode-tools libqrencode qrencode >/dev/null 2>&1 || true
         elif command -v pacman >/dev/null 2>&1; then
             pacman -Sy --noconfirm qrencode >/dev/null 2>&1 || true
         fi
@@ -146,17 +148,21 @@ detect_arch() {
 # Alpine Linux 兼容性保障与依赖自愈
 ensure_alpine_compatibility() {
     if command -v apk >/dev/null 2>&1; then
+        # 确保启用 community 软件源
+        if [[ -f /etc/apk/repositories ]]; then
+            sed -i 's/^#\(.*\/community\)/\1/' /etc/apk/repositories 2>/dev/null || true
+        fi
         local need_apk=0
-        for _pkg in bash grep procps util-linux gcompat libc6-compat ca-certificates curl jq tar qrencode; do
-            if ! apk info -e "$_pkg" >/dev/null 2>&1; then
+        for _pkg in bash grep procps util-linux gcompat libc6-compat ca-certificates curl jq tar libqrencode-tools; do
+            if ! apk info -e "$_pkg" >/dev/null 2>&1 && ! command -v qrencode >/dev/null 2>&1; then
                 need_apk=1
                 break
             fi
         done
         if [[ $need_apk -eq 1 ]]; then
-            yellow "[*] 检测到 Alpine Linux 环境，正在自动补全基础依赖与 glibc 兼容层 (gcompat, libc6-compat, qrencode)..."
+            yellow "[*] 检测到 Alpine Linux 环境，正在自动补全基础依赖与 glibc 兼容层 (gcompat, libc6-compat, libqrencode-tools)..."
             apk update >/dev/null 2>&1 || true
-            apk add --no-cache bash grep procps util-linux gcompat libc6-compat ca-certificates curl jq tar wget qrencode >/dev/null 2>&1 || true
+            apk add --no-cache bash grep procps util-linux gcompat libc6-compat ca-certificates curl jq tar wget libqrencode-tools libqrencode qrencode >/dev/null 2>&1 || true
         fi
         
         # 确保 /lib64 ld-linux 兼容链接存在
@@ -325,10 +331,11 @@ install_system_dependencies() {
             yum install -y curl wget tar jq openssl git net-tools unzip cronie ca-certificates epel-release qrencode
         elif command -v apk >/dev/null 2>&1; then
             echo -e "${blue}--> 正在更新 APK 软件源并安装依赖...${re}"
+            [[ -f /etc/apk/repositories ]] && sed -i 's/^#\(.*\/community\)/\1/' /etc/apk/repositories 2>/dev/null || true
             apk update
             # Alpine 使用 musl libc，需要 gcompat 提供 glibc 兼容层以运行预编译二进制
             apk add curl wget tar jq openssl git net-tools unzip ca-certificates \
-                     bash grep procps util-linux gcompat libc6-compat qrencode
+                     bash grep procps util-linux gcompat libc6-compat libqrencode-tools libqrencode
         elif command -v pacman >/dev/null 2>&1; then
             echo -e "${blue}--> 正在安装 Pacman 基础依赖包...${re}"
             pacman -Sy --noconfirm curl wget tar jq openssl net-tools unzip cronie ca-certificates qrencode
