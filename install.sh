@@ -3283,15 +3283,30 @@ psiphon_custom_test() {
 
 psiphon_view_log() {
     echo
-    green "========== Psiphon 运行日志 (最近 30 行) =========="
-    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC && systemctl is-active psiphon-main >/dev/null 2>&1; then
-        journalctl -u psiphon-main -n 30 --no-pager 2>/dev/null
-    elif [[ -f "$WORKDIR/psiphon.log" && -s "$WORKDIR/psiphon.log" ]]; then
-        tail -n 30 "$WORKDIR/psiphon.log"
+    echo "  1. 实时跟踪 Psiphon 日志 (-f, 按 Ctrl+C 退出)"
+    echo "  2. 查看最近 50 行 Psiphon 日志"
+    reading "请选择 [1-2, 默认2]: " p_choice
+    echo
+    if [[ "$p_choice" == "1" ]]; then
+        green "========== Psiphon 实时动态日志 (按 Ctrl+C 退出) =========="
+        if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC && systemctl is-active psiphon-main >/dev/null 2>&1; then
+            journalctl -u psiphon-main -n 50 -f
+        elif [[ -f "$WORKDIR/psiphon.log" ]]; then
+            tail -n 50 -f "$WORKDIR/psiphon.log"
+        else
+            yellow "暂未读取到日志或日志为空"
+        fi
     else
-        yellow "暂未读取到日志或日志为空"
+        green "========== Psiphon 运行日志 (最近 50 行) =========="
+        if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC && systemctl is-active psiphon-main >/dev/null 2>&1; then
+            journalctl -u psiphon-main -n 50 --no-pager 2>/dev/null
+        elif [[ -f "$WORKDIR/psiphon.log" && -s "$WORKDIR/psiphon.log" ]]; then
+            tail -n 50 "$WORKDIR/psiphon.log"
+        else
+            yellow "暂未读取到日志或日志为空"
+        fi
+        echo "==================================================="
     fi
-    echo "==================================================="
 }
 
 psiphon_restart() {
@@ -3704,10 +3719,25 @@ configure_psiphon_instance_egress_menu() {
                 ;;
             4)
                 echo
-                if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
-                    journalctl -u "psiphon-instance@${target_cc}" -n 50 --no-pager
+                echo "  1. 实时跟踪 [$target_cc - $cname] 日志 (-f, 按 Ctrl+C 退出)"
+                echo "  2. 查看最近 50 行 [$target_cc - $cname] 日志"
+                reading "请选择 [1-2, 默认2]: " pinst_choice
+                echo
+                if [[ "$pinst_choice" == "1" ]]; then
+                    green "========== 赛风副节点 [$target_cc] 实时日志 (按 Ctrl+C 退出) =========="
+                    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+                        journalctl -u "psiphon-instance@${target_cc}" -n 50 -f
+                    else
+                        tail -n 50 -f "$idir/psiphon.log" 2>/dev/null || yellow "暂无日志"
+                    fi
                 else
-                    tail -n 50 "$idir/psiphon.log" 2>/dev/null || yellow "暂无日志"
+                    green "========== 赛风副节点 [$target_cc] 日志 (最近 50 行) =========="
+                    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+                        journalctl -u "psiphon-instance@${target_cc}" -n 50 --no-pager
+                    else
+                        tail -n 50 "$idir/psiphon.log" 2>/dev/null || yellow "暂无日志"
+                    fi
+                    echo "============================================================"
                 fi
                 echo
                 reading "按回车继续..." _
@@ -4137,38 +4167,157 @@ view_logs_menu() {
         green "  查看系统与服务运行日志"
         green "============================================================"
         echo
-        echo "  1. 查看 Sing-box 日志"
-        echo "  2. 查看 Argo 隧道日志"
-        echo "  3. 查看 Psiphon 赛风日志"
-        echo "  4. 查看自愈守护日志"
+        echo "  1. 查看 Sing-box 实时动态日志 (流式跟踪 -f, 按 Ctrl+C 退出)"
+        echo "  2. 查看 Sing-box 最近运行日志 (最近 50 行)"
+        echo "  3. 查看 Argo 隧道实时 / 最近日志"
+        echo "  4. 查看 Psiphon 赛风主服务实时 / 最近日志"
+        echo "  5. 查看 Psiphon 赛风副节点各出口组日志"
+        echo "  6. 查看自愈守护任务监控日志"
+        echo "  7. 清理历史陈旧静态日志文件"
         echo "------------------------------------------------------------"
         red  "  0. 返回主菜单"
         echo "============================================================"
-        reading "请选择 [0-4]: " choice
+        reading "请选择 [0-7]: " choice
         case "$choice" in
             1)
                 echo
-                green "========== Sing-box 运行日志 =========="
-                tail -n 30 /var/log/sing-box.log 2>/dev/null || journalctl -u sing-box -n 30 --no-pager 2>/dev/null || yellow "日志为空"
-                echo "======================================="
+                green "========== Sing-box 实时动态日志 (按 Ctrl+C 退出) =========="
+                if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+                    journalctl -u sing-box -n 50 -f
+                elif [[ -f /var/log/sing-box.log ]]; then
+                    tail -n 50 -f /var/log/sing-box.log
+                else
+                    yellow "未找到可用的 Sing-box 实时日志源"
+                fi
                 ;;
             2)
                 echo
-                green "========== Argo 隧道日志 =========="
-                tail -n 30 /var/log/argo-tunnel.log 2>/dev/null || journalctl -u argo-tunnel -n 30 --no-pager 2>/dev/null || yellow "日志为空"
-                echo "==================================="
+                green "========== Sing-box 最近运行日志 (最近 50 行) =========="
+                if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+                    journalctl -u sing-box -n 50 --no-pager 2>/dev/null || yellow "日志为空"
+                elif [[ -f /var/log/sing-box.log ]]; then
+                    tail -n 50 /var/log/sing-box.log 2>/dev/null || yellow "日志为空"
+                else
+                    yellow "未找到可用的 Sing-box 日志源"
+                fi
+                echo "========================================================"
                 ;;
             3)
                 echo
-                green "========== Psiphon 赛风日志 =========="
-                tail -n 30 "$WORKDIR/psiphon.log" 2>/dev/null || yellow "日志为空"
-                echo "======================================"
+                echo "  1. 实时跟踪 Argo 日志 (-f, 按 Ctrl+C 退出)"
+                echo "  2. 查看最近 50 行 Argo 日志"
+                reading "请选择 [1-2, 默认2]: " argo_log_choice
+                echo
+                if [[ "$argo_log_choice" == "1" ]]; then
+                    green "========== Argo 隧道实时日志 (按 Ctrl+C 退出) =========="
+                    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC && systemctl is-active argo-tunnel >/dev/null 2>&1; then
+                        journalctl -u argo-tunnel -n 50 -f
+                    elif [[ -f /var/log/argo-tunnel.log ]]; then
+                        tail -n 50 -f /var/log/argo-tunnel.log
+                    else
+                        yellow "暂未读取到 Argo 运行日志"
+                    fi
+                else
+                    green "========== Argo 隧道运行日志 (最近 50 行) =========="
+                    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC && systemctl is-active argo-tunnel >/dev/null 2>&1; then
+                        journalctl -u argo-tunnel -n 50 --no-pager 2>/dev/null
+                    elif [[ -f /var/log/argo-tunnel.log ]]; then
+                        tail -n 50 /var/log/argo-tunnel.log 2>/dev/null
+                    else
+                        yellow "暂未读取到 Argo 运行日志"
+                    fi
+                    echo "===================================================="
+                fi
                 ;;
             4)
                 echo
-                green "========== 自愈守护任务日志 =========="
-                tail -n 30 /etc/s-box/monitor.log 2>/dev/null || yellow "日志为空"
-                echo "======================================"
+                echo "  1. 实时跟踪 Psiphon 主服务日志 (-f, 按 Ctrl+C 退出)"
+                echo "  2. 查看最近 50 行 Psiphon 主服务日志"
+                reading "请选择 [1-2, 默认2]: " psi_log_choice
+                echo
+                if [[ "$psi_log_choice" == "1" ]]; then
+                    green "========== Psiphon 主服务实时日志 (按 Ctrl+C 退出) =========="
+                    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC && systemctl is-active psiphon-main >/dev/null 2>&1; then
+                        journalctl -u psiphon-main -n 50 -f
+                    elif [[ -f "$WORKDIR/psiphon.log" ]]; then
+                        tail -n 50 -f "$WORKDIR/psiphon.log"
+                    else
+                        yellow "暂未读取到 Psiphon 主服务日志"
+                    fi
+                else
+                    green "========== Psiphon 主服务运行日志 (最近 50 行) =========="
+                    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC && systemctl is-active psiphon-main >/dev/null 2>&1; then
+                        journalctl -u psiphon-main -n 50 --no-pager 2>/dev/null
+                    elif [[ -f "$WORKDIR/psiphon.log" && -s "$WORKDIR/psiphon.log" ]]; then
+                        tail -n 50 "$WORKDIR/psiphon.log" 2>/dev/null
+                    else
+                        yellow "暂未读取到 Psiphon 主服务日志"
+                    fi
+                    echo "=========================================================="
+                fi
+                ;;
+            5)
+                local psi_instances=()
+                mapfile -t psi_instances < <(get_all_psiphon_instances 2>/dev/null)
+                if [[ ${#psi_instances[@]} -eq 0 ]]; then
+                    yellow "当前未配置任何赛风副节点出口组"
+                else
+                    echo
+                    purple "当前已配置的赛风副节点出口组:"
+                    for ((i=0; i<${#psi_instances[@]}; i++)); do
+                        local picc="${psi_instances[$i]}"
+                        local picname=$(get_country_name "$picc")
+                        echo "  [$((i+1))] [$picc] $picname"
+                    done
+                    reading "请输入要查看日志的国家序号或代码 (如 1 或 JP): " inst_sel
+                    local target_pcc=""
+                    if [[ "$inst_sel" =~ ^[0-9]+$ ]] && (( inst_sel >= 1 && inst_sel <= ${#psi_instances[@]} )); then
+                        target_pcc="${psi_instances[$((inst_sel-1))]}"
+                    else
+                        inst_sel="${inst_sel^^}"
+                        for p in "${psi_instances[@]}"; do
+                            [[ "$p" == "$inst_sel" ]] && { target_pcc="$p"; break; }
+                        done
+                    fi
+                    if [[ -n "$target_pcc" ]]; then
+                        local target_pcname=$(get_country_name "$target_pcc")
+                        echo
+                        echo "  1. 实时跟踪 [$target_pcc - $target_pcname] 日志 (-f, 按 Ctrl+C 退出)"
+                        echo "  2. 查看最近 50 行 [$target_pcc - $target_pcname] 日志"
+                        reading "请选择 [1-2, 默认2]: " pinst_log_choice
+                        echo
+                        if [[ "$pinst_log_choice" == "1" ]]; then
+                            green "========== 赛风副节点 [$target_pcc] 实时日志 (按 Ctrl+C 退出) =========="
+                            if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+                                journalctl -u "psiphon-instance@${target_pcc}" -n 50 -f
+                            else
+                                tail -n 50 -f "${PSI_INSTANCES_DIR}/${target_pcc}/psiphon.log" 2>/dev/null || yellow "暂无日志"
+                            fi
+                        else
+                            green "========== 赛风副节点 [$target_pcc] 日志 (最近 50 行) =========="
+                            if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+                                journalctl -u "psiphon-instance@${target_pcc}" -n 50 --no-pager
+                            else
+                                tail -n 50 "${PSI_INSTANCES_DIR}/${target_pcc}/psiphon.log" 2>/dev/null || yellow "暂无日志"
+                            fi
+                            echo "========================================================="
+                        fi
+                    else
+                        red "未找到指定赛风出口组"
+                    fi
+                fi
+                ;;
+            6)
+                echo
+                green "========== 自愈守护任务日志 (最近 50 行) =========="
+                tail -n 50 /etc/s-box/monitor.log 2>/dev/null || yellow "日志为空"
+                echo "================================================"
+                ;;
+            7)
+                echo
+                yellow "[*] 正在清理历史陈旧静态日志文件..."
+                rm -f /var/log/sing-box.log /var/log/sing-box.err /var/log/argo-tunnel.log 2>/dev/null || true
+                green "[✓] 历史静态日志文件已清理完成！"
                 ;;
             0) return 0 ;;
             *) red "无效选项" ;;
