@@ -631,6 +631,280 @@ restart_psiphon_instance() {
     start_psiphon_instance "$cc"
 }
 
+# ==================== RealityChecker 域名检测与优选模块 ====================
+download_reality_checker() {
+    local arch=$(detect_arch)
+    local rc_arch=""
+    case "$arch" in
+        amd64|x86_64) rc_arch="amd64" ;;
+        arm64|aarch64) rc_arch="arm64" ;;
+        *) rc_arch="amd64" ;;
+    esac
+
+    mkdir -p "$WORKDIR"
+    ensure_alpine_compatibility
+
+    if [[ -x "$WORKDIR/reality-checker" ]] && "$WORKDIR/reality-checker" --help >/dev/null 2>&1; then
+        return 0
+    fi
+
+    yellow "[*] 正在下载 RealityChecker 目标网站检测组件 (Linux-${rc_arch})..."
+    local rc_ver="v2.2.3"
+    local rc_urls=(
+        "https://github.com/V2RaySSR/RealityChecker/releases/download/${rc_ver}/reality-checker-linux-${rc_arch}.zip"
+        "https://ghproxy.net/https://github.com/V2RaySSR/RealityChecker/releases/download/${rc_ver}/reality-checker-linux-${rc_arch}.zip"
+    )
+
+    # 确保存在 unzip 工具
+    if ! command -v unzip >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y >/dev/null 2>&1 && apt-get install -y --no-install-recommends unzip >/dev/null 2>&1 || true
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y unzip >/dev/null 2>&1 || true
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache unzip >/dev/null 2>&1 || true
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm unzip >/dev/null 2>&1 || true
+        fi
+    fi
+
+    local tmp_d="/tmp/rc_download_tmp"
+    rm -rf "$tmp_d" && mkdir -p "$tmp_d"
+
+    for url in "${rc_urls[@]}"; do
+        echo -e "${blue}--> 尝试下载源: ${url}${re}"
+        if curl -# -fSL --connect-timeout 10 --max-time 60 "$url" -o "$tmp_d/rc.zip" 2>/dev/null; then
+            if unzip -q -o "$tmp_d/rc.zip" -d "$tmp_d" 2>/dev/null; then
+                local bpath=$(find "$tmp_d" -type f -name "reality-checker*" ! -name "*.zip" | head -n 1)
+                if [[ -n "$bpath" ]]; then
+                    cp -f "$bpath" "$WORKDIR/reality-checker"
+                    chmod +x "$WORKDIR/reality-checker" 2>/dev/null
+                    break
+                fi
+            elif command -v python3 >/dev/null 2>&1; then
+                python3 -c "import zipfile; zipfile.ZipFile('$tmp_d/rc.zip').extractall('$tmp_d')" 2>/dev/null
+                local bpath=$(find "$tmp_d" -type f -name "reality-checker*" ! -name "*.zip" | head -n 1)
+                if [[ -n "$bpath" ]]; then
+                    cp -f "$bpath" "$WORKDIR/reality-checker"
+                    chmod +x "$WORKDIR/reality-checker" 2>/dev/null
+                    break
+                fi
+            fi
+        fi
+    done
+    rm -rf "$tmp_d"
+
+    if [[ -x "$WORKDIR/reality-checker" ]] && "$WORKDIR/reality-checker" --help >/dev/null 2>&1; then
+        green "[+] RealityChecker 检测组件就绪: $WORKDIR/reality-checker"
+        return 0
+    else
+        yellow "[!] RealityChecker 二进制下载或运行受限，系统将自动使用内置 TLS 探测器保底。"
+        return 1
+    fi
+}
+
+# 预设优质低延迟、小证书（<4KB）、支持 TLS 1.3 / H2 的候选 SNI 列表
+PRESET_REALITY_DOMAINS=(
+    "gateway.icloud.com"
+    "itunes.apple.com"
+    "swdist.apple.com"
+    "fpinit.itunes.apple.com"
+    "assets.adobedtm.com"
+    "d1.awsstatic.com"
+    "prod.us-east-1.ui.gcr-chat.marketing.aws.dev"
+    "visualstudio.microsoft.com"
+    "cdn77.api.userway.org"
+    "addons.mozilla.org"
+    "www.yahoo.com"
+    "speed.cloudflare.com"
+    "cdnjs.cloudflare.com"
+    "www.lovelive-anime.jp"
+)
+
+apply_reality_sni() {
+    local new_sni="$1"
+    if [[ -z "$new_sni" ]]; then
+        red "[!] 域名不能为空！"
+        return 1
+    fi
+    new_sni=$(echo "$new_sni" | sed -e 's|^https\?://||' -e 's|/.*$||' -e 's|:.*$||' | tr -d ' \t\r\n')
+    if [[ -z "$new_sni" ]]; then
+        red "[!] 无效的域名格式！"
+        return 1
+    fi
+
+    echo "$new_sni" > "$WORKDIR/reym.txt"
+    local cfg="$WORKDIR/sb.json"
+
+    if [[ -f "$cfg" ]] && command jq -e . "$cfg" >/dev/null 2>&1; then
+        local tmp_json
+        tmp_json=$(command jq --arg sni "$new_sni" '
+          if .inbounds != null then
+            .inbounds |= map(
+              if .tls?.reality? != null then
+                .tls.server_name = $sni |
+                .tls.reality.handshake.server = $sni
+              else . end
+            )
+          else . end
+        ' "$cfg" 2>/dev/null)
+
+        if [[ -n "$tmp_json" ]]; then
+            echo "$tmp_json" > "$cfg"
+        fi
+    fi
+
+    sync_all_secondary_nodes 2>/dev/null || true
+
+    if apply_changes; then
+        green "[✓] REALITY 伪装目标域名已成功更换为: ${new_sni}"
+        echo
+        show_links
+        return 0
+    else
+        red "[!] 配置应用失败，请检查服务状态！"
+        return 1
+    fi
+}
+
+reality_sni_menu() {
+    while true; do
+        [[ -t 1 ]] && clear 2>/dev/null || true
+        local cur_sni=$(cat "$WORKDIR/reym.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality != null) | .tls.reality.handshake.server' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
+        [[ -z "$cur_sni" || "$cur_sni" == "null" ]] && cur_sni="gateway.icloud.com"
+
+        echo
+        green "============================================================"
+        green "       REALITY 伪装域名 (SNI) 检测与智能更换管理           "
+        green "============================================================"
+        echo -e "  当前使用的伪装域名 : ${yellow}${cur_sni}${re}"
+        echo -e "  集成检测工具       : ${cyan}RealityChecker (TLS1.3/X25519/H2/CDN/证书)${re}"
+        echo "============================================================"
+        echo
+        echo -e "  1. ${green}【智能推荐】运行 RealityChecker 批量体检并优选域名${re} [推荐]"
+        echo -e "  2. ${cyan}【自定义检测】输入自定义域名 -> 深度检测 -> 确认更换${re}"
+        echo -e "  3. ${blue}【单项体检】检测当前正在使用的伪装域名质量${re}"
+        echo -e "  4. ${yellow}【快速恢复】重置为官方极简小证书域名 (gateway.icloud.com)${re}"
+        echo "------------------------------------------------------------"
+        echo -e "  0. 返回上级菜单"
+        echo "============================================================"
+        reading "请选择 [0-4]: " r_choice
+        echo
+
+        case "$r_choice" in
+            1)
+                download_reality_checker >/dev/null 2>&1 || true
+                echo -e "${yellow}[*] 正在调用 RealityChecker 对预选优质小证书域名进行并发全面检测...${re}"
+                echo
+                if [[ -x "$WORKDIR/reality-checker" ]]; then
+                    "$WORKDIR/reality-checker" batch "${PRESET_REALITY_DOMAINS[@]}"
+                    echo
+                fi
+                echo -e "${blue}--> 正在进行服务器本地 TLS 握手延迟测速...${re}"
+                echo "----------------------------------------------------------------------"
+                printf "%-4s %-44s %-14s %s\n" "编号" "目标域名 (SNI)" "TLS握手延迟" "状态/评级"
+                echo "----------------------------------------------------------------------"
+                local idx=1
+                local avail_domains=()
+                for d in "${PRESET_REALITY_DOMAINS[@]}"; do
+                    local t1 t2 cost status
+                    t1=$(date +%s%3N 2>/dev/null || date +%s)
+                    if timeout 2 openssl s_client -connect "${d}:443" -servername "$d" </dev/null &>/dev/null; then
+                        t2=$(date +%s%3N 2>/dev/null || date +%s)
+                        cost=$(( t2 - t1 ))
+                        status="${green}极佳 (推荐)${re}"
+                        printf "[%2d] %-42s %-12s ms %b\n" "$idx" "$d" "$cost" "$status"
+                        avail_domains+=("$d")
+                        idx=$(( idx + 1 ))
+                    else
+                        printf "[--] %-42s %-12s    %b\n" "$d" "超时/失败" "${red}不可用${re}"
+                    fi
+                done
+                echo "----------------------------------------------------------------------"
+                echo
+                if [[ ${#avail_domains[@]} -gt 0 ]]; then
+                    reading "请输入要切换的域名编号 [1-$((idx - 1)), 回车取消]: " pick_idx
+                    if [[ "$pick_idx" =~ ^[0-9]+$ && "$pick_idx" -ge 1 && "$pick_idx" -le ${#avail_domains[@]} ]]; then
+                        local chosen_domain="${avail_domains[$((pick_idx - 1))]}"
+                        apply_reality_sni "$chosen_domain"
+                    else
+                        yellow "已取消操作。"
+                    fi
+                else
+                    red "[!] 未发现可用的候选域名，请检查服务器 DNS 与网络！"
+                fi
+                echo
+                reading "按回车继续..." _
+                ;;
+            2)
+                reading "请输入要检测并应用的伪装目标域名 (如 swdist.apple.com): " custom_d
+                [[ -z "$custom_d" ]] && continue
+                custom_d=$(echo "$custom_d" | sed -e 's|^https\?://||' -e 's|/.*$||' -e 's|:.*$||' | tr -d ' \t\r\n')
+                [[ -z "$custom_d" ]] && { red "[!] 域名格式不正确！"; sleep 1; continue; }
+
+                download_reality_checker >/dev/null 2>&1 || true
+                echo
+                yellow "[*] 正在使用 RealityChecker 检测目标域名: ${custom_d} ..."
+                echo
+                if [[ -x "$WORKDIR/reality-checker" ]]; then
+                    "$WORKDIR/reality-checker" check "$custom_d"
+                    echo
+                fi
+
+                echo -e "${blue}--> 正在测试服务器到该域名的 TLS 握手延迟...${re}"
+                local t1 t2 cost
+                t1=$(date +%s%3N 2>/dev/null || date +%s)
+                if timeout 2 openssl s_client -connect "${custom_d}:443" -servername "$custom_d" </dev/null &>/dev/null; then
+                    t2=$(date +%s%3N 2>/dev/null || date +%s)
+                    cost=$(( t2 - t1 ))
+                    green "[✓] TLS 握手成功！延迟约为: ${cost} ms"
+                else
+                    red "[!] 警告：服务器无法在 2 秒内完成与 ${custom_d}:443 的 TLS 握手 (可能被墙、超时或阻断)！"
+                fi
+                echo
+                reading "是否确认将 REALITY 伪装域名切换为 [${custom_d}] ? (y/N): " confirm_c
+                if [[ "$confirm_c" =~ ^[Yy]$ ]]; then
+                    apply_reality_sni "$custom_d"
+                else
+                    yellow "已取消更换。"
+                fi
+                echo
+                reading "按回车继续..." _
+                ;;
+            3)
+                download_reality_checker >/dev/null 2>&1 || true
+                echo
+                yellow "[*] 正在对当前使用的伪装域名 [${cur_sni}] 进行全面体检..."
+                echo
+                if [[ -x "$WORKDIR/reality-checker" ]]; then
+                    "$WORKDIR/reality-checker" check "$cur_sni"
+                    echo
+                fi
+                echo -e "${blue}--> 正在测试当前服务器到 [${cur_sni}:443] 的连通性与握手延迟...${re}"
+                local t1 t2 cost
+                t1=$(date +%s%3N 2>/dev/null || date +%s)
+                if timeout 2 openssl s_client -connect "${cur_sni}:443" -servername "$cur_sni" </dev/null &>/dev/null; then
+                    t2=$(date +%s%3N 2>/dev/null || date +%s)
+                    cost=$(( t2 - t1 ))
+                    green "[✓] 握手正常！当前 VPS 到目标站延迟: ${cost} ms"
+                else
+                    red "[!] 异常：无法连接或握手超时！强烈建议立即更换伪装域名。"
+                fi
+                echo
+                reading "按回车继续..." _
+                ;;
+            4)
+                yellow "正在重置为官方稳定极简小证书域名 (gateway.icloud.com)..."
+                apply_reality_sni "gateway.icloud.com"
+                echo
+                reading "按回车继续..." _
+                ;;
+            0) return 0 ;;
+            *) red "无效选项" ;;
+        esac
+    done
+}
+
 # ==================== IP 与端口获取 ====================
 ALL_IPS=()
 get_all_ips() {
@@ -1579,7 +1853,7 @@ sync_proxy_group_to_singbox() {
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
     [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$cfg" 2>/dev/null | head -n1)
     reality_pvk=$(cat "$WORKDIR/private_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key' "$cfg" 2>/dev/null | head -n1)
-    reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
+    reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "gateway.icloud.com")
 
     local tmp_json
     tmp_json=$(mktemp)
@@ -1721,7 +1995,7 @@ sync_psiphon_instance_to_singbox() {
     uuid=$(cat "$WORKDIR/UUID.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.users[0].uuid != null) | .users[0].uuid' "$cfg" 2>/dev/null | head -n1)
     [[ -z "$uuid" ]] && uuid=$(jq -r '.inbounds[]? | select(.users[0].password != null) | .users[0].password' "$cfg" 2>/dev/null | head -n1)
     reality_pvk=$(cat "$WORKDIR/private_key.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.private_key != null) | .tls.reality.private_key' "$cfg" 2>/dev/null | head -n1)
-    reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
+    reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "gateway.icloud.com")
     local cc_lower=$(echo "$cc" | tr '[:upper:]' '[:lower:]')
     local out_tag="psiphon-${cc_lower}"
 
@@ -1909,15 +2183,15 @@ psiphon_instance_is_stuck() {
 
     local count=0
     if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
-        count=$(journalctl -u "psiphon-instance@${cc}" --since '15 min ago' --no-pager 2>/dev/null | grep -c "EstablishTunnelTimeout" 2>/dev/null || echo 0)
+        count=$(journalctl -u "psiphon-instance@${cc}" --since '15 min ago' --no-pager 2>/dev/null | grep -c "EstablishTunnelTimeout" 2>/dev/null)
     else
-        local log_f="$idir/psiphon.log"
-        if [[ -f "$log_f" ]]; then
-            count=$(tail -n 100 "$log_f" 2>/dev/null | grep -c "EstablishTunnelTimeout" 2>/dev/null || echo 0)
+        if [[ -f "$idir/psiphon.log" ]]; then
+            count=$(tail -n 100 "$idir/psiphon.log" 2>/dev/null | grep -c "EstablishTunnelTimeout" 2>/dev/null)
         fi
     fi
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
 
-    if [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -ge 2 ]]; then
+    if [[ "$count" -ge 2 ]]; then
         return 0
     fi
     return 1
@@ -1928,31 +2202,28 @@ self_heal_stuck_psiphon_instances() {
     mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
     local now_epoch
     now_epoch=$(date +%s)
-    local log_file="$WORKDIR/monitor.log"
-
     for cc in "${psi_insts[@]}"; do
         [[ -z "$cc" ]] && continue
-        local idir="${PSI_INSTANCES_DIR}/${cc}"
-        [[ -d "$idir" ]] || continue
-
-        local cooldown_file="$idir/.selfheal_cooldown"
+        local cc_upper="${cc^^}"
+        local idir="${PSI_INSTANCES_DIR}/${cc_upper}"
+        local cooldown_file="${idir}/.selfheal_cooldown"
+        local last_heal=0
         if [[ -f "$cooldown_file" ]]; then
-            local last_heal
             last_heal=$(cat "$cooldown_file" 2>/dev/null)
-            if [[ "$last_heal" =~ ^[0-9]+$ ]] && (( now_epoch - last_heal < 900 )); then
-                continue
-            fi
+            [[ "$last_heal" =~ ^[0-9]+$ ]] || last_heal=0
+        fi
+        if (( now_epoch - last_heal < 900 )); then
+            continue
         fi
 
-        if psiphon_instance_is_stuck "$cc"; then
-            local log_msg="$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Psiphon ${cc} 实例隧道卡死(EstablishTunnelTimeout)，正在清空缓存数据目录并重启"
-            echo "$log_msg" >> "$log_file"
-            yellow "[自愈守护] Psiphon ${cc} 实例隧道卡死(EstablishTunnelTimeout)，正在清空缓存数据目录并重启"
-            stop_psiphon_instance "$cc"
+        if psiphon_instance_is_stuck "$cc_upper"; then
+            local log_msg="$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Psiphon ${cc_upper} 实例隧道卡死(EstablishTunnelTimeout)，正在清空缓存数据目录并重启"
+            echo "$log_msg" >> "$WORKDIR/monitor.log"
+            yellow "$log_msg"
+            stop_psiphon_instance "$cc_upper"
             sleep 1
-            rm -rf "${idir}/data"
-            mkdir -p "${idir}/data"
-            start_psiphon_instance "$cc"
+            rm -rf "${idir}/data" && mkdir -p "${idir}/data"
+            start_psiphon_instance "$cc_upper"
             echo "$now_epoch" > "$cooldown_file"
         fi
     done
@@ -2253,10 +2524,11 @@ configure_main_node_protocols() {
     echo "  1. 一键启用全部协议"
     echo "  2. 自定义选择协议与端口"
     echo "  3. 重新生成 UUID 与密钥"
+    echo "  4. 更换 / 优选 REALITY 伪装域名 (SNI)"
     echo "------------------------------------------------------------"
     echo "  0. 返回主菜单"
     echo "============================================================"
-    reading "请选择 [0-3]: " p_choice
+    reading "请选择 [0-4]: " p_choice
 
     case "$p_choice" in
         1)
@@ -2330,6 +2602,9 @@ configure_main_node_protocols() {
             fi
             green "UUID 与 Reality 密钥对已刷新！请重新选择 1 或 2 应用配置。"
             ;;
+        4)
+            reality_sni_menu
+            ;;
         0) return 0 ;;
         *) red "无效选项" ;;
     esac
@@ -2353,7 +2628,7 @@ build_and_apply_main_inbounds() {
         echo "$reality_pvk" > "$WORKDIR/private_key.txt"
         echo "$pbk" > "$WORKDIR/public_key.txt"
     fi
-    reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
+    reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "gateway.icloud.com")
 
     if [[ ! -f "$WORKDIR/cert.pem" || ! -f "$WORKDIR/private.key" ]]; then
         openssl req -x509 -newkey rsa:2048 -nodes -sha256 -keyout "$WORKDIR/private.key" -out "$WORKDIR/cert.pem" -days 3650 -subj "/CN=www.bing.com" >/dev/null 2>&1
@@ -2823,7 +3098,7 @@ generate_proxy_group_links() {
     if [[ "$vless_p" -gt 0 ]]; then
         local pbk=$(get_reality_pbk)
         local sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.short_id != null) | .tls.reality.short_id[0] // empty' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
-        local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
+        local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "gateway.icloud.com")
         local vless_link="vless://${uuid}@${ip}:${vless_p}?type=tcp&encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#${remark}-Reality"
         green "3. VLESS-Reality 节点链接:"
         echo "   $vless_link"
@@ -3475,7 +3750,7 @@ generate_psiphon_instance_links() {
     if [[ "$vless_p" -gt 0 ]]; then
         local pbk=$(get_reality_pbk)
         local sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.short_id != null) | .tls.reality.short_id[0] // empty' "$WORKDIR/sb.json" 2>/dev/null | head -n1)
-        local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "apple.com")
+        local reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || echo "gateway.icloud.com")
         local vless_link="vless://${uuid}@${ip}:${vless_p}?type=tcp&encryption=none&flow=xtls-rprx-vision&security=reality&sni=${reym}&fp=chrome&pbk=${pbk}&sid=${sid}#Psi-${cc}-Reality"
         green "3. VLESS-Reality 节点链接:"
         echo "   $vless_link"
@@ -4015,7 +4290,7 @@ show_links() {
     pbk=$(get_reality_pbk)
     sid=$(cat "$WORKDIR/short_id.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.short_id != null) | .tls.reality.short_id[0] // empty' "$cfg" 2>/dev/null | head -n1)
     reym=$(cat "$WORKDIR/reym.txt" 2>/dev/null || jq -r '.inbounds[]? | select(.tls.reality.handshake.server != null) | .tls.reality.handshake.server' "$cfg" 2>/dev/null | head -n1)
-    [[ -z "$reym" ]] && reym="apple.com"
+    [[ -z "$reym" ]] && reym="gateway.icloud.com"
 
     green "=================================================="
     green "         Sing-box 主节点信息"
@@ -4911,42 +5186,44 @@ menu() {
         blue   "  【主节点管理】"
         echo "------------------------------------------------------------"
         green  "  1. 重新配置主节点协议"
-        green  "  2. 主节点出站管理"
-        green  "  3. 主节点 Argo 隧道管理"
-        green  "  4. 查看主节点信息与链接"
+        green  "  2. 更换 / 优选 REALITY 伪装域名 (SNI)"
+        green  "  3. 主节点出站管理"
+        green  "  4. 主节点 Argo 隧道管理"
+        green  "  5. 查看主节点信息与链接"
         echo "------------------------------------------------------------"
         purple "  【副节点管理】"
         echo "------------------------------------------------------------"
-        purple "  5. 赛风综合管理"
-        purple "  6. 自定义代理出站管理"
+        purple "  6. 赛风综合管理"
+        purple "  7. 自定义代理出站管理"
         echo "------------------------------------------------------------"
         white  "  【综合功能与系统运维】"
         echo "------------------------------------------------------------"
-        blue   "  7. 自定义节点组合推送"
-        blue   "  8. 查看全部节点信息总览"
-        green  "  9. 重启所有服务"
-        yellow " 10. 系统诊断与配置修复"
-        blue   " 11. 查看运行日志"
-        yellow " 12. 开启 / 关闭服务自愈守护"
-        cyan   " 13. TCP / BBR 网络深度调优"
-        red    " 14. 彻底卸载 Sing-box 环境"
+        blue   "  8. 自定义节点组合推送"
+        blue   "  9. 查看全部节点信息总览"
+        green  " 10. 重启所有服务"
+        yellow " 11. 系统诊断与配置修复"
+        blue   " 12. 查看运行日志"
+        yellow " 13. 开启 / 关闭服务自愈守护"
+        cyan   " 14. TCP / BBR 网络深度调优"
+        red    " 15. 彻底卸载 Sing-box 环境"
         echo "------------------------------------------------------------"
         red    "  0. 退出脚本"
         echo "============================================================"
 
-        reading "请选择 [0-14]: " choice
+        reading "请选择 [0-15]: " choice
         echo
 
         case "$choice" in
             1) configure_main_node_protocols ;;
-            2) configure_warp_outbound ;;
-            3) argo_management_menu ;;
-            4) show_links; echo; reading "按回车继续..." _ ;;
-            5) psiphon_management_menu ;;
-            6) proxy_egress_menu ;;
-            7) custom_push_nodes; echo; reading "按回车继续..." _ ;;
-            8) show_all_nodes_summary; echo; reading "按回车继续..." _ ;;
-            9)
+            2) reality_sni_menu ;;
+            3) configure_warp_outbound ;;
+            4) argo_management_menu ;;
+            5) show_links; echo; reading "按回车继续..." _ ;;
+            6) psiphon_management_menu ;;
+            7) proxy_egress_menu ;;
+            8) custom_push_nodes; echo; reading "按回车继续..." _ ;;
+            9) show_all_nodes_summary; echo; reading "按回车继续..." _ ;;
+            10)
                 yellow "正在重启所有服务..."
                 service_restart sing-box
                 [[ -f /etc/s-box/argo.conf ]] && service_restart argo-tunnel
@@ -4955,7 +5232,7 @@ menu() {
                 green "所有服务已重启并完成配置同步！"
                 reading "按回车继续..." _
                 ;;
-            10)
+            11)
                 yellow "正在诊断与修复配置..."
                 apply_main_node_outbound
                 sync_all_secondary_nodes
@@ -4963,8 +5240,8 @@ menu() {
                 green "诊断与修复完成！"
                 reading "按回车继续..." _
                 ;;
-            11) view_logs_menu ;;
-            12)
+            12) view_logs_menu ;;
+            13)
                 if crontab -l 2>/dev/null | grep -q "sb cron"; then
                     crontab -l | grep -v "sb cron" | crontab -
                     green "已关闭服务自愈守护任务。"
@@ -4975,8 +5252,8 @@ menu() {
                 fi
                 reading "按回车继续..." _
                 ;;
-            13) tcp_tune_menu ;;
-            14)
+            14) tcp_tune_menu ;;
+            15)
                 reading "确定彻底卸载 Sing-box 及所有组件? (y/N): " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
                     service_stop sing-box
@@ -5025,9 +5302,10 @@ install_singbox_main() {
     log_info "【步骤 2/5】下载并配置 Sing-box 核心程序..."
     download_singbox_core || { red "[!] Sing-box 核心下载失败，安装终止"; exit 1; }
 
-    log_info "【步骤 3/5】下载附加核心组件 (Cloudflared / Psiphon)..."
+    log_info "【步骤 3/5】下载附加核心组件 (Cloudflared / Psiphon / RealityChecker)..."
     download_cloudflared_core
     download_psiphon_core
+    download_reality_checker
 
     log_info "【步骤 4/5】初始化配置、证书与 Reality 密钥..."
     local UUID
@@ -5048,7 +5326,7 @@ install_singbox_main() {
             echo "$pbk" > "$WORKDIR/public_key.txt"
         fi
     fi
-    [[ ! -f "$WORKDIR/reym.txt" ]] && echo "apple.com" > "$WORKDIR/reym.txt"
+    [[ ! -f "$WORKDIR/reym.txt" ]] && echo "gateway.icloud.com" > "$WORKDIR/reym.txt"
     [[ ! -f "$WORKDIR/short_id.txt" ]] && echo "" > "$WORKDIR/short_id.txt"
 
     get_all_ips >/dev/null 2>&1
@@ -5237,6 +5515,10 @@ update_script_self() {
 case "$1" in
     cron)
         run_cron_check
+        exit 0
+        ;;
+    sni|reality|reym)
+        reality_sni_menu
         exit 0
         ;;
     show|links|info)
