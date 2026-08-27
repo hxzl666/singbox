@@ -1901,6 +1901,63 @@ ensure_all_psiphon_instances_running() {
     done
 }
 
+psiphon_instance_is_stuck() {
+    local cc="${1^^}"
+    local idir="${PSI_INSTANCES_DIR}/${cc}"
+    [[ -d "$idir" ]] || return 1
+    is_psiphon_instance_running "$cc" || return 1
+
+    local count=0
+    if command -v journalctl >/dev/null 2>&1 && ! $IS_DIRECT && ! $IS_OPENRC; then
+        count=$(journalctl -u "psiphon-instance@${cc}" --since '15 min ago' --no-pager 2>/dev/null | grep -c "EstablishTunnelTimeout" 2>/dev/null || echo 0)
+    else
+        local log_f="$idir/psiphon.log"
+        if [[ -f "$log_f" ]]; then
+            count=$(tail -n 100 "$log_f" 2>/dev/null | grep -c "EstablishTunnelTimeout" 2>/dev/null || echo 0)
+        fi
+    fi
+
+    if [[ "$count" =~ ^[0-9]+$ ]] && [[ "$count" -ge 2 ]]; then
+        return 0
+    fi
+    return 1
+}
+
+self_heal_stuck_psiphon_instances() {
+    local psi_insts
+    mapfile -t psi_insts < <(get_all_psiphon_instances 2>/dev/null)
+    local now_epoch
+    now_epoch=$(date +%s)
+    local log_file="$WORKDIR/monitor.log"
+
+    for cc in "${psi_insts[@]}"; do
+        [[ -z "$cc" ]] && continue
+        local idir="${PSI_INSTANCES_DIR}/${cc}"
+        [[ -d "$idir" ]] || continue
+
+        local cooldown_file="$idir/.selfheal_cooldown"
+        if [[ -f "$cooldown_file" ]]; then
+            local last_heal
+            last_heal=$(cat "$cooldown_file" 2>/dev/null)
+            if [[ "$last_heal" =~ ^[0-9]+$ ]] && (( now_epoch - last_heal < 900 )); then
+                continue
+            fi
+        fi
+
+        if psiphon_instance_is_stuck "$cc"; then
+            local log_msg="$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Psiphon ${cc} 实例隧道卡死(EstablishTunnelTimeout)，正在清空缓存数据目录并重启"
+            echo "$log_msg" >> "$log_file"
+            yellow "[自愈守护] Psiphon ${cc} 实例隧道卡死(EstablishTunnelTimeout)，正在清空缓存数据目录并重启"
+            stop_psiphon_instance "$cc"
+            sleep 1
+            rm -rf "${idir}/data"
+            mkdir -p "${idir}/data"
+            start_psiphon_instance "$cc"
+            echo "$now_epoch" > "$cooldown_file"
+        fi
+    done
+}
+
 # ==================== 副节点全面自动同步函数 ====================
 sync_all_secondary_nodes() {
     local cfg="$WORKDIR/sb.json"
@@ -4354,6 +4411,7 @@ run_cron_check() {
     fi
 
     ensure_all_psiphon_instances_running
+    self_heal_stuck_psiphon_instances
 }
 
 # ==================== 8. TCP / UDP / BBR 网络深度调优模块 ====================
