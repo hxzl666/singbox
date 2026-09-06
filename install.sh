@@ -3059,6 +3059,358 @@ add_proxy_egress_group() {
     fi
 }
 
+# 一键添加 OpenRung 中继节点 (自动抓取 broker 中继列表, 按国家分类建组, 自动换节点自愈)
+add_openrung_egress_group() {
+    init_proxy_groups_dir
+    echo
+    green "==== 一键添加 OpenRung 中继节点 (按国家分类) ===="
+    yellow "[*] 正在从 OpenRung Broker 获取最新中继列表..."
+    echo
+
+    local relays_json relays_count
+    relays_json=$(curl -s --max-time 15 -H "User-Agent: openrung/0.3.8" "https://broker.openrung.org/api/v1/relays?limit=20" 2>/dev/null)
+    if ! echo "$relays_json" | jq -e '.relays | type == "array"' >/dev/null 2>&1; then
+        red "[!] 获取 OpenRung 中继列表失败 (网络不通或服务不可用)"
+        return 1
+    fi
+    relays_count=$(echo "$relays_json" | jq '.relays | length')
+    if [[ "$relays_count" -eq 0 ]]; then
+        red "[!] 当前无可用中继"
+        return 1
+    fi
+
+    # ---- 按国家聚合 ----
+    # 生成 国家代码|国家名|城市列表|中继数 的聚合行 (按中继数降序)
+    local cc_summary
+    cc_summary=$(echo "$relays_json" | jq -r '
+        [.relays[] | {cc: (.country_code // "?"), cn: (.country // "?"), city: (.city // "?"), host: .public_host, port: .public_port, uuid: .client_id, pbk: .reality_public_key, sid: .short_id}]
+        | group_by(.cc)
+        | map({cc: .[0].cc, cn: .[0].cn, count: length, relays: .})
+        | sort_by(-.count)
+        | .[] | [.cc, .cn, (.relays | length), ([.relays[].city] | unique | join("/"))] | @tsv'
+    )
+
+    echo "------------------------------------------------------------"
+    echo "  共获取到 $relays_count 个中继, 按国家分类如下:"
+    echo "------------------------------------------------------------"
+    local -a cc_list=() cn_list=() cnt_list=() cities_list=()
+    local cc_idx=0
+    while IFS=$'\t' read -r cc cn cnt cities; do
+        [[ -z "$cc" ]] && continue
+        cc_list+=("$cc"); cn_list+=("$cn"); cnt_list+=("$cnt"); cities_list+=("$cities")
+        ((cc_idx++))
+        yellow "  [$cc_idx] [$cc] $cn (${cnt}个中继: $cities)"
+    done < <(echo "$cc_summary")
+
+    echo "------------------------------------------------------------"
+    echo "  支持: 单个编号 (如 3) | 多个 (如 1,3,5) | 范围 (如 2-4) | 全部 (a)"
+    reading "  请选择要添加的国家: " sel
+
+    if [[ -z "$sel" ]]; then
+        red "[!] 未选择任何国家"
+        return 1
+    fi
+
+    local -a pick_cc=()
+    if [[ "$sel" == "a" || "$sel" == "A" || "$sel" == "all" ]]; then
+        for ((i=0; i<${#cc_list[@]}; i++)); do pick_cc+=("$i"); done
+    else
+        local tok
+        local old_ifs="$IFS"; IFS=','
+        for tok in $sel; do
+            tok=$(echo "$tok" | tr -d ' ')
+            if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                local s="${BASH_REMATCH[1]}" e="${BASH_REMATCH[2]}"
+                for ((i=s; i<=e; i++)); do
+                    [[ $i -ge 1 && $i -le ${#cc_list[@]} ]] && pick_cc+=("$((i-1))")
+                done
+            elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+                [[ $tok -ge 1 && $tok -le ${#cc_list[@]} ]] && pick_cc+=("$((tok-1))")
+            fi
+        done
+        IFS="$old_ifs"
+    fi
+
+    if [[ ${#pick_cc[@]} -eq 0 ]]; then
+        red "[!] 选择无效"
+        return 1
+    fi
+
+    echo
+    purple "请选择本地入站协议:"
+    echo "  1. Hysteria2 入站"
+    echo "  2. TUIC v5 入站"
+    echo "  3. VLESS-Reality 入站"
+    echo "  4. 同时开启 Hy2 与 TUIC"
+    reading "请选择 [1-4, 默认4]: " oproto
+    [[ -z "$oproto" ]] && oproto="4"
+
+    # 预处理: 把每个国家的所有中继 URL 一次性从 JSON 提取
+    local added=0 failed=0
+    for ci in "${pick_cc[@]}"; do
+        local ccc="${cc_list[$ci]}" cname="${cn_list[$ci]}" ccity="${cities_list[$ci]}"
+        local remark="OpenRung-${ccc}"
+
+        # 提取该国全部中继 vless URL (每行一个)
+        local relay_urls
+        relay_urls=$(echo "$relays_json" | jq -r --arg cc "$ccc" '
+            [.relays[] | select((.country_code // "?") == $cc)]
+            | sort_by(.registered_at)
+            | .[] | "vless://\(.client_id)@\(.public_host):\(.public_port)?encryption=none&flow=xtls-rprx-vision&security=reality&sni=\(.server_name // "www.cloudflare.com")&fp=chrome&pbk=\(.reality_public_key)&sid=\(.short_id)&type=tcp"' 2>/dev/null)
+        [[ -z "$relay_urls" ]] && { red "[✗] [$remark] 无可用中继, 跳过"; ((failed++)); continue; }
+
+        # 首个中继作为当前激活
+        local first_url
+        first_url=$(echo "$relay_urls" | head -n 1 | tr -d ' \r\n')
+        [[ -z "$first_url" ]] && { red "[✗] [$remark] 中继链接为空, 跳过"; ((failed++)); continue; }
+
+        local out_json
+        out_json=$(validate_and_parse_proxy_url "$first_url" "openrung-out")
+        if [[ $? -ne 0 || -z "$out_json" ]]; then
+            red "[✗] [$remark] 链接解析失败, 跳过"
+            ((failed++))
+            continue
+        fi
+
+        # 分配组 tag 与端口
+        local group_tag="proxy-$(( $(get_all_proxy_groups | wc -l) + 1 ))"
+        while proxy_group_exists "$group_tag"; do
+            group_tag="proxy-$((RANDOM % 1000 + 1))"
+        done
+
+        local hy2_p="0" tuic_p="0" vless_p="0"
+        case "$oproto" in
+            1)
+                read_valid_port "  [$remark] Hysteria2 入站端口 [回车自动]: " "$(get_free_port)" hy2_p
+                ;;
+            2)
+                read_valid_port "  [$remark] TUIC v5 入站端口 [回车自动]: " "$(get_free_port)" tuic_p
+                ;;
+            3)
+                read_valid_port "  [$remark] VLESS-Reality 入站端口 [回车自动]: " "$(get_free_port)" vless_p
+                ;;
+            *)
+                read_valid_port "  [$remark] Hysteria2 入站端口 [回车自动]: " "$(get_free_port)" hy2_p
+                read_valid_port "  [$remark] TUIC v5 入站端口 [回车自动]: " "$(get_free_port)" tuic_p
+                ;;
+        esac
+
+        local gdir="${PROXY_GROUPS_DIR}/${group_tag}"
+        mkdir -p "$gdir"
+        echo "$remark" > "$gdir/remark.txt"
+        echo "$ccc" > "$gdir/country.txt"
+        echo "$relay_urls" > "$gdir/relays.txt"
+        echo "0" > "$gdir/active_idx.txt"
+        echo "$first_url" > "$gdir/raw_url.txt"
+        echo "$out_json" > "$gdir/outbound.json"
+        echo "$hy2_p" > "$gdir/hy2_port.txt"
+        echo "$tuic_p" > "$gdir/tuic_port.txt"
+        echo "$vless_p" > "$gdir/vless_port.txt"
+        if sync_proxy_group_to_singbox "$group_tag"; then
+            if ! grep -qx "$group_tag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
+                echo "$group_tag" >> "$PROXY_GROUPS_DIR/groups.txt"
+            fi
+            apply_changes
+            green "[✓] OpenRung [$remark] 建组成功! (标识: $group_tag, 中继: $(echo "$first_url" | sed -E 's|^[a-zA-Z0-9]+://([^@]+)@([^:/]+):?([0-9]*).*|\2|'))"
+            blue  "      该国备用中继: $(echo "$relay_urls" | wc -l) 个 (失效自动切换)"
+            generate_proxy_group_links "$group_tag"
+            ((added++))
+        else
+            rm -rf "$gdir"
+            sed -i "/^${group_tag}$/d" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null || true
+            red "[✗] [$remark] 同步配置失败, 跳过"
+            ((failed++))
+        fi
+        echo
+    done
+
+    echo "============================================================"
+    green "  OpenRung 中继建组完成: 成功 $added 个国家, 失败 $failed 个"
+    cyan  "  自愈探测: 每分钟自动检测出口IP, 失效自动切换同国家备用中继"
+    echo "============================================================"
+}
+
+# ============ OpenRung 中继自愈探测 (每分钟) ============
+# 遍历所有 OpenRung 组, 逐个探测出口IP; 失效则切换同国备用中继
+openrung_health_check() {
+    local monitor_log="/etc/s-box/monitor.log"
+    local openrung_dir="$WORKDIR/openrung"
+    mkdir -p "$openrung_dir" 2>/dev/null || true
+
+    # 单实例锁: 防止上一轮未结束导致资源堆积
+    local lock_file="$openrung_dir/check.lock"
+    if [[ -f "$lock_file" ]]; then
+        local old_pid
+        old_pid=$(cat "$lock_file" 2>/dev/null)
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            return 0  # 上一轮还在跑, 跳过本轮 (绝不叠加)
+        fi
+        rm -f "$lock_file"
+    fi
+    echo "$$" > "$lock_file"
+    trap 'rm -f "$lock_file"' EXIT
+
+    # 遍历所有代理组, 找 OpenRung 组 (有 country.txt + relays.txt 标记)
+    local -a or_groups=()
+    for gdir in "$PROXY_GROUPS_DIR"/*/; do
+        [[ -d "$gdir" ]] || continue
+        [[ -f "$gdir/country.txt" && -f "$gdir/relays.txt" ]] || continue
+        or_groups+=("$(basename "$gdir")")
+    done
+
+    if [[ ${#or_groups[@]} -eq 0 ]]; then
+        rm -f "$lock_file"
+        return 0
+    fi
+
+    local log_line="$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] 开始探测 ${#or_groups[@]} 个中继组"
+    echo "$log_line" >> "$monitor_log"
+    # 日志防膨胀: 超过 200KB 截断保留尾部
+    if [[ -f "$monitor_log" && $(wc -c < "$monitor_log" 2>/dev/null || echo 0) -gt 204800 ]]; then
+        tail -n 200 "$monitor_log" > "$monitor_log.tmp" 2>/dev/null && mv -f "$monitor_log.tmp" "$monitor_log" 2>/dev/null || true
+    fi
+
+    local changed=false
+    for tag in "${or_groups[@]}"; do
+        local gdir="${PROXY_GROUPS_DIR}/$tag"
+        local remark=$(cat "$gdir/remark.txt" 2>/dev/null || echo "$tag")
+
+        # 探测当前激活中继出口 IP (严格超时, 用完即杀, 自动清理)
+        local egress_ip ok
+        egress_ip=$(openrung_probe_egress_ip "$gdir")
+        ok=$?
+
+        if [[ $ok -eq 0 && -n "$egress_ip" ]]; then
+            # 正常: 写回探测结果供用户查看
+            echo "$egress_ip" > "$gdir/last_egress_ip.txt"
+            echo "$(date '+%Y-%m-%d %H:%M:%S')" > "$gdir/last_check_ok.txt"
+            continue
+        fi
+
+        # 失效: 切换到该国下一个备用中继
+        local cc=$(cat "$gdir/country.txt" 2>/dev/null || echo "?")
+        local idx=$(cat "$gdir/active_idx.txt" 2>/dev/null || echo "0")
+        local total=$(wc -l < "$gdir/relays.txt" 2>/dev/null || echo "0")
+        [[ -z "$total" || "$total" -eq 0 ]] && total=0
+        local new_idx=$((idx + 1))
+        if [[ "$new_idx" -ge "$total" ]]; then
+            new_idx=0  # 备用用完则重头轮询 (下次探测再失败会重抓)
+        fi
+
+        local new_url
+        new_url=$(sed -n "$((new_idx + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d ' \r\n')
+        if [[ -z "$new_url" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 探测失败且无备用中继, 跳过" >> "$monitor_log"
+            continue
+        fi
+
+        # 重新解析并应用
+        local new_out
+        new_out=$(validate_and_parse_proxy_url "$new_url" "${tag}-out" 2>/dev/null)
+        if [[ -z "$new_out" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 备用中继解析失败, 跳过" >> "$monitor_log"
+            continue
+        fi
+
+        echo "$new_url" > "$gdir/raw_url.txt"
+        echo "$new_out" > "$gdir/outbound.json"
+        echo "$new_idx" > "$gdir/active_idx.txt"
+        rm -f "$gdir/last_egress_ip.txt"
+
+        if sync_proxy_group_to_singbox "$tag"; then
+            changed=true
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 中继失效, 已自动切换至备用 #$((new_idx+1)): $(echo "$new_url" | sed -E 's|^[a-zA-Z0-9]+://([^@]+)@([^:/]+):?([0-9]*).*|\2|')" >> "$monitor_log"
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 切换同步失败!" >> "$monitor_log"
+        fi
+        sleep 1  # 组间冷却, 避免瞬时资源飙升
+    done
+
+    if $changed; then
+        apply_changes
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] 配置已生效 (sing-box 已重启)" >> "$monitor_log"
+    fi
+
+    rm -f "$lock_file"
+    return 0
+}
+
+# 探测单个 OpenRung 组出口 IP (轻量临时 sing-box, 严格超时, 用完即杀并清理)
+openrung_probe_egress_ip() {
+    local gdir="$1"
+    local outbound_json
+    outbound_json=$(cat "$gdir/outbound.json" 2>/dev/null)
+    [[ -z "$outbound_json" ]] && return 1
+
+    local sb_bin="$WORKDIR/sing-box"
+    [[ -x "$sb_bin" ]] || sb_bin=$(command -v sing-box 2>/dev/null || echo "")
+    [[ -n "$sb_bin" ]] || return 1
+
+    # 读取出站 tag (必须与 route.final 一致)
+    local out_tag
+    out_tag=$(echo "$outbound_json" | jq -r '.tag // empty' 2>/dev/null)
+    if [[ -z "$out_tag" ]]; then
+        out_tag="probe-out"
+        outbound_json=$(echo "$outbound_json" | jq -c --arg t "$out_tag" '.tag = $t' 2>/dev/null)
+    fi
+
+    # 随机本地 socks 端口 + 临时目录
+    local probe_port=$((20000 + RANDOM % 20000))
+    local probe_dir
+    probe_dir=$(mktemp -d /tmp/or-probe-XXXXXX 2>/dev/null) || return 1
+
+    # 生成探测配置: socks 本地入站 + 该组出站 + direct 兜底
+    cat > "$probe_dir/probe.json" <<EOF
+{
+  "log": {"level": "error"},
+  "inbounds": [{"type": "socks", "tag": "probe-in", "listen": "127.0.0.1", "listen_port": $probe_port}],
+  "outbounds": [
+    $outbound_json,
+    {"type": "direct", "tag": "direct"}
+  ],
+  "route": {"final": "$out_tag", "rules": []}
+}
+EOF
+
+    # 配置合法性校验 (失败立即清理返回, 绝不残留)
+    if ! "$sb_bin" check -c "$probe_dir/probe.json" >/dev/null 2>&1; then
+        rm -rf "$probe_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    # 启动临时 sing-box (严格超时 10s 兜底)
+    local sb_pid=""
+    timeout 10 "$sb_bin" run -c "$probe_dir/probe.json" >/dev/null 2>&1 &
+    sb_pid=$!
+    [[ -n "$sb_pid" ]] || { rm -rf "$probe_dir" 2>/dev/null || true; return 1; }
+
+    # 等待端口就绪并探测出口 IP (最多 8 秒, curl 严格 2 秒超时)
+    local egress_ip=""
+    for ((i=1; i<=8; i++)); do
+        sleep 1
+        if ! kill -0 "$sb_pid" 2>/dev/null; then break; fi
+        local res
+        res=$(timeout 3 curl -sx "socks5h://127.0.0.1:${probe_port}" -s4 --connect-timeout 1 -m 2 "http://api.ipify.org" 2>/dev/null | tr -d ' \r\n') || true
+        if [[ -n "$res" && "$res" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            egress_ip="$res"
+            break
+        fi
+    done
+
+    # 彻底终止并清理 (防残留进程/文件占资源)
+    kill -9 "$sb_pid" 2>/dev/null || true
+    wait "$sb_pid" 2>/dev/null || true
+    pkill -9 -f "$probe_dir/probe.json" 2>/dev/null || true
+    rm -rf "$probe_dir" 2>/dev/null || true
+
+    if [[ -n "$egress_ip" ]]; then
+        echo "$egress_ip"
+        return 0
+    fi
+    sleep 1  # 探测失败时短暂冷却, 避免高频重试
+    return 1
+}
+
 generate_proxy_group_links() {
     local tag="$1"
     [[ -z "$tag" ]] && return 1
@@ -3151,12 +3503,14 @@ proxy_egress_menu() {
         yellow "  3. 修改代理出站链接"
         red    "  4. 删除代理节点组"
         blue   "  5. 重新同步代理配置"
+        cyan   "  6. 一键添加 OpenRung 中继 (自动抓取/按国家建组/自愈)"
         echo "------------------------------------------------------------"
         red    "  0. 返回主菜单"
         echo "============================================================"
-        reading "请选择 [0-5]: " choice
+        reading "请选择 [0-6]: " choice
         case "$choice" in
             1) add_proxy_egress_group ;;
+            6) add_openrung_egress_group ;;
             2)
                 for t in "${groups[@]}"; do generate_proxy_group_links "$t"; done
                 ;;
@@ -4687,6 +5041,9 @@ run_cron_check() {
 
     ensure_all_psiphon_instances_running
     self_heal_stuck_psiphon_instances
+
+    # OpenRung 中继自愈: 每分钟探测出口IP, 失效自动切换同国备用中继
+    openrung_health_check
 }
 
 # ==================== 8. TCP / UDP / BBR 网络深度调优模块 ====================
