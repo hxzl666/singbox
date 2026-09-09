@@ -3347,7 +3347,7 @@ add_freevpn_egress_group() {
         return 1
     fi
 
-    # 按国家分组 (节点标签: CC-NNN-protocol, 取 # 后第一段)
+    # 按国家分组 (节点标签: CC-NNN[-R|H]-protocol, 取 # 后第一段)
     declare -A cc_group_map
     local -a cc_order=()
     local n line tag cc_key
@@ -3369,9 +3369,15 @@ add_freevpn_egress_group() {
     local ci=0
     for cc_key in "${cc_sorted[@]}"; do
         ((ci++))
-        local cnt
+        local cnt nR nH
         cnt=$(printf '%s' "${cc_group_map[$cc_key]}" | grep -c '://' || true)
-        yellow "  [$ci] [$cc_key] ${cnt} 个节点"
+        nR=$(printf '%s' "${cc_group_map[$cc_key]}" | grep -c -- '-R-' || true)
+        nH=$(printf '%s' "${cc_group_map[$cc_key]}" | grep -c -- '-H-' || true)
+        if [[ "$nR" -gt 0 ]]; then
+            green "  [$ci] [$cc_key] ${cnt} 节点 [家宽${nR}/机房${nH}]"
+        else
+            yellow "  [$ci] [$cc_key] ${cnt} 节点 [家宽${nR}/机房${nH}]"
+        fi
     done
     echo "------------------------------------------------------------"
     echo "  支持: 单个编号 (如 3) | 多个 (如 1,3,5) | 范围 (如 2-4) | 全部 (a)"
@@ -3414,10 +3420,22 @@ add_freevpn_egress_group() {
         local remark="FreeVPN-${ccc}"
         echo
         yellow "[*] [$remark] 正在解析节点... (共 $(printf '%s' "${cc_group_map[$ccc]}" | grep -c '://' || true) 个)"
-        # 组内节点列表: 全部写入 relays.txt, 首个为当前激活
+        # 组内节点列表: 全部写入 relays.txt, 首个为当前激活; 家宽优先排序
         local relays_file
         relays_file=$(mktemp)
-        printf '%s\n' "${cc_group_map[$ccc]}" | grep '://' > "$relays_file"
+        local -a resi_l=() host_l=() unk_l=()
+        while IFS= read -r ln; do
+            ln=$(echo "$ln" | tr -d '\r')
+            [[ -z "$ln" ]] && continue
+            case "$(tag_type "$ln")" in
+                R) resi_l+=("$ln") ;;
+                H) host_l+=("$ln") ;;
+                *) unk_l+=("$ln") ;;
+            esac
+        done < <(printf '%s\n' "${cc_group_map[$ccc]}" | grep '://')
+        printf '%s\n' "${resi_l[@]}" "${host_l[@]}" "${unk_l[@]}" > "$relays_file"
+        local n_resi=${#resi_l[@]} n_host=${#host_l[@]}
+        [[ "$n_resi" -gt 0 ]] && green "  [家宽优先] ${n_resi} 个家宽节点已排前, ${n_host} 个机房殿后"
         local first_url first_out_all
         first_url=$(head -1 "$relays_file" 2>/dev/null | tr -d '\r')
         [[ -z "$first_url" ]] && { rm -f "$relays_file"; red "[✗] [$remark] 组内无可用节点"; ((failed++)); continue; }
@@ -3533,6 +3551,18 @@ refresh_freevpn_country() {
     [[ ${#lines[@]} -eq 0 ]] && return 1
     printf '%s\n' "${lines[@]}"
     return 0
+}
+
+# 从节点链接标签解析家宽标记(R=家宽 H=机房 U=未知)
+# 标签格式: CC-NNN[-R|H]-protocol (爬虫重命名时打标)
+tag_type() {
+    local tag="${1##*#}"
+    local seg3
+    seg3=$(echo "$tag" | cut -d- -f3)
+    case "$seg3" in
+        R|H) echo "$seg3" ;;
+        *) echo "U" ;;
+    esac
 }
 
 freevpn_health_check() {
