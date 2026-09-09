@@ -3549,7 +3549,18 @@ refresh_freevpn_country() {
         [[ "$cckey" == "$cc" ]] && lines+=("$line")
     done <<< "$sub_content"
     [[ ${#lines[@]} -eq 0 ]] && return 1
-    printf '%s\n' "${lines[@]}"
+    # 家宽优先输出: R → H → U (爬虫已打标 CC-NNN-R|H-proto)
+    local -a resi_l=() host_l=() unk_l=()
+    local ln2 t
+    for ln2 in "${lines[@]}"; do
+        t=$(tag_type "$ln2")
+        case "$t" in
+            R) resi_l+=("$ln2") ;;
+            H) host_l+=("$ln2") ;;
+            *) unk_l+=("$ln2") ;;
+        esac
+    done
+    printf '%s\n' "${resi_l[@]}" "${host_l[@]}" "${unk_l[@]}"
     return 0
 }
 
