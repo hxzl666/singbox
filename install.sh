@@ -3342,8 +3342,11 @@ add_urpool_egress_group() {
         [[ -z "$socks_url" ]] && { red "[✗] [$remark] 获取代理失败"; ((failed++)); continue; }
         socks_url=$(echo "$socks_url" | tr -d ' \r\n')
 
-        local group_tag
-        group_tag=$(generate_proxy_group_tag)
+        # 分配组 tag (install 版模式: proxy-序号, 冲突时随机)
+        local group_tag="proxy-$(( $(get_all_proxy_groups | wc -l) + 1 ))"
+        while proxy_group_exists "$group_tag"; do
+            group_tag="proxy-$((RANDOM % 1000 + 1))"
+        done
         local out_json
         out_json=$(validate_and_parse_proxy_url "$socks_url" "${group_tag}-out")
         if [[ $? -ne 0 || -z "$out_json" ]]; then
