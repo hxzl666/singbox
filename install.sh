@@ -5488,8 +5488,16 @@ run_cron_check() {
     fi
 
     if ! service_is_active sing-box; then
-        service_restart sing-box
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Sing-box 未运行，已自动拉起！" >> "$log_file"
+        # 进程在跑但 pid 文件失效 → 仅修正 pid 文件, 绝不误杀活实例
+        local _sb_live
+        _sb_live=$(pgrep -x sing-box 2>/dev/null | head -1)
+        if [[ -n "$_sb_live" ]]; then
+            echo "$_sb_live" > /etc/s-box/sing-box.pid
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Sing-box 进程运行中但 pid 文件失效, 已修正 pid" >> "$log_file"
+        else
+            service_restart sing-box
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Sing-box 未运行，已自动拉起！" >> "$log_file"
+        fi
     fi
 
     if [[ -f /etc/s-box/argo.conf ]]; then
