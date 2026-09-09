@@ -30,6 +30,7 @@
   - **赛风（WARP 前置 / Cfon 出站）**：采用 Oblivion / Cfon 架构，由 Cloudflare WARP 作为赛风的底层前置加密传输通道，大幅增强抗阻断能力，最终出口保持在所选国家。
 - **自定义外部代理副节点组**：支持导入外部代理节点（VLESS / VLESS-Reality / VMess / Trojan / Shadowsocks / Hysteria2 / TUIC），自动配置专属本地入站中转。VLESS-Reality 链接自动解析 Reality 公钥 / short_id / SNI / flow，可直接导入 OpenRung 等中继节点。
 - **OpenRung 中继一键接入 + 自愈**：自动抓取 OpenRung Broker 最新中继列表并按国家分类建组（每个国家独立节点组，自动保存该国全部备用中继）；每分钟自动探测各中继出口 IP，失效自动切换同国备用中继并重建配置，全程轻量探测（严格超时 + 用完即杀 + 自动清理缓存，绝不占用服务器资源）。
+- **URPool 中继一键接入 + 自愈**：支持自建 URPool API（按国家分发 socks5 出口）一键接入，交互式输入 API 地址与 Token（脚本不内置任何地址，源码公开安全）；按国家分类建组，每分钟自动探测出口 IP，失效自动调用 rotate 端点换新并重建配置，全程轻量探测。
 
 ### 4. Cloudflare Argo 隧道穿透
 - 自动部署并管理 Cloudflare Argo 临时隧道，无需自有域名与公网开放端口，即可实现全球 CDN 加速与流量穿透。
