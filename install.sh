@@ -3265,77 +3265,103 @@ add_openrung_egress_group() {
     echo "============================================================"
 }
 
-# ============ URPool 中继建组 (按国家, 从 urpool API 获取 socks5 出口) ============
-add_urpool_egress_group() {
+# ============ 免费节点池建组 (按国家, 从 CF Worker 订阅获取节点) ============
+# 数据源: 自由部署的免费节点池 Worker (如 CF-Workers-SUB), 订阅地址+密钥由用户自行填写, 不内置
+add_freevpn_egress_group() {
     init_proxy_groups_dir
 
     echo
-    green "==== 一键添加 URPool 中继节点 (按国家分类) ===="
-    yellow "[*] 需自行提供 URPool API 地址与 Token (不内置任何地址)"
+    green "==== 一键添加免费节点池 (按国家分类) ===="
+    yellow "[*] 需自行提供订阅地址与密钥 (不内置任何地址)"
     echo
 
-    # 读取/保存 URPool API 配置 ($WORKDIR/urpool/api.txt 两行: 地址 / token)
-    local urpool_dir="$WORKDIR/urpool"
-    mkdir -p "$urpool_dir" 2>/dev/null || true
-    local up_api="" up_token=""
-    if [[ -f "$urpool_dir/api.txt" ]]; then
-        up_api=$(sed -n '1p' "$urpool_dir/api.txt" 2>/dev/null | tr -d ' \r\n')
-        up_token=$(sed -n '2p' "$urpool_dir/api.txt" 2>/dev/null | tr -d ' \r\n')
+    # 读取/保存 FreeVPN 订阅配置 ($WORKDIR/freevpn/api.txt 两行: 订阅地址 / token)
+    local fv_dir="$WORKDIR/freevpn"
+    mkdir -p "$fv_dir" 2>/dev/null || true
+    local fv_api="" fv_token=""
+    if [[ -f "$fv_dir/api.txt" ]]; then
+        fv_api=$(sed -n '1p' "$fv_dir/api.txt" 2>/dev/null | tr -d ' \r\n')
+        fv_token=$(sed -n '2p' "$fv_dir/api.txt" 2>/dev/null | tr -d ' \r\n')
     fi
-    if [[ -n "$up_api" ]]; then
-        yellow "[*] 检测到已保存的 URPool API: $up_api"
+    if [[ -n "$fv_api" ]]; then
+        yellow "[*] 检测到已保存的订阅: $fv_api"
         echo "  1. 使用已保存配置"
-        echo "  2. 重新输入 API 地址与 token"
+        echo "  2. 重新输入订阅地址与密钥"
         reading "  请选择 [1-2, 默认1]: " api_choice
         [[ -z "$api_choice" ]] && api_choice="1"
         if [[ "$api_choice" != "1" ]]; then
-            up_api=""; up_token=""
+            fv_api=""; fv_token=""
         fi
     fi
-    if [[ -z "$up_api" ]]; then
-        reading "请输入 URPool API 地址 (如 https://urnet.example.com): " up_api
-        up_api=$(echo "$up_api" | tr -d ' \r\n')
-        [[ -z "$up_api" ]] && { red "[!] API 地址不能为空"; return 1; }
-        reading "请输入 URPool API Token: " up_token
-        up_token=$(echo "$up_token" | tr -d ' \r\n')
-        [[ -z "$up_token" ]] && { red "[!] Token 不能为空"; return 1; }
-        echo "$up_api"   > "$urpool_dir/api.txt"
-        echo "$up_token" >> "$urpool_dir/api.txt"
+    if [[ -z "$fv_api" ]]; then
+        reading "请输入订阅地址 (如 https://free.example.com/free): " fv_api
+        fv_api=$(echo "$fv_api" | tr -d ' \r\n')
+        [[ -z "$fv_api" ]] && { red "[!] 订阅地址不能为空"; return 1; }
+        reading "请输入订阅密钥: " fv_token
+        fv_token=$(echo "$fv_token" | tr -d ' \r\n')
+        [[ -z "$fv_token" ]] && { red "[!] 密钥不能为空"; return 1; }
+        echo "$fv_api"   > "$fv_dir/api.txt"
+        echo "$fv_token" >> "$fv_dir/api.txt"
     fi
-    up_api="${up_api%/}"
+    fv_api="${fv_api%/}"
 
     echo
-    yellow "[*] 正在从 URPool API 获取国家列表..."
-    local countries_json
-    countries_json=$(curl -s --max-time 20 -H "Authorization: Bearer ${up_token}" "${up_api%/}/api/countries" 2>/dev/null)
-    if ! echo "$countries_json" | jq -e '.countries | type == "array"' >/dev/null 2>&1; then
-        red "[!] 获取国家列表失败 (API 地址/Token 错误或服务不可用)"
+    yellow "[*] 正在从订阅获取节点列表..."
+    local sub_content
+    sub_content=$(curl -s --max-time 30 "${fv_api}?token=${fv_token}" 2>/dev/null)
+    if [[ -z "$sub_content" ]]; then
+        red "[!] 拉取订阅失败 (地址/密钥错误或服务不可用)"
         return 1
     fi
-    local cc_count
-    cc_count=$(echo "$countries_json" | jq '.countries | length')
-    [[ "$cc_count" -eq 0 ]] && { red "[!] 当前无可选国家"; return 1; }
+    # 订阅可能 base64 编码, 尝试解码
+    if ! printf '%s' "$sub_content" | grep -qE '://'; then
+        local dec
+        dec=$(printf '%s' "$sub_content" | base64 -d 2>/dev/null)
+        [[ -n "$dec" ]] && sub_content="$dec"
+    fi
+    local -a node_lines=()
+    while IFS= read -r line; do
+        line=$(echo "$line" | tr -d ' \r')
+        [[ -z "$line" ]] && continue
+        case "$line" in
+            vless://*|vmess://*|trojan://*|ss://*|hysteria2://*|hy2://*|tuic://*) node_lines+=("$line") ;;
+        esac
+    done <<< "$sub_content"
+    if [[ ${#node_lines[@]} -eq 0 ]]; then
+        red "[!] 订阅中未解析到任何节点"
+        return 1
+    fi
+
+    # 按国家分组 (节点标签: CC-NNN-protocol, 取 # 后第一段)
+    declare -A cc_group_map
+    local -a cc_order=()
+    local n line tag cc_key
+    for n in "${node_lines[@]}"; do
+        tag="${n##*#}"
+        cc_key="${tag%%-*}"
+        [[ ${#cc_key} -ne 2 ]] && cc_key="XX"
+        cc_key=$(echo "$cc_key" | tr 'a-z' 'A-Z')
+        [[ -z "${cc_group_map[$cc_key]:-}" ]] && cc_order+=("$cc_key")
+        cc_group_map[$cc_key]+="$n"$'\n'
+    done
 
     echo "------------------------------------------------------------"
-    echo "  共获取到 $cc_count 个国家:"
-    echo "------------------------------------------------------------"
-    local -a cc_list=() cn_list=()
-    local cc_idx=0
-    while IFS=$'\t' read -r ccc cnn pcc; do
-        [[ -z "$ccc" ]] && continue
-        cc_list+=("$ccc"); cn_list+=("$cnn")
-        ((cc_idx++))
-        yellow "  [$cc_idx] [$ccc] $cnn (providers: ${pcc:-0})"
-    done < <(echo "$countries_json" | jq -r '.countries[] | [.country_code, (.name // .country_code), (.provider_count // 0)] | @tsv')
-
+    echo "  订阅中共 ${#node_lines[@]} 个节点, 分组: ${#cc_order[@]} 个国家/地区"
+    local ci=0
+    for cc_key in "${cc_order[@]}"; do
+        ((ci++))
+        local cnt
+        cnt=$(printf '%s' "${cc_group_map[$cc_key]}" | grep -c '://' || true)
+        yellow "  [$ci] [$cc_key] ${cnt} 个节点"
+    done
     echo "------------------------------------------------------------"
     echo "  支持: 单个编号 (如 3) | 多个 (如 1,3,5) | 范围 (如 2-4) | 全部 (a)"
-    reading "  请选择要添加的国家: " sel
-    [[ -z "$sel" ]] && { red "[!] 未选择任何国家"; return 1; }
+    reading "  请选择要添加的地区: " sel
+    [[ -z "$sel" ]] && { red "[!] 未选择任何地区"; return 1; }
 
-    local -a pick_cc=()
+    local -a pick_idx=()
     if [[ "$sel" == "a" || "$sel" == "A" || "$sel" == "all" ]]; then
-        for ((i=0; i<${#cc_list[@]}; i++)); do pick_cc+=("$i"); done
+        for ((i=0; i<${#cc_order[@]}; i++)); do pick_idx+=("$i"); done
     else
         local tok
         local old_ifs="$IFS"; IFS=','
@@ -3344,15 +3370,15 @@ add_urpool_egress_group() {
             if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
                 local s="${BASH_REMATCH[1]}" e="${BASH_REMATCH[2]}"
                 for ((i=s; i<=e; i++)); do
-                    [[ $i -ge 1 && $i -le ${#cc_list[@]} ]] && pick_cc+=("$((i-1))")
+                    [[ $i -ge 1 && $i -le ${#cc_order[@]} ]] && pick_idx+=("$((i-1))")
                 done
             elif [[ "$tok" =~ ^[0-9]+$ ]]; then
-                [[ $tok -ge 1 && $tok -le ${#cc_list[@]} ]] && pick_cc+=("$((tok-1))")
+                [[ $tok -ge 1 && $tok -le ${#cc_order[@]} ]] && pick_idx+=("$((tok-1))")
             fi
         done
         IFS="$old_ifs"
     fi
-    [[ ${#pick_cc[@]} -eq 0 ]] && { red "[!] 选择无效"; return 1; }
+    [[ ${#pick_idx[@]} -eq 0 ]] && { red "[!] 选择无效"; return 1; }
 
     echo
     purple "请选择本地入站协议:"
@@ -3364,46 +3390,60 @@ add_urpool_egress_group() {
     [[ -z "$oproto" ]] && oproto="4"
 
     local added=0 failed=0
-    for ci in "${pick_cc[@]}"; do
-        local ccc="${cc_list[$ci]}" cname="${cn_list[$ci]}"
-        local remark="URPool-${ccc}"
+    for pi in "${pick_idx[@]}"; do
+        local ccc="${cc_order[$pi]}"
+        local remark="FreeVPN-${ccc}"
         echo
-        yellow "[*] [$remark] 正在获取 ${cname} 出口代理..."
-        local proxy_json socks_url
-        proxy_json=$(curl -s --max-time 30 -H "Authorization: Bearer ${up_token}" "${up_api%/}/api/proxy?country=${ccc}" 2>/dev/null)
-        socks_url=$(echo "$proxy_json" | jq -r '.socks5 // empty' 2>/dev/null)
-        [[ -z "$socks_url" ]] && { red "[✗] [$remark] 获取代理失败 ($(echo "$proxy_json" | jq -r '.error // "未知错误"' 2>/dev/null))"; ((failed++)); continue; }
-        socks_url=$(echo "$socks_url" | tr -d ' \r\n')
+        yellow "[*] [$remark] 正在解析节点... (共 $(printf '%s' "${cc_group_map[$ccc]}" | grep -c '://' || true) 个)"
+        # 组内节点列表: 全部写入 relays.txt, 首个为当前激活
+        local relays_file
+        relays_file=$(mktemp)
+        printf '%s\n' "${cc_group_map[$ccc]}" | grep '://' > "$relays_file"
+        local first_url first_out_all
+        first_url=$(head -1 "$relays_file" 2>/dev/null | tr -d '\r')
+        [[ -z "$first_url" ]] && { rm -f "$relays_file"; red "[✗] [$remark] 组内无可用节点"; ((failed++)); continue; }
 
-        # 分配组 tag (install 版模式: proxy-序号, 冲突时随机)
+        # 分配组 tag
         local group_tag="proxy-$(( $(get_all_proxy_groups | wc -l) + 1 ))"
         while proxy_group_exists "$group_tag"; do
             group_tag="proxy-$((RANDOM % 1000 + 1))"
         done
-        local out_json
-        out_json=$(validate_and_parse_proxy_url "$socks_url" "${group_tag}-out")
-        if [[ $? -ne 0 || -z "$out_json" ]]; then
-            red "[✗] [$remark] 代理解析失败"; ((failed++)); continue
+
+        first_out_all=$(validate_and_parse_proxy_url "$first_url" "${group_tag}-out")
+        if [[ $? -ne 0 || -z "$first_out_all" ]]; then
+            # 首个节点解析失败, 尝试组内下一个
+            local alt_url alt_out
+            alt_url=""; alt_out=""
+            while IFS= read -r ln; do
+                ln=$(echo "$ln" | tr -d '\r')
+                [[ -z "$ln" ]] && continue
+                alt_out=$(validate_and_parse_proxy_url "$ln" "${group_tag}-out" 2>/dev/null)
+                if [[ $? -eq 0 && -n "$alt_out" ]]; then
+                    alt_url="$ln"
+                    break
+                fi
+            done < "$relays_file"
+            if [[ -z "$alt_url" ]]; then
+                rm -f "$relays_file"
+                red "[✗] [$remark] 组内全部节点解析失败"; ((failed++)); continue
+            fi
+            first_url="$alt_url"
+            first_out_all="$alt_out"
         fi
 
-        # 按选择分配本地入站端口 (与 OpenRung 建组逻辑一致)
+        # 按选择分配本地入站端口
         local hy2_p="0" tuic_p="0" vless_p="0"
         case "$oproto" in
-            1)
-                read_valid_port "  [$remark] Hysteria2 入站端口 [回车自动]: " "$(get_free_port)" hy2_p
-                ;;
-            2)
-                read_valid_port "  [$remark] TUIC v5 入站端口 [回车自动]: " "$(get_free_port)" tuic_p
-                ;;
-            3)
-                read_valid_port "  [$remark] VLESS-Reality 入站端口 [回车自动]: " "$(get_free_port)" vless_p
-                ;;
+            1) read_valid_port "  [$remark] Hysteria2 入站端口 [回车自动]: " "$(get_free_port)" hy2_p ;;
+            2) read_valid_port "  [$remark] TUIC v5 入站端口 [回车自动]: " "$(get_free_port)" tuic_p ;;
+            3) read_valid_port "  [$remark] VLESS-Reality 入站端口 [回车自动]: " "$(get_free_port)" vless_p ;;
             *)
                 read_valid_port "  [$remark] Hysteria2 入站端口 [回车自动]: " "$(get_free_port)" hy2_p
                 read_valid_port "  [$remark] TUIC v5 入站端口 [回车自动]: " "$(get_free_port)" tuic_p
                 ;;
         esac
         if [[ "$hy2_p" == "0" && "$tuic_p" == "0" && "$vless_p" == "0" ]]; then
+            rm -f "$relays_file"
             red "[✗] [$remark] 入站端口分配失败, 跳过"
             ((failed++)); continue
         fi
@@ -3412,11 +3452,14 @@ add_urpool_egress_group() {
         mkdir -p "$gdir"
         echo "$remark"        > "$gdir/remark.txt"
         echo "$ccc"           > "$gdir/country.txt"
-        echo "$up_api"        > "$gdir/urpool_api.txt"
-        echo "$up_token"      > "$gdir/urpool_token.txt"
-        echo "$socks_url"     > "$gdir/raw_url.txt"
-        echo "$out_json"      > "$gdir/outbound.json"
-        echo "$(date +%s)"    > "$gdir/urpool_ts.txt"
+        echo "$fv_api"        > "$gdir/freevpn_api.txt"
+        echo "$fv_token"      > "$gdir/freevpn_token.txt"
+        cp -f "$relays_file"  "$gdir/relays.txt"
+        rm -f "$relays_file"
+        echo "$first_url"     > "$gdir/raw_url.txt"
+        echo "$first_out_all" > "$gdir/outbound.json"
+        echo "0"              > "$gdir/active_idx.txt"
+        echo "$(date +%s)"    > "$gdir/check_ts.txt"
         echo "$hy2_p"         > "$gdir/hy2_port.txt"
         echo "$tuic_p"        > "$gdir/tuic_port.txt"
         echo "$vless_p"       > "$gdir/vless_port.txt"
@@ -3426,7 +3469,7 @@ add_urpool_egress_group() {
                 echo "$group_tag" >> "$PROXY_GROUPS_DIR/groups.txt"
             fi
             apply_changes
-            green "[✓] $remark 建组成功! (标识: $group_tag)"
+            green "[✓] $remark 建组成功! (标识: $group_tag, 组内 $(grep -c '://' "$gdir/relays.txt" || true) 节点)"
             generate_proxy_group_links "$group_tag" 2>/dev/null
             ((added++))
         else
@@ -3436,22 +3479,22 @@ add_urpool_egress_group() {
     done
 
     echo "============================================================"
-    green "  URPool 建组完成: 成功 $added 个国家, 失败 $failed 个"
-    cyan  "  自愈探测: 每分钟自动检测出口 IP, 失效自动从 URPool 换新 (rotate)"
+    green "  FreeVPN 建组完成: 成功 $added 个地区, 失败 $failed 个"
+    cyan  "  自愈探测: 每分钟自动检测出口 IP, 失效自动切换组内下一个节点"
     echo "============================================================"
 }
 
-# ============ URPool 中继自愈探测 (挂 run_cron_check) ============
-urpool_health_check() {
+# ============ FreeVPN 自愈探测 (挂 run_cron_check) ============
+freevpn_health_check() {
     local monitor_log="$WORKDIR/monitor.log"
-    local urpool_dir="$WORKDIR/urpool"
-    mkdir -p "$urpool_dir" 2>/dev/null || true
+    local fv_dir="$WORKDIR/freevpn"
+    mkdir -p "$fv_dir" 2>/dev/null || true
 
     if [[ ! -d "$PROXY_GROUPS_DIR" ]]; then
         return 0
     fi
 
-    local lock_file="$urpool_dir/check.lock"
+    local lock_file="$fv_dir/check.lock"
     if [[ -f "$lock_file" ]]; then
         local old_pid
         old_pid=$(cat "$lock_file" 2>/dev/null)
@@ -3463,34 +3506,34 @@ urpool_health_check() {
     echo "$$" > "$lock_file"
     trap 'rm -f "$lock_file"' EXIT
 
-    local -a up_groups=()
+    local -a fv_groups=()
     for gdir in "$PROXY_GROUPS_DIR"/*/; do
         [[ -d "$gdir" ]] || continue
-        [[ -f "$gdir/urpool_api.txt" && -f "$gdir/outbound.json" ]] || continue
-        up_groups+=("$(basename "$gdir")")
+        [[ -f "$gdir/freevpn_api.txt" && -f "$gdir/relays.txt" && -f "$gdir/outbound.json" ]] || continue
+        fv_groups+=("$(basename "$gdir")")
     done
 
-    if [[ ${#up_groups[@]} -eq 0 ]]; then
+    if [[ ${#fv_groups[@]} -eq 0 ]]; then
         rm -f "$lock_file"; return 0
     fi
 
-    local log_line="$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] 开始探测 ${#up_groups[@]} 个中继组"
+    local log_line="$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] 开始探测 ${#fv_groups[@]} 个节点组"
     echo "$log_line" >> "$monitor_log"
     if [[ -f "$monitor_log" && $(wc -c < "$monitor_log" 2>/dev/null || echo 0) -gt 204800 ]]; then
         tail -n 200 "$monitor_log" > "$monitor_log.tmp" 2>/dev/null && mv -f "$monitor_log.tmp" "$monitor_log" 2>/dev/null || true
     fi
 
     local changed=false
-    for tag in "${up_groups[@]}"; do
+    for tag in "${fv_groups[@]}"; do
         local gdir="${PROXY_GROUPS_DIR}/$tag"
         local remark=$(cat "$gdir/remark.txt" 2>/dev/null || echo "$tag")
 
-        # 预热宽限期: URPool 新实例需 ~45s 预热, 期间跳过探测, 避免"建了又死、死了又建"循环
+        # 新组/刚切换需短暂宽限, 期间跳过探测
         local now_ts
         now_ts=$(date +%s)
-        local ts=$(cat "$gdir/urpool_ts.txt" 2>/dev/null || echo "0")
+        local ts=$(cat "$gdir/check_ts.txt" 2>/dev/null || echo "0")
         [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
-        if (( now_ts - ts < 90 )); then
+        if (( now_ts - ts < 45 )); then
             continue
         fi
 
@@ -3503,54 +3546,50 @@ urpool_health_check() {
             continue
         fi
 
-        local cc=$(cat "$gdir/country.txt" 2>/dev/null || echo "?")
-        local up_api=$(cat "$gdir/urpool_api.txt" 2>/dev/null || echo "")
-        local up_token=$(cat "$gdir/urpool_token.txt" 2>/dev/null || echo "")
-        if [[ -z "$up_api" || -z "$up_token" ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 缺少 API 配置, 跳过" >> "$monitor_log"
-            continue
-        fi
+        # 出口失效 → 切换组内下一个节点 (active_idx 轮换)
+        local total
+        total=$(grep -c '://' "$gdir/relays.txt" 2>/dev/null || echo 0)
+        [[ "$total" -le 1 ]] && { echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 组内仅 1 个节点且已失效, 等待订阅更新" >> "$monitor_log"; continue; }
 
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 出口失效, 正在从 URPool 换新..." >> "$monitor_log"
+        local active_idx
+        active_idx=$(cat "$gdir/active_idx.txt" 2>/dev/null || echo "0")
+        [[ "$active_idx" =~ ^[0-9]+$ ]] || active_idx=0
+        local next_idx=$(( (active_idx + 1) % total ))
         local new_url
-        new_url=$(curl -s --max-time 30 -X POST -H "Authorization: Bearer ${up_token}" "${up_api%/}/api/rotate?country=${cc}" 2>/dev/null | jq -r '.socks5 // empty' 2>/dev/null)
-        if [[ -z "$new_url" ]]; then
-            new_url=$(curl -s --max-time 30 -H "Authorization: Bearer ${up_token}" "${up_api%/}/api/proxy?country=${cc}" 2>/dev/null | jq -r '.socks5 // empty' 2>/dev/null)
-        fi
-        if [[ -z "$new_url" ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 换新失败, 稍后重试" >> "$monitor_log"
-            continue
-        fi
+        new_url=$(sed -n "$((next_idx + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
+        [[ -z "$new_url" ]] && { echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 取节点失败(索引 $next_idx)" >> "$monitor_log"; continue; }
 
         local new_out
         new_out=$(validate_and_parse_proxy_url "$new_url" "${tag}-out" 2>/dev/null)
         if [[ -z "$new_out" ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 新代理解析失败" >> "$monitor_log"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 节点解析失败 ($(echo "$new_url" | sed -E 's|^[a-zA-Z0-9]+://([^@]+)@([^:/]+):?([0-9]*).*|\2|'))" >> "$monitor_log"
             continue
         fi
 
         echo "$new_url" > "$gdir/raw_url.txt"
         echo "$new_out" > "$gdir/outbound.json"
-        echo "$(date +%s)" > "$gdir/urpool_ts.txt"
+        echo "$next_idx" > "$gdir/active_idx.txt"
+        echo "$(date +%s)" > "$gdir/check_ts.txt"
         rm -f "$gdir/last_egress_ip.txt"
 
         if sync_proxy_group_to_singbox "$tag"; then
             changed=true
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 已从 URPool 换新出口 $(echo "$new_url" | sed -E 's|^[a-zA-Z0-9]+://([^@]+)@([^:/]+):?([0-9]*).*|\2|')" >> "$monitor_log"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 已切换到第 $((next_idx+1))/$total 个节点 $(echo "$new_url" | sed -E 's|^[a-zA-Z0-9]+://([^@]+)@([^:/]+):?([0-9]*).*|\2|')" >> "$monitor_log"
         else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 切换同步失败!" >> "$monitor_log"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 切换同步失败!" >> "$monitor_log"
         fi
         sleep 1
     done
 
     if $changed; then
         apply_changes
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] 配置已生效 (sing-box 已重启)" >> "$monitor_log"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] 配置已生效 (sing-box 已重启)" >> "$monitor_log"
     fi
 
     rm -f "$lock_file"
     return 0
 }
+
 
 # ============ OpenRung 中继自愈探测 (每分钟) ============
 # 遍历所有 OpenRung 组, 逐个探测出口IP; 失效则切换同国备用中继
@@ -3826,7 +3865,7 @@ proxy_egress_menu() {
         red    "  4. 删除代理节点组"
         blue   "  5. 重新同步代理配置"
         cyan   "  6. 一键添加 OpenRung 中继 (自动抓取/按国家建组/自愈)"
-        green  "  7. 一键添加 URPool 中继 (按国家分类, 失效自动换新)"
+        green  "  7. 一键添加免费节点池 (按国家分类, 失效自动切换)"
         echo "------------------------------------------------------------"
         red    "  0. 返回主菜单"
         echo "============================================================"
@@ -3834,7 +3873,7 @@ proxy_egress_menu() {
         case "$choice" in
             1) add_proxy_egress_group ;;
             6) add_openrung_egress_group ;;
-            7) add_urpool_egress_group ;;
+            7) add_freevpn_egress_group ;;
             2)
                 for t in "${groups[@]}"; do generate_proxy_group_links "$t"; done
                 ;;
@@ -5368,7 +5407,7 @@ run_cron_check() {
 
     # OpenRung 中继自愈: 每分钟探测出口IP, 失效自动切换同国备用中继
     openrung_health_check
-    urpool_health_check
+    freevpn_health_check
 }
 
 # ==================== 8. TCP / UDP / BBR 网络深度调优模块 ====================
