@@ -198,7 +198,12 @@ service_start() {
             case "$name" in
                 sing-box)
                     nohup /etc/s-box/sing-box run -c /etc/s-box/sb.json >> /var/log/sing-box.log 2>&1 &
-                    echo $! > /etc/s-box/sing-box.pid
+                    local _sb_pid=$!
+                    sleep 1
+                    local _sb_real
+                    _sb_real=$(pgrep -x sing-box 2>/dev/null | head -1)
+                    [[ -n "$_sb_real" ]] && _sb_pid="$_sb_real"
+                    echo "$_sb_pid" > /etc/s-box/sing-box.pid
                     ;;
                 argo-tunnel)
                     local _cf_args
@@ -222,7 +227,13 @@ service_start() {
         case "$name" in
             sing-box)
                 nohup /etc/s-box/sing-box run -c /etc/s-box/sb.json >> /var/log/sing-box.log 2>&1 &
-                echo $! > /etc/s-box/sing-box.pid
+                local _sb_pid=$!
+                sleep 1
+                # nohup 的 pid 与 sing-box 实际 pid 不一致(手动启动残留/pid 错乱) → 以实际进程为准
+                local _sb_real
+                _sb_real=$(pgrep -x sing-box 2>/dev/null | head -1)
+                [[ -n "$_sb_real" ]] && _sb_pid="$_sb_real"
+                echo "$_sb_pid" > /etc/s-box/sing-box.pid
                 ;;
             argo-tunnel)
                 local _cf_args
@@ -284,13 +295,17 @@ service_is_active() {
         rc-service "$name" status 2>/dev/null | grep -q "started"
     elif $IS_DIRECT; then
         local pidfile="/etc/s-box/${name}.pid"
+        local alive=false
         if [[ -f "$pidfile" ]]; then
             local pid
             pid=$(cat "$pidfile" 2>/dev/null)
-            [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
-        else
-            return 1
+            [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && alive=true
         fi
+        # pid 文件失效但进程实际在跑(如手动启动/pid 错乱) → 仍视为运行中, 避免误杀
+        if ! $alive; then
+            pgrep -x "$name" >/dev/null 2>&1 && alive=true
+        fi
+        $alive
     else
         systemctl is-active --quiet "$name"
     fi
