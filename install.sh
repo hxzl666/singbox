@@ -3372,7 +3372,7 @@ add_urpool_egress_group() {
         local proxy_json socks_url
         proxy_json=$(curl -s --max-time 30 -H "Authorization: Bearer ${up_token}" "${up_api%/}/api/proxy?country=${ccc}" 2>/dev/null)
         socks_url=$(echo "$proxy_json" | jq -r '.socks5 // empty' 2>/dev/null)
-        [[ -z "$socks_url" ]] && { red "[✗] [$remark] 获取代理失败"; ((failed++)); continue; }
+        [[ -z "$socks_url" ]] && { red "[✗] [$remark] 获取代理失败 ($(echo "$proxy_json" | jq -r '.error // "未知错误"' 2>/dev/null))"; ((failed++)); continue; }
         socks_url=$(echo "$socks_url" | tr -d ' \r\n')
 
         # 分配组 tag (install 版模式: proxy-序号, 冲突时随机)
