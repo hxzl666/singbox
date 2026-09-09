@@ -3354,6 +3354,15 @@ add_urpool_egress_group() {
     fi
     [[ ${#pick_cc[@]} -eq 0 ]] && { red "[!] 选择无效"; return 1; }
 
+    echo
+    purple "请选择本地入站协议:"
+    echo "  1. Hysteria2 入站"
+    echo "  2. TUIC v5 入站"
+    echo "  3. VLESS-Reality 入站"
+    echo "  4. 同时开启 Hy2 与 TUIC"
+    reading "请选择 [1-4, 默认4]: " oproto
+    [[ -z "$oproto" ]] && oproto="4"
+
     local added=0 failed=0
     for ci in "${pick_cc[@]}"; do
         local ccc="${cc_list[$ci]}" cname="${cn_list[$ci]}"
@@ -3377,6 +3386,28 @@ add_urpool_egress_group() {
             red "[✗] [$remark] 代理解析失败"; ((failed++)); continue
         fi
 
+        # 按选择分配本地入站端口 (与 OpenRung 建组逻辑一致)
+        local hy2_p="0" tuic_p="0" vless_p="0"
+        case "$oproto" in
+            1)
+                read_valid_port "  [$remark] Hysteria2 入站端口 [回车自动]: " "$(get_free_port)" hy2_p
+                ;;
+            2)
+                read_valid_port "  [$remark] TUIC v5 入站端口 [回车自动]: " "$(get_free_port)" tuic_p
+                ;;
+            3)
+                read_valid_port "  [$remark] VLESS-Reality 入站端口 [回车自动]: " "$(get_free_port)" vless_p
+                ;;
+            *)
+                read_valid_port "  [$remark] Hysteria2 入站端口 [回车自动]: " "$(get_free_port)" hy2_p
+                read_valid_port "  [$remark] TUIC v5 入站端口 [回车自动]: " "$(get_free_port)" tuic_p
+                ;;
+        esac
+        if [[ "$hy2_p" == "0" && "$tuic_p" == "0" && "$vless_p" == "0" ]]; then
+            red "[✗] [$remark] 入站端口分配失败, 跳过"
+            ((failed++)); continue
+        fi
+
         local gdir="${PROXY_GROUPS_DIR}/${group_tag}"
         mkdir -p "$gdir"
         echo "$remark"        > "$gdir/remark.txt"
@@ -3386,6 +3417,9 @@ add_urpool_egress_group() {
         echo "$socks_url"     > "$gdir/raw_url.txt"
         echo "$out_json"      > "$gdir/outbound.json"
         echo "$(date +%s)"    > "$gdir/urpool_ts.txt"
+        echo "$hy2_p"         > "$gdir/hy2_port.txt"
+        echo "$tuic_p"        > "$gdir/tuic_port.txt"
+        echo "$vless_p"       > "$gdir/vless_port.txt"
 
         if sync_proxy_group_to_singbox "$group_tag"; then
             if ! grep -qx "$group_tag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
