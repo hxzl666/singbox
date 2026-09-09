@@ -1580,7 +1580,7 @@ parse_proxy_url_to_json() {
             local query=""
             local hostpart="$rest"
             if [[ "$rest" == *"?"* ]]; then
-                query="${rest#*?}"
+                query="${rest#*\?}"
                 hostpart="${rest%%\?*}"
             fi
 
@@ -3345,10 +3345,14 @@ add_freevpn_egress_group() {
         cc_group_map[$cc_key]+="$n"$'\n'
     done
 
+    # 按国家码字母序展示与选择
+    local -a cc_sorted=()
+    mapfile -t cc_sorted < <(printf '%s\n' "${cc_order[@]}" | sort)
+
     echo "------------------------------------------------------------"
     echo "  订阅中共 ${#node_lines[@]} 个节点, 分组: ${#cc_order[@]} 个国家/地区"
     local ci=0
-    for cc_key in "${cc_order[@]}"; do
+    for cc_key in "${cc_sorted[@]}"; do
         ((ci++))
         local cnt
         cnt=$(printf '%s' "${cc_group_map[$cc_key]}" | grep -c '://' || true)
@@ -3370,10 +3374,10 @@ add_freevpn_egress_group() {
             if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
                 local s="${BASH_REMATCH[1]}" e="${BASH_REMATCH[2]}"
                 for ((i=s; i<=e; i++)); do
-                    [[ $i -ge 1 && $i -le ${#cc_order[@]} ]] && pick_idx+=("$((i-1))")
+                    [[ $i -ge 1 && $i -le ${#cc_sorted[@]} ]] && pick_idx+=("$((i-1))")
                 done
             elif [[ "$tok" =~ ^[0-9]+$ ]]; then
-                [[ $tok -ge 1 && $tok -le ${#cc_order[@]} ]] && pick_idx+=("$((tok-1))")
+                [[ $tok -ge 1 && $tok -le ${#cc_sorted[@]} ]] && pick_idx+=("$((tok-1))")
             fi
         done
         IFS="$old_ifs"
@@ -3391,7 +3395,7 @@ add_freevpn_egress_group() {
 
     local added=0 failed=0
     for pi in "${pick_idx[@]}"; do
-        local ccc="${cc_order[$pi]}"
+        local ccc="${cc_sorted[$pi]}"
         local remark="FreeVPN-${ccc}"
         echo
         yellow "[*] [$remark] 正在解析节点... (共 $(printf '%s' "${cc_group_map[$ccc]}" | grep -c '://' || true) 个)"
@@ -3485,6 +3489,37 @@ add_freevpn_egress_group() {
 }
 
 # ============ FreeVPN 自愈探测 (挂 run_cron_check) ============
+# ============ FreeVPN 订阅重新拉取指定国家节点 (返回多行 URL) ============
+refresh_freevpn_country() {
+    local fv_api="$1" fv_token="$2" cc="$3"
+    [[ -z "$fv_api" || -z "$fv_token" || -z "$cc" ]] && return 1
+    local sub_content dec
+    sub_content=$(curl -s --max-time 30 "${fv_api}?token=${fv_token}" 2>/dev/null)
+    [[ -z "$sub_content" ]] && return 1
+    if ! printf '%s' "$sub_content" | grep -qE '://'; then
+        dec=$(printf '%s' "$sub_content" | base64 -d 2>/dev/null)
+        [[ -n "$dec" ]] && sub_content="$dec"
+    fi
+    local -a lines=()
+    local line tag cckey
+    while IFS= read -r line; do
+        line=$(echo "$line" | tr -d ' \r')
+        [[ -z "$line" ]] && continue
+        case "$line" in
+            vless://*|vmess://*|trojan://*|ss://*|hysteria2://*|hy2://*|tuic://*) ;;
+            *) continue ;;
+        esac
+        tag="${line##*#}"
+        cckey="${tag%%-*}"
+        [[ ${#cckey} -ne 2 ]] && cckey="XX"
+        cckey=$(echo "$cckey" | tr 'a-z' 'A-Z')
+        [[ "$cckey" == "$cc" ]] && lines+=("$line")
+    done <<< "$sub_content"
+    [[ ${#lines[@]} -eq 0 ]] && return 1
+    printf '%s\n' "${lines[@]}"
+    return 0
+}
+
 freevpn_health_check() {
     local monitor_log="$WORKDIR/monitor.log"
     local fv_dir="$WORKDIR/freevpn"
@@ -3546,17 +3581,71 @@ freevpn_health_check() {
             continue
         fi
 
-        # 出口失效 → 切换组内下一个节点 (active_idx 轮换)
-        local total
+        # 出口失效 → 切换组内下一个节点 (active_idx 轮换); 一圈全失效 → 从订阅重新拉取 (用户指定 fallback 逻辑)
+        local total active_idx next_idx new_url new_out
         total=$(grep -c '://' "$gdir/relays.txt" 2>/dev/null || echo 0)
-        [[ "$total" -le 1 ]] && { echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 组内仅 1 个节点且已失效, 等待订阅更新" >> "$monitor_log"; continue; }
-
-        local active_idx
         active_idx=$(cat "$gdir/active_idx.txt" 2>/dev/null || echo "0")
         [[ "$active_idx" =~ ^[0-9]+$ ]] || active_idx=0
-        local next_idx=$(( (active_idx + 1) % total ))
-        local new_url
-        new_url=$(sed -n "$((next_idx + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
+        local fv_api fv_token cc reloaded=false last_reload now_s
+        fv_api=$(cat "$gdir/freevpn_api.txt" 2>/dev/null || cat "$fv_dir/api.txt" 2>/dev/null)
+        fv_token=$(cat "$gdir/freevpn_token.txt" 2>/dev/null)
+        cc=$(cat "$gdir/country.txt" 2>/dev/null || echo "")
+        [[ ${#cc} -ne 2 ]] && cc="XX"
+        cc=$(echo "$cc" | tr 'a-z' 'A-Z')
+
+        if [[ "$total" -le 1 ]]; then
+            # 单节点/空组: 失效后直接尝试重新拉取该国家节点
+            last_reload=$(cat "$gdir/reload_ts.txt" 2>/dev/null || echo "0")
+            now_s=$(date +%s)
+            [[ "$last_reload" =~ ^[0-9]+$ ]] || last_reload=0
+            if [[ -n "$fv_api" && -n "$fv_token" ]] && (( now_s - last_reload > 300 )); then
+                local fresh
+                fresh=$(refresh_freevpn_country "$fv_api" "$fv_token" "$cc" 2>/dev/null)
+                if [[ -n "$fresh" ]]; then
+                    printf '%s\n' "$fresh" > "$gdir/relays.txt"
+                    echo "$now_s" > "$gdir/reload_ts.txt"
+                    echo "0" > "$gdir/active_idx.txt"
+                    total=$(grep -c '://' "$gdir/relays.txt" 2>/dev/null || echo 0)
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 节点已失效, 已从订阅重新拉取 $total 个节点" >> "$monitor_log"
+                    reloaded=true
+                fi
+            fi
+            if ! $reloaded; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 组内节点失效且暂无法刷新订阅" >> "$monitor_log"
+                continue
+            fi
+            next_idx=0
+            new_url=$(head -1 "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
+        else
+            next_idx=$(( (active_idx + 1) % total ))
+            if [[ "$next_idx" -eq 0 ]]; then
+                # 转完一整圈 → 全部失效 → 重新拉取该国家节点
+                last_reload=$(cat "$gdir/reload_ts.txt" 2>/dev/null || echo "0")
+                now_s=$(date +%s)
+                [[ "$last_reload" =~ ^[0-9]+$ ]] || last_reload=0
+                if [[ -n "$fv_api" && -n "$fv_token" ]] && (( now_s - last_reload > 300 )); then
+                    local fresh2
+                    fresh2=$(refresh_freevpn_country "$fv_api" "$fv_token" "$cc" 2>/dev/null)
+                    if [[ -n "$fresh2" ]]; then
+                        printf '%s\n' "$fresh2" > "$gdir/relays.txt"
+                        echo "$now_s" > "$gdir/reload_ts.txt"
+                        echo "0" > "$gdir/active_idx.txt"
+                        total=$(grep -c '://' "$gdir/relays.txt" 2>/dev/null || echo 0)
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 组内全部节点失效, 已从订阅重新拉取 $total 个节点" >> "$monitor_log"
+                        reloaded=true
+                    fi
+                fi
+                if $reloaded; then
+                    next_idx=0
+                    new_url=$(head -1 "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
+                else
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 组内全部节点失效, 订阅刷新受限, 稍后再试" >> "$monitor_log"
+                    continue
+                fi
+            else
+                new_url=$(sed -n "$((next_idx + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
+            fi
+        fi
         [[ -z "$new_url" ]] && { echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 取节点失败(索引 $next_idx)" >> "$monitor_log"; continue; }
 
         local new_out
