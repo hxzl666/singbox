@@ -1386,6 +1386,7 @@ init_proxy_groups_dir() {
 get_all_proxy_groups() {
     init_proxy_groups_dir
     if [[ -f "$PROXY_GROUPS_DIR/groups.txt" ]]; then
+        grep -v '^$' "$PROXY_GROUPS_DIR/groups.txt" | sort -V 2>/dev/null || \
         grep -v '^$' "$PROXY_GROUPS_DIR/groups.txt" | sort -u
     fi
 }
