@@ -1790,6 +1790,41 @@ parse_proxy_url_to_json() {
                     ;;
             esac
             ;;
+        socks5|socks5h)
+            local srest="${url#*://}"
+            local spart="$srest"
+            local s_user="" s_pass=""
+            if [[ "$spart" == *"@"* ]]; then
+                local uinfo="${spart%%@*}"
+                spart="${spart#*@}"
+                if [[ "$uinfo" == *":"* ]]; then
+                    s_user="${uinfo%%:*}"
+                    s_pass="${uinfo#*:}"
+                else
+                    s_user="$uinfo"
+                fi
+            fi
+            local s_host="" s_port=""
+            if [[ "$spart" =~ ^\[([a-fA-F0-9:]+)\]:([0-9]+)$ ]]; then
+                s_host="${BASH_REMATCH[1]}"
+                s_port="${BASH_REMATCH[2]}"
+            elif [[ "$spart" =~ ^([-a-zA-Z0-9.]+):([0-9]+)$ ]]; then
+                s_host="${BASH_REMATCH[1]}"
+                s_port="${BASH_REMATCH[2]}"
+            else
+                s_host="$spart"
+                s_port="443"
+            fi
+            jq -n --arg tag "$tag" --arg server "$s_host" --argjson port "$s_port" --arg user "$s_user" --arg pass "$s_pass" '
+            {
+              "type": "socks",
+              "tag": $tag,
+              "server": $server,
+              "server_port": $port,
+              "version": "5"
+            } + (if $user != "" then {"username": $user} else {} end) + (if $pass != "" then {"password": $pass} else {} end)
+            '
+            ;;
         *)
             echo "ERROR: 不支持的协议: $proto"
             return 1
@@ -3230,6 +3265,232 @@ add_openrung_egress_group() {
     echo "============================================================"
 }
 
+# ============ URPool 中继建组 (按国家, 从 urpool API 获取 socks5 出口) ============
+add_urpool_egress_group() {
+    init_proxy_groups_dir
+
+    echo
+    green "==== 一键添加 URPool 中继节点 (按国家分类) ===="
+    yellow "[*] 需自行提供 URPool API 地址与 Token (不内置任何地址)"
+    echo
+    reading "请输入 URPool API 地址 (如 https://urnet.example.com): " up_api
+    up_api=$(echo "$up_api" | tr -d ' \r\n')
+    [[ -z "$up_api" ]] && { red "[!] API 地址不能为空"; return 1; }
+    reading "请输入 URPool API Token: " up_token
+    up_token=$(echo "$up_token" | tr -d ' \r\n')
+    [[ -z "$up_token" ]] && { red "[!] Token 不能为空"; return 1; }
+
+    echo
+    yellow "[*] 正在从 URPool API 获取国家列表..."
+    local countries_json
+    countries_json=$(curl -s --max-time 20 -H "Authorization: Bearer ${up_token}" "${up_api%/}/api/countries" 2>/dev/null)
+    if ! echo "$countries_json" | jq -e '.countries | type == "array"' >/dev/null 2>&1; then
+        red "[!] 获取国家列表失败 (API 地址/Token 错误或服务不可用)"
+        return 1
+    fi
+    local cc_count
+    cc_count=$(echo "$countries_json" | jq '.countries | length')
+    [[ "$cc_count" -eq 0 ]] && { red "[!] 当前无可选国家"; return 1; }
+
+    echo "------------------------------------------------------------"
+    echo "  共获取到 $cc_count 个国家:"
+    echo "------------------------------------------------------------"
+    local -a cc_list=() cn_list=()
+    local cc_idx=0
+    while IFS=$'\t' read -r ccc cnn pcc; do
+        [[ -z "$ccc" ]] && continue
+        cc_list+=("$ccc"); cn_list+=("$cnn")
+        ((cc_idx++))
+        yellow "  [$cc_idx] [$ccc] $cnn (providers: ${pcc:-0})"
+    done < <(echo "$countries_json" | jq -r '.countries[] | [.country_code, (.name // .country_code), (.provider_count // 0)] | @tsv')
+
+    echo "------------------------------------------------------------"
+    echo "  支持: 单个编号 (如 3) | 多个 (如 1,3,5) | 范围 (如 2-4) | 全部 (a)"
+    reading "  请选择要添加的国家: " sel
+    [[ -z "$sel" ]] && { red "[!] 未选择任何国家"; return 1; }
+
+    local -a pick_cc=()
+    if [[ "$sel" == "a" || "$sel" == "A" || "$sel" == "all" ]]; then
+        for ((i=0; i<${#cc_list[@]}; i++)); do pick_cc+=("$i"); done
+    else
+        local tok
+        local old_ifs="$IFS"; IFS=','
+        for tok in $sel; do
+            tok=$(echo "$tok" | tr -d ' ')
+            if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                local s="${BASH_REMATCH[1]}" e="${BASH_REMATCH[2]}"
+                for ((i=s; i<=e; i++)); do
+                    [[ $i -ge 1 && $i -le ${#cc_list[@]} ]] && pick_cc+=("$((i-1))")
+                done
+            elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+                [[ $tok -ge 1 && $tok -le ${#cc_list[@]} ]] && pick_cc+=("$((tok-1))")
+            fi
+        done
+        IFS="$old_ifs"
+    fi
+    [[ ${#pick_cc[@]} -eq 0 ]] && { red "[!] 选择无效"; return 1; }
+
+    local added=0 failed=0
+    for ci in "${pick_cc[@]}"; do
+        local ccc="${cc_list[$ci]}" cname="${cn_list[$ci]}"
+        local remark="URPool-${ccc}"
+        echo
+        yellow "[*] [$remark] 正在获取 ${cname} 出口代理..."
+        local proxy_json socks_url
+        proxy_json=$(curl -s --max-time 30 -H "Authorization: Bearer ${up_token}" "${up_api%/}/api/proxy?country=${ccc}" 2>/dev/null)
+        socks_url=$(echo "$proxy_json" | jq -r '.socks5 // empty' 2>/dev/null)
+        [[ -z "$socks_url" ]] && { red "[✗] [$remark] 获取代理失败"; ((failed++)); continue; }
+        socks_url=$(echo "$socks_url" | tr -d ' \r\n')
+
+        local group_tag
+        group_tag=$(generate_proxy_group_tag)
+        local out_json
+        out_json=$(validate_and_parse_proxy_url "$socks_url" "${group_tag}-out")
+        if [[ $? -ne 0 || -z "$out_json" ]]; then
+            red "[✗] [$remark] 代理解析失败"; ((failed++)); continue
+        fi
+
+        local gdir="${PROXY_GROUPS_DIR}/${group_tag}"
+        mkdir -p "$gdir"
+        echo "$remark"        > "$gdir/remark.txt"
+        echo "$ccc"           > "$gdir/country.txt"
+        echo "$up_api"        > "$gdir/urpool_api.txt"
+        echo "$up_token"      > "$gdir/urpool_token.txt"
+        echo "$socks_url"     > "$gdir/raw_url.txt"
+        echo "$out_json"      > "$gdir/outbound.json"
+        echo "$(date +%s)"    > "$gdir/urpool_ts.txt"
+
+        if sync_proxy_group_to_singbox "$group_tag"; then
+            if ! grep -qx "$group_tag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
+                echo "$group_tag" >> "$PROXY_GROUPS_DIR/groups.txt"
+            fi
+            apply_changes
+            green "[✓] $remark 建组成功! (标识: $group_tag)"
+            generate_proxy_group_links "$group_tag" 2>/dev/null
+            ((added++))
+        else
+            rm -rf "$gdir"; sed -i "/^${group_tag}$/d" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null || true
+            red "[✗] [$remark] 同步配置失败"; ((failed++))
+        fi
+    done
+
+    echo "============================================================"
+    green "  URPool 建组完成: 成功 $added 个国家, 失败 $failed 个"
+    cyan  "  自愈探测: 每分钟自动检测出口 IP, 失效自动从 URPool 换新 (rotate)"
+    echo "============================================================"
+}
+
+# ============ URPool 中继自愈探测 (挂 run_cron_check) ============
+urpool_health_check() {
+    local monitor_log="$WORKDIR/monitor.log"
+    local urpool_dir="$WORKDIR/urpool"
+    mkdir -p "$urpool_dir" 2>/dev/null || true
+
+    if [[ ! -d "$PROXY_GROUPS_DIR" ]]; then
+        return 0
+    fi
+
+    local lock_file="$urpool_dir/check.lock"
+    if [[ -f "$lock_file" ]]; then
+        local old_pid
+        old_pid=$(cat "$lock_file" 2>/dev/null)
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$lock_file"
+    fi
+    echo "$$" > "$lock_file"
+    trap 'rm -f "$lock_file"' EXIT
+
+    local -a up_groups=()
+    for gdir in "$PROXY_GROUPS_DIR"/*/; do
+        [[ -d "$gdir" ]] || continue
+        [[ -f "$gdir/urpool_api.txt" && -f "$gdir/outbound.json" ]] || continue
+        up_groups+=("$(basename "$gdir")")
+    done
+
+    if [[ ${#up_groups[@]} -eq 0 ]]; then
+        rm -f "$lock_file"; return 0
+    fi
+
+    local log_line="$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] 开始探测 ${#up_groups[@]} 个中继组"
+    echo "$log_line" >> "$monitor_log"
+    if [[ -f "$monitor_log" && $(wc -c < "$monitor_log" 2>/dev/null || echo 0) -gt 204800 ]]; then
+        tail -n 200 "$monitor_log" > "$monitor_log.tmp" 2>/dev/null && mv -f "$monitor_log.tmp" "$monitor_log" 2>/dev/null || true
+    fi
+
+    local changed=false
+    for tag in "${up_groups[@]}"; do
+        local gdir="${PROXY_GROUPS_DIR}/$tag"
+        local remark=$(cat "$gdir/remark.txt" 2>/dev/null || echo "$tag")
+
+        # 预热宽限期: URPool 新实例需 ~45s 预热, 期间跳过探测, 避免"建了又死、死了又建"循环
+        local now_ts
+        now_ts=$(date +%s)
+        local ts=$(cat "$gdir/urpool_ts.txt" 2>/dev/null || echo "0")
+        [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
+        if (( now_ts - ts < 90 )); then
+            continue
+        fi
+
+        local egress_ip ok
+        egress_ip=$(openrung_probe_egress_ip "$gdir")
+        ok=$?
+        if [[ $ok -eq 0 && -n "$egress_ip" ]]; then
+            echo "$egress_ip" > "$gdir/last_egress_ip.txt"
+            echo "$(date '+%Y-%m-%d %H:%M:%S')" > "$gdir/last_check_ok.txt"
+            continue
+        fi
+
+        local cc=$(cat "$gdir/country.txt" 2>/dev/null || echo "?")
+        local up_api=$(cat "$gdir/urpool_api.txt" 2>/dev/null || echo "")
+        local up_token=$(cat "$gdir/urpool_token.txt" 2>/dev/null || echo "")
+        if [[ -z "$up_api" || -z "$up_token" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 缺少 API 配置, 跳过" >> "$monitor_log"
+            continue
+        fi
+
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 出口失效, 正在从 URPool 换新..." >> "$monitor_log"
+        local new_url
+        new_url=$(curl -s --max-time 30 -X POST -H "Authorization: Bearer ${up_token}" "${up_api%/}/api/rotate?country=${cc}" 2>/dev/null | jq -r '.socks5 // empty' 2>/dev/null)
+        if [[ -z "$new_url" ]]; then
+            new_url=$(curl -s --max-time 30 -H "Authorization: Bearer ${up_token}" "${up_api%/}/api/proxy?country=${cc}" 2>/dev/null | jq -r '.socks5 // empty' 2>/dev/null)
+        fi
+        if [[ -z "$new_url" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 换新失败, 稍后重试" >> "$monitor_log"
+            continue
+        fi
+
+        local new_out
+        new_out=$(validate_and_parse_proxy_url "$new_url" "${tag}-out" 2>/dev/null)
+        if [[ -z "$new_out" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 新代理解析失败" >> "$monitor_log"
+            continue
+        fi
+
+        echo "$new_url" > "$gdir/raw_url.txt"
+        echo "$new_out" > "$gdir/outbound.json"
+        echo "$(date +%s)" > "$gdir/urpool_ts.txt"
+        rm -f "$gdir/last_egress_ip.txt"
+
+        if sync_proxy_group_to_singbox "$tag"; then
+            changed=true
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 已从 URPool 换新出口 $(echo "$new_url" | sed -E 's|^[a-zA-Z0-9]+://([^@]+)@([^:/]+):?([0-9]*).*|\2|')" >> "$monitor_log"
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] [$remark] 切换同步失败!" >> "$monitor_log"
+        fi
+        sleep 1
+    done
+
+    if $changed; then
+        apply_changes
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [URPool自愈] 配置已生效 (sing-box 已重启)" >> "$monitor_log"
+    fi
+
+    rm -f "$lock_file"
+    return 0
+}
+
 # ============ OpenRung 中继自愈探测 (每分钟) ============
 # 遍历所有 OpenRung 组, 逐个探测出口IP; 失效则切换同国备用中继
 openrung_health_check() {
@@ -3504,13 +3765,15 @@ proxy_egress_menu() {
         red    "  4. 删除代理节点组"
         blue   "  5. 重新同步代理配置"
         cyan   "  6. 一键添加 OpenRung 中继 (自动抓取/按国家建组/自愈)"
+        green  "  7. 一键添加 URPool 中继 (按国家分类, 失效自动换新)"
         echo "------------------------------------------------------------"
         red    "  0. 返回主菜单"
         echo "============================================================"
-        reading "请选择 [0-6]: " choice
+        reading "请选择 [0-7]: " choice
         case "$choice" in
             1) add_proxy_egress_group ;;
             6) add_openrung_egress_group ;;
+            7) add_urpool_egress_group ;;
             2)
                 for t in "${groups[@]}"; do generate_proxy_group_links "$t"; done
                 ;;
@@ -5044,6 +5307,7 @@ run_cron_check() {
 
     # OpenRung 中继自愈: 每分钟探测出口IP, 失效自动切换同国备用中继
     openrung_health_check
+    urpool_health_check
 }
 
 # ==================== 8. TCP / UDP / BBR 网络深度调优模块 ====================
