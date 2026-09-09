@@ -8995,7 +8995,9 @@ except: print('')" 2>/dev/null)
     org=$(echo "$j" | jq -r '.org // ""' 2>/dev/null)
     if [[ -z "$org" || "$org" == "null" ]]; then
         t="U"
-    elif echo "$org" | grep -qiE 'amazon|aws|google|microsoft|azure|ovh|hetzner|digitalocean|digital ocean|vultr|linode|akamai|cloudflare|fastly|contabo|m247|leaseweb|choopa|psychz|datapacket|hostinger|namecheap|ionos|scaleway|serverius|hivelocity|oracle|alibaba|tencent|huawei|ibm|rackspace|equinix|softlayer|godaddy|netlify|vercel|heroku|netcup|stackscale|datacamp|g-core|racknerd|colocrossing'; then
+    elif echo "$org" | grep -qiE 'hinet|chunghwa|china telecom|chinanet|china unicom|chinamobile|ntt |kddi|softbank|vodafone|comcast|verizon|t-mobile|tmobile|deutsche telekom|telekom|british telecom|sky uk|talktalk|virgin media|kt corp|sk telecom|singtel|starhub|telia|telenor|telstra|optus|telefonica|sfr|bouygues|korea telecom'; then
+        t="R"
+    elif echo "$org" | grep -qiE 'amazon|aws|google|microsoft|azure|ovh|hetzner|digitalocean|digital ocean|vultr|linode|akamai|cloudflare|fastly|contabo|m247|leaseweb|choopa|psychz|datapacket|hostinger|namecheap|ionos|scaleway|serverius|hivelocity|oracle|alibaba|tencent|huawei|ibm|rackspace|equinix|softlayer|godaddy|netlify|vercel|heroku|netcup|stackscale|datacamp|g-core|racknerd|colocrossing|hosting|datacenter|data center|colocation|vps|server|cloud|iomart|oneprovider|redstation|servercore|ucloud|globalit|firstheberg|interserver|internap|terrahost|xyun|idc'; then
         t="H"
     else
         t=$(curl -s --max-time 6 "https://ipwho.is/$ip" 2>/dev/null | jq -r '.type // ""' 2>/dev/null)
