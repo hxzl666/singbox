@@ -3273,12 +3273,36 @@ add_urpool_egress_group() {
     green "==== 一键添加 URPool 中继节点 (按国家分类) ===="
     yellow "[*] 需自行提供 URPool API 地址与 Token (不内置任何地址)"
     echo
-    reading "请输入 URPool API 地址 (如 https://urnet.example.com): " up_api
-    up_api=$(echo "$up_api" | tr -d ' \r\n')
-    [[ -z "$up_api" ]] && { red "[!] API 地址不能为空"; return 1; }
-    reading "请输入 URPool API Token: " up_token
-    up_token=$(echo "$up_token" | tr -d ' \r\n')
-    [[ -z "$up_token" ]] && { red "[!] Token 不能为空"; return 1; }
+
+    # 读取/保存 URPool API 配置 ($WORKDIR/urpool/api.txt 两行: 地址 / token)
+    local urpool_dir="$WORKDIR/urpool"
+    mkdir -p "$urpool_dir" 2>/dev/null || true
+    local up_api="" up_token=""
+    if [[ -f "$urpool_dir/api.txt" ]]; then
+        up_api=$(sed -n '1p' "$urpool_dir/api.txt" 2>/dev/null | tr -d ' \r\n')
+        up_token=$(sed -n '2p' "$urpool_dir/api.txt" 2>/dev/null | tr -d ' \r\n')
+    fi
+    if [[ -n "$up_api" ]]; then
+        yellow "[*] 检测到已保存的 URPool API: $up_api"
+        echo "  1. 使用已保存配置"
+        echo "  2. 重新输入 API 地址与 token"
+        reading "  请选择 [1-2, 默认1]: " api_choice
+        [[ -z "$api_choice" ]] && api_choice="1"
+        if [[ "$api_choice" != "1" ]]; then
+            up_api=""; up_token=""
+        fi
+    fi
+    if [[ -z "$up_api" ]]; then
+        reading "请输入 URPool API 地址 (如 https://urnet.example.com): " up_api
+        up_api=$(echo "$up_api" | tr -d ' \r\n')
+        [[ -z "$up_api" ]] && { red "[!] API 地址不能为空"; return 1; }
+        reading "请输入 URPool API Token: " up_token
+        up_token=$(echo "$up_token" | tr -d ' \r\n')
+        [[ -z "$up_token" ]] && { red "[!] Token 不能为空"; return 1; }
+        echo "$up_api"   > "$urpool_dir/api.txt"
+        echo "$up_token" >> "$urpool_dir/api.txt"
+    fi
+    up_api="${up_api%/}"
 
     echo
     yellow "[*] 正在从 URPool API 获取国家列表..."
