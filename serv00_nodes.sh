@@ -10211,7 +10211,23 @@ openrung_health_check() {
         local idx=$(cat "$gdir/active_idx.txt" 2>/dev/null || echo "0")
         local total=$(wc -l < "$gdir/relays.txt" 2>/dev/null || echo "0")
         [[ -z "$total" || "$total" -eq 0 ]] && total=0
+        # 家宽优先: 失效时从第 1 个节点起按序 TCP 探测, 选第一个可达的(R→H→U 排序 => 优先家宽, 避免单向轮换后永远回不来)
+        local __found=-1 __i __u __host __port
+        for ((__i=0; __i<total; __i++)); do
+            __u=$(sed -n "$((__i + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d ' \r\n')
+            [[ -z "$__u" ]] && continue
+            __host=$(echo "$__u" | sed -E 's|^[a-zA-Z0-9]+://[^@]*@([^:/]+).*|\1|')
+            __port=$(echo "$__u" | sed -E 's|^[a-zA-Z0-9]+://[^@]*@[^:/]+:([0-9]+).*|\1|')
+            if timeout 6 bash -c "cat < /dev/null > /dev/tcp/$__host/$__port" 2>/dev/null; then
+                __found=$__i
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 探测到可用节点 #$((__i+1)) $__host (共 $total), 回跳/切换" >> "$monitor_log"
+                break
+            fi
+        done
         local new_idx=$((idx + 1))
+        if [[ "$__found" -ge 0 ]]; then
+            new_idx=$__found
+        fi
         if [[ "$new_idx" -ge "$total" ]]; then
             new_idx=0
         fi

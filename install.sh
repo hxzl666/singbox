@@ -3674,8 +3674,25 @@ freevpn_health_check() {
             next_idx=0
             new_url=$(head -1 "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
         else
-            next_idx=$(( (active_idx + 1) % total ))
-            if [[ "$next_idx" -eq 0 ]]; then
+            # 家宽优先: 失效时从第 1 个节点起按序 TCP 探测, 选第一个可达的(R→H→U 排序 => 优先家宽, 避免单向轮换后永远回不来)
+            local __found=-1 __i __u __host __port
+            for ((__i=0; __i<total; __i++)); do
+                __u=$(sed -n "$((__i + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
+                [[ -z "$__u" ]] && continue
+                __host=$(echo "$__u" | sed -E 's|^[a-zA-Z0-9]+://[^@]*@([^:/]+).*|\1|')
+                __port=$(echo "$__u" | sed -E 's|^[a-zA-Z0-9]+://[^@]*@[^:/]+:([0-9]+).*|\1|')
+                if timeout 6 bash -c "cat < /dev/null > /dev/tcp/$__host/$__port" 2>/dev/null; then
+                    __found=$__i
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 探测到可用节点 #$((__i+1)) $__host (共 $total), 回跳/切换" >> "$monitor_log"
+                    break
+                fi
+            done
+            if [[ "$__found" -ge 0 ]]; then
+                next_idx=$__found
+            else
+                next_idx=$(( (active_idx + 1) % total ))
+            fi
+            if [[ "$next_idx" -eq 0 && "${__found:-}" != "0" ]]; then
                 # 转完一整圈 → 全部失效 → 重新拉取该国家节点
                 last_reload=$(cat "$gdir/reload_ts.txt" 2>/dev/null || echo "0")
                 now_s=$(date +%s)
