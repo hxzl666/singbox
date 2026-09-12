@@ -3909,23 +3909,47 @@ freevpn_health_check() {
             next_idx=0
             new_url=$(head -1 "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
         else
-            # 家宽优先: 失效时从第 1 个节点起按序 TCP 探测, 选第一个可达的(R→H→U 排序 => 优先家宽, 避免单向轮换后永远回不来)
-            local __found=-1 __i __u __host __port
+            # 真实代理探测: 逐个节点用 openrung_probe_egress_ip 验证能通(不只是TCP端口通)
+            local __found=-1 __i __u __probe_start
+            __probe_start=$(date +%s)
             for ((__i=0; __i<total; __i++)); do
                 __u=$(sed -n "$((__i + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
                 [[ -z "$__u" ]] && continue
+                # 总超时保护: 超过 100 秒强制停止(下轮 cron 会继续)
+                if (( $(date +%s) - __probe_start > 100 )); then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 探测总超时(100s), 停止本轮" >> "$monitor_log"
+                    break
+                fi
+                # 先快速 TCP 检测(6秒超时),不通直接跳过,省得启动 sing-box 探测
+                local __host __port
                 __host=$(echo "$__u" | sed -E 's|^[a-zA-Z0-9]+://[^@]*@([^:/]+).*|\1|')
                 __port=$(echo "$__u" | sed -E 's|^[a-zA-Z0-9]+://[^@]*@[^:/]+:([0-9]+).*|\1|')
-                if timeout 6 bash -c "cat < /dev/null > /dev/tcp/$__host/$__port" 2>/dev/null; then
+                if ! timeout 6 bash -c "cat < /dev/null > /dev/tcp/$__host/$__port" 2>/dev/null; then
+                    continue
+                fi
+                # TCP 通了,再用真实代理探测验证能否拿到出口IP
+                local __probe_out __probe_ip __probe_ok
+                __probe_out=$(validate_and_parse_proxy_url "$__u" "probe-${tag}-${__i}" 2>/dev/null)
+                [[ -z "$__probe_out" ]] && continue
+                # 临时写入探测目录
+                local __probe_dir
+                __probe_dir=$(mktemp -d /tmp/fv-probe-XXXXXX 2>/dev/null) || continue
+                echo "$__probe_out" > "$__probe_dir/outbound.json"
+                __probe_ip=$(openrung_probe_egress_ip "$__probe_dir" 2>/dev/null)
+                __probe_ok=$?
+                rm -rf "$__probe_dir" 2>/dev/null || true
+                if [[ $__probe_ok -eq 0 && -n "$__probe_ip" ]]; then
                     __found=$__i
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 探测到可用节点 #$((__i+1)) $__host (共 $total), 回跳/切换" >> "$monitor_log"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 真实探测通过节点 #$((__i+1)) $__host (出口: $__probe_ip, 共 $total)" >> "$monitor_log"
                     break
                 fi
             done
             if [[ "$__found" -ge 0 ]]; then
                 next_idx=$__found
             else
+                # 全部节点真实探测失败 → 重新拉取
                 next_idx=$(( (active_idx + 1) % total ))
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 全部 $total 个节点真实探测失败, 尝试重新拉取" >> "$monitor_log"
             fi
             if [[ "$next_idx" -eq 0 && "${__found:-}" != "0" ]]; then
                 # 转完一整圈 → 全部失效 → 重新拉取该国家节点
@@ -3945,8 +3969,38 @@ freevpn_health_check() {
                     fi
                 fi
                 if $reloaded; then
-                    next_idx=0
-                    new_url=$(head -1 "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
+                    # 新拉取的节点也要逐个真实探测,选第一个能通的
+                    local __ri __ru __rhost __rport __rprobe_out __rprobe_ip __rprobe_ok __rprobe_dir
+                    local __rfound=-1
+                    total=$(grep -c '://' "$gdir/relays.txt" 2>/dev/null || echo 0)
+                    for ((__ri=0; __ri<total; __ri++)); do
+                        __ru=$(sed -n "$((__ri + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
+                        [[ -z "$__ru" ]] && continue
+                        __rhost=$(echo "$__ru" | sed -E 's|^[a-zA-Z0-9]+://[^@]*@([^:/]+).*|\1|')
+                        __rport=$(echo "$__ru" | sed -E 's|^[a-zA-Z0-9]+://[^@]*@[^:/]+:([0-9]+).*|\1|')
+                        if ! timeout 6 bash -c "cat < /dev/null > /dev/tcp/$__rhost/$__rport" 2>/dev/null; then
+                            continue
+                        fi
+                        __rprobe_out=$(validate_and_parse_proxy_url "$__ru" "probe-${tag}-r-$__ri" 2>/dev/null)
+                        [[ -z "$__rprobe_out" ]] && continue
+                        __rprobe_dir=$(mktemp -d /tmp/fv-probe-XXXXXX 2>/dev/null) || continue
+                        echo "$__rprobe_out" > "$__rprobe_dir/outbound.json"
+                        __rprobe_ip=$(openrung_probe_egress_ip "$__rprobe_dir" 2>/dev/null)
+                        __rprobe_ok=$?
+                        rm -rf "$__rprobe_dir" 2>/dev/null || true
+                        if [[ $__rprobe_ok -eq 0 && -n "$__rprobe_ip" ]]; then
+                            __rfound=$__ri
+                            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 新拉取节点 #$((__ri+1)) $__rhost 真实探测通过 (出口: $__rprobe_ip)" >> "$monitor_log"
+                            break
+                        fi
+                    done
+                    if [[ "$__rfound" -ge 0 ]]; then
+                        next_idx=$__rfound
+                        new_url=$(sed -n "$((next_idx + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d '\r')
+                    else
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 新拉取的 $total 个节点全部探测失败, 稍后再试" >> "$monitor_log"
+                        continue
+                    fi
                 else
                     echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 组内全部节点失效, 订阅刷新受限, 稍后再试" >> "$monitor_log"
                     continue
@@ -4009,11 +4063,13 @@ openrung_health_check() {
     echo "$$" > "$lock_file"
     trap 'rm -f "$lock_file"' EXIT
 
-    # 遍历所有代理组, 找 OpenRung 组 (有 country.txt + relays.txt 标记)
+    # 遍历所有代理组, 找 OpenRung 组 (有 country.txt + relays.txt 标记, 且非 FreeVPN 组)
     local -a or_groups=()
     for gdir in "$PROXY_GROUPS_DIR"/*/; do
         [[ -d "$gdir" ]] || continue
-        [[ -f "$gdir/country.txt" && -f "$gdir/relays.txt" ]] || continue
+        [[ -f "${gdir}country.txt" && -f "${gdir}relays.txt" ]] || continue
+        # 排除 FreeVPN 组 (有 freevpn_api.txt 的由 freevpn_health_check 管, 避免双自愈打架)
+        [[ -f "${gdir}freevpn_api.txt" ]] && continue
         or_groups+=("$(basename "$gdir")")
     done
 
@@ -4046,31 +4102,57 @@ openrung_health_check() {
             continue
         fi
 
-        # 失效: 切换到该国下一个备用中继
+        # 失效: 遍历备用中继,逐个真实探测,选第一个能通的
         local cc=$(cat "$gdir/country.txt" 2>/dev/null || echo "?")
         local idx=$(cat "$gdir/active_idx.txt" 2>/dev/null || echo "0")
         local total=$(wc -l < "$gdir/relays.txt" 2>/dev/null || echo "0")
         [[ -z "$total" || "$total" -eq 0 ]] && total=0
-        local new_idx=$((idx + 1))
-        if [[ "$new_idx" -ge "$total" ]]; then
-            new_idx=0  # 备用用完则重头轮询 (下次探测再失败会重抓)
+        local new_idx=-1 new_url="" new_out=""
+
+        if [[ "$total" -gt 0 ]]; then
+            local __i __u __host __port __probe_out __probe_ip __probe_ok __probe_dir __probe_start
+            __probe_start=$(date +%s)
+            for ((__i=0; __i<total; __i++)); do
+                # 跳过当前已失效的节点
+                [[ "$__i" -eq "$idx" ]] && continue
+                __u=$(sed -n "$((__i + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d ' \r\n')
+                [[ -z "$__u" ]] && continue
+                # 总超时保护
+                if (( $(date +%s) - __probe_start > 100 )); then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 探测总超时(100s), 停止本轮" >> "$monitor_log"
+                    break
+                fi
+                __host=$(echo "$__u" | sed -E 's|^[a-zA-Z0-9]+://[^@]*@([^:/]+).*|\1|')
+                __port=$(echo "$__u" | sed -E 's|^[a-zA-Z0-9]+://[^@]*@[^:/]+:([0-9]+).*|\1|')
+                # 先 TCP 快检
+                if ! timeout 6 bash -c "cat < /dev/null > /dev/tcp/$__host/$__port" 2>/dev/null; then
+                    continue
+                fi
+                # 再真实代理探测
+                __probe_out=$(validate_and_parse_proxy_url "$__u" "probe-${tag}-${__i}" 2>/dev/null)
+                [[ -z "$__probe_out" ]] && continue
+                __probe_dir=$(mktemp -d /tmp/or-probe-XXXXXX 2>/dev/null) || continue
+                echo "$__probe_out" > "$__probe_dir/outbound.json"
+                __probe_ip=$(openrung_probe_egress_ip "$__probe_dir" 2>/dev/null)
+                __probe_ok=$?
+                rm -rf "$__probe_dir" 2>/dev/null || true
+                if [[ $__probe_ok -eq 0 && -n "$__probe_ip" ]]; then
+                    new_idx=$__i
+                    new_url="$__u"
+                    new_out="$__probe_out"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 真实探测通过备用 #$((__i+1)) $__host (出口: $__probe_ip)" >> "$monitor_log"
+                    break
+                fi
+            done
         fi
 
-        local new_url
-        new_url=$(sed -n "$((new_idx + 1))p" "$gdir/relays.txt" 2>/dev/null | tr -d ' \r\n')
-        if [[ -z "$new_url" ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 探测失败且无备用中继, 跳过" >> "$monitor_log"
+        if [[ "$new_idx" -lt 0 || -z "$new_url" || -z "$new_out" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 全部备用中继真实探测失败, 跳过" >> "$monitor_log"
             continue
         fi
 
-        # 重新解析并应用
-        local new_out
-        new_out=$(validate_and_parse_proxy_url "$new_url" "${tag}-out" 2>/dev/null)
-        if [[ -z "$new_out" ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 备用中继解析失败, 跳过" >> "$monitor_log"
-            continue
-        fi
-
+        # 确保 outbound.json 的 tag 正确 (探测时用的是临时 tag)
+        new_out=$(echo "$new_out" | jq -c --arg t "${tag}-out" '.tag = $t' 2>/dev/null)
         echo "$new_url" > "$gdir/raw_url.txt"
         echo "$new_out" > "$gdir/outbound.json"
         echo "$new_idx" > "$gdir/active_idx.txt"
@@ -4078,7 +4160,7 @@ openrung_health_check() {
 
         if sync_proxy_group_to_singbox "$tag"; then
             changed=true
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 中继失效, 已自动切换至备用 #$((new_idx+1)): $(echo "$new_url" | sed -E 's|^[a-zA-Z0-9]+://([^@]+)@([^:/]+):?([0-9]*).*|\2|')" >> "$monitor_log"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 中继失效, 已自动切换至真实探测通过的备用 #$((new_idx+1)): $(echo "$new_url" | sed -E 's|^[a-zA-Z0-9]+://([^@]+)@([^:/]+):?([0-9]*).*|\2|')" >> "$monitor_log"
         else
             echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 切换同步失败!" >> "$monitor_log"
         fi
