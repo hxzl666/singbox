@@ -4693,6 +4693,7 @@ add_openvpn_egress_group() {
     [[ -z "$proto_sel" ]] && proto_sel="4"
 
     local created_count=0
+    local -a current_created_tags=()
 
     # 遍历每个指定的国家，分别创建独立节点池
     for each_cc in "${final_ccs[@]}"; do
@@ -4884,6 +4885,7 @@ OB_EOF
                 echo "$group_tag" >> "$PROXY_GROUPS_DIR/groups.txt"
             fi
             ((created_count++))
+            current_created_tags+=("$group_tag")
             green "[✓] 国家 [$each_cc] 出站组 [$group_remark] 添加成功！"
         else
             red "[!] 国家 [$each_cc] 同步 Sing-box 失败，回滚清理..."
@@ -4901,10 +4903,8 @@ OB_EOF
         green "============================================================"
         green " [✓] 成功创建并上线 $created_count 个国家/地区的 OpenVPN 用户态节点池！"
         green "============================================================"
-        for gt in $(get_all_proxy_groups); do
-            if [[ -f "${PROXY_GROUPS_DIR}/$gt/is_openvpn.txt" ]]; then
-                generate_proxy_group_links "$gt"
-            fi
+        for gt in "${current_created_tags[@]}"; do
+            generate_proxy_group_links "$gt"
         done
     else
         yellow "未创建任何 OpenVPN 出站组"
