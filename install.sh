@@ -4341,7 +4341,8 @@ generate_proxy_group_links() {
 
 
 
-# ==================== OpenVPN 用户态 (Mihomo) 出站模块 ====================
+
+# ==================== OpenVPN 用户态 (Mihomo) 出站模块 (纯 Bash 零 Python 依赖版) ====================
 
 ensure_mihomo_installed() {
     if [[ -x /usr/local/bin/mihomo ]] && /usr/local/bin/mihomo -v >/dev/null 2>&1; then
@@ -4388,70 +4389,56 @@ ensure_mihomo_installed() {
     fi
 }
 
-# 辅助函数: 解析单个 .ovpn 文本并生成 Mihomo proxy YAML 片段
+# 辅助函数: 纯 Bash 解析单个 .ovpn 文本并生成 Mihomo proxy YAML 片段
 parse_single_ovpn_to_yaml() {
     local ovpn_source="$1"
     local node_name="$2"
-    python3 -c "
-import sys, re
+    local txt=""
+    if [[ -f "$ovpn_source" ]]; then
+        txt=$(cat "$ovpn_source" 2>/dev/null | tr -d '\r')
+    else
+        txt=$(printf '%s' "$ovpn_source" | tr -d '\r')
+    fi
+    [[ -z "$txt" ]] && return 1
 
-src = '''$ovpn_source'''
-if '\n' not in src and len(src) < 500:
-    try:
-        with open(src, 'r', encoding='utf-8', errors='ignore') as f:
-            text = f.read()
-    except Exception:
-        text = src
-else:
-    text = src
+    local proto=$(echo "$txt" | awk '/^[ \t]*proto[ \t]+/{print tolower($2); exit}')
+    proto="${proto:-tcp}"
 
-proto_m = re.search(r'^[ \\t]*proto[ \\t]+(\\S+)', text, re.M)
-proto = proto_m.group(1).lower() if proto_m else 'tcp'
+    local srv_port=$(echo "$txt" | awk '/^[ \t]*remote[ \t]+/{print $2, $3; exit}')
+    local srv=$(echo "$srv_port" | awk '{print $1}')
+    local port=$(echo "$srv_port" | awk '{print $2}')
+    [[ -z "$srv" || -z "$port" ]] && return 1
 
-remote_m = re.search(r'^[ \\t]*remote[ \\t]+(\\S+)[ \\t]+(\\d+)', text, re.M)
-if not remote_m:
-    sys.exit(1)
+    local cipher=$(echo "$txt" | awk '/^[ \t]*cipher[ \t]+/{print $2; exit}')
+    local auth=$(echo "$txt" | awk '/^[ \t]*auth[ \t]+/{print $2; exit}')
 
-server = remote_m.group(1)
-port = int(remote_m.group(2))
+    echo "  - name: \"${node_name}\""
+    echo "    type: openvpn"
+    echo "    server: \"${srv}\""
+    echo "    port: ${port}"
+    echo "    proto: ${proto}"
+    echo "    username: \"vpn\""
+    echo "    password: \"vpn\""
+    echo "    cipher: \"${cipher:-AES-128-CBC}\""
+    echo "    auth: \"${auth:-SHA1}\""
+    echo "    remote-dns-resolve: true"
 
-cipher_m = re.search(r'^[ \\t]*cipher[ \\t]+(\\S+)', text, re.M)
-cipher = cipher_m.group(1) if cipher_m else 'AES-128-CBC'
+    local ca_block=$(echo "$txt" | sed -n '/<ca>/,/<\/ca>/p' | grep -v '<.*ca>' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -v '^$')
+    local cert_block=$(echo "$txt" | sed -n '/<cert>/,/<\/cert>/p' | grep -v '<.*cert>' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -v '^$')
+    local key_block=$(echo "$txt" | sed -n '/<key>/,/<\/key>/p' | grep -v '<.*key>' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -v '^$')
 
-auth_m = re.search(r'^[ \\t]*auth[ \\t]+(\\S+)', text, re.M)
-auth = auth_m.group(1) if auth_m else 'SHA1'
-
-ca_m = re.search(r'<ca>([\\s\\S]*?)<\/ca>', text)
-cert_m = re.search(r'<cert>([\\s\\S]*?)<\/cert>', text)
-key_m = re.search(r'<key>([\\s\\S]*?)<\/key>', text)
-
-ca = ca_m.group(1).strip() if ca_m else ''
-cert = cert_m.group(1).strip() if cert_m else ''
-key = key_m.group(1).strip() if key_m else ''
-
-def indent(s, spaces=6):
-    return '\n'.join(' ' * spaces + line.strip() for line in s.splitlines() if line.strip())
-
-node = f'''  - name: \"{sys.argv[1]}\"
-    type: openvpn
-    server: \"{server}\"
-    port: {port}
-    proto: {proto}
-    username: \"vpn\"
-    password: \"vpn\"
-    cipher: \"{cipher}\"
-    auth: \"{auth}\"
-    remote-dns-resolve: true'''
-
-if ca:
-    node += f'''\n    ca: |-\n{indent(ca)}'''
-if cert:
-    node += f'''\n    cert: |-\n{indent(cert)}'''
-if key:
-    node += f'''\n    key: |-\n{indent(key)}'''
-
-print(node)
-" "$node_name" 2>/dev/null
+    if [[ -n "$ca_block" ]]; then
+        echo "    ca: |-"
+        echo "$ca_block" | sed 's/^/      /'
+    fi
+    if [[ -n "$cert_block" ]]; then
+        echo "    cert: |-"
+        echo "$cert_block" | sed 's/^/      /'
+    fi
+    if [[ -n "$key_block" ]]; then
+        echo "    key: |-"
+        echo "$key_block" | sed 's/^/      /'
+    fi
 }
 
 add_openvpn_egress_group() {
@@ -4461,6 +4448,7 @@ add_openvpn_egress_group() {
     green "  添加 OpenVPN 出站节点池 (Mihomo 用户态免 TUN 运行)"
     green "============================================================"
     yellow "  特性: 纯用户态运行，无需 tun 虚拟网卡，完全不影响宿主机网络与 SSH"
+    yellow "        纯 Bash 脚本驱动，零 Python 依赖，适合任意小内存低配服务器"
     yellow "        支持指定/自动归类国家（JP/KR/US等），每国独立组池自动故障转移"
     yellow "        底层由 Mihomo 托管多节点 fallback，上游由 Sing-box 提供本地多协议入站"
     green "============================================================"
@@ -4480,110 +4468,92 @@ add_openvpn_egress_group() {
     [[ -z "$src_choice" ]] && src_choice="1"
 
     # 数据暂存目录
-    local vpngate_dump_json="/tmp/vpngate_nodes_by_cc.json"
-    rm -f "$vpngate_dump_json"
-
-    local -A country_proxies_map
+    local vg_tmp_dir=$(mktemp -d /tmp/vg_box_XXXXXX)
+    mkdir -p "$vg_tmp_dir/countries"
     local -a available_ccs=()
+    local -a final_ccs=()
 
     case "$src_choice" in
         1)
-            yellow "[*] 正在从 VPN Gate 抓取最新真实家宽节点清单并自动归类国家..."
-            python3 -c "
-import urllib.request, base64, re, sys, json
+            yellow "[*] 正在从 VPN Gate 抓取最新真实家宽节点清单并自动归类国家 (纯 Bash 处理)..."
+            local raw_csv
+            raw_csv=$(curl -fsSL --max-time 15 "http://www.vpngate.net/api/iphone/" 2>/dev/null)
+            [[ -z "$raw_csv" ]] && raw_csv=$(curl -fsSL --max-time 15 "https://www.vpngate.net/api/iphone/" 2>/dev/null)
 
-urls = ['http://www.vpngate.net/api/iphone/', 'https://www.vpngate.net/api/iphone/']
-raw = ''
-for u in urls:
-    try:
-        req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=12) as r:
-            raw = r.read().decode('utf-8', errors='ignore')
-            if raw: break
-    except Exception:
-        pass
-
-if not raw:
-    sys.exit(1)
-
-servers_by_cc = {}
-for line in raw.splitlines():
-    line = line.strip()
-    if not line or line.startswith('*') or line.startswith('#'): continue
-    parts = line.split(',')
-    if len(parts) >= 15:
-        # 排除官方机房前缀与网段，只留纯家宽
-        if parts[0].startswith('public-vpn') or parts[1].startswith('219.100.37.'):
-            continue
-        try:
-            sp = int(parts[4])
-        except Exception:
-            sp = 0
-        cc = (parts[6] or 'XX').upper()
-        if len(cc) != 2: cc = 'XX'
-
-        try:
-            txt = base64.b64decode(parts[14]).decode('utf-8', errors='ignore')
-        except Exception:
-            continue
-        proto_m = re.search(r'^[ \\t]*proto[ \\t]+(\\S+)', txt, re.M)
-        proto = proto_m.group(1).lower() if proto_m else 'tcp'
-        if proto != 'tcp': continue
-
-        remote_m = re.search(r'^[ \\t]*remote[ \\t]+(\\S+)[ \\t]+(\\d+)', txt, re.M)
-        if not remote_m: continue
-        server, port = remote_m.group(1), int(remote_m.group(2))
-
-        cipher_m = re.search(r'^[ \\t]*cipher[ \\t]+(\\S+)', txt, re.M)
-        cipher = cipher_m.group(1) if cipher_m else 'AES-128-CBC'
-        auth_m = re.search(r'^[ \\t]*auth[ \\t]+(\\S+)', txt, re.M)
-        auth = auth_m.group(1) if auth_m else 'SHA1'
-
-        ca_m = re.search(r'<ca>([\\s\\S]*?)<\/ca>', txt)
-        cert_m = re.search(r'<cert>([\\s\\S]*?)<\/cert>', txt)
-        key_m = re.search(r'<key>([\\s\\S]*?)<\/key>', txt)
-
-        ca = ca_m.group(1).strip() if ca_m else ''
-        cert = cert_m.group(1).strip() if cert_m else ''
-        key = key_m.group(1).strip() if key_m else ''
-
-        if cc not in servers_by_cc:
-            servers_by_cc[cc] = []
-
-        servers_by_cc[cc].append({
-            'server': server,
-            'port': port,
-            'speed': sp,
-            'cipher': cipher,
-            'auth': auth,
-            'ca': ca,
-            'cert': cert,
-            'key': key
-        })
-
-if not servers_by_cc:
-    sys.exit(2)
-
-# 各国节点按测速倒序排序
-for cc in servers_by_cc:
-    servers_by_cc[cc].sort(key=lambda x: x['speed'], reverse=True)
-
-with open('$vpngate_dump_json', 'w', encoding='utf-8') as f:
-    json.dump(servers_by_cc, f)
-"
-            if [[ $? -ne 0 || ! -s "$vpngate_dump_json" ]]; then
-                red "[!] 抓取 VPN Gate 节点失败或未发现可用 TCP 节点"
-                rm -f "$vpngate_dump_json"
+            if [[ -z "$raw_csv" ]]; then
+                red "[!] 无法连接 VPN Gate 官方节点清单接口，请检查服务器海外网络！"
+                rm -rf "$vg_tmp_dir"
                 return 1
             fi
 
-            # 读取国家列表
-            mapfile -t available_ccs < <(python3 -c "import json; d=json.load(open('$vpngate_dump_json')); print('\n'.join(sorted(d.keys())))")
+            # 1. 过滤并按速度排序 (纯 Bash + sort)
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                line=$(echo "$line" | tr -d '\r')
+                [[ -z "$line" || "$line" == "#"* || "$line" == "*"* ]] && continue
+
+                local b64="${line##*,}"
+                local h_name ip score ping speed c_long c_short rest
+                IFS=',' read -r h_name ip score ping speed c_long c_short rest <<< "$line"
+
+                # 排除官方机房
+                [[ "$h_name" == public-vpn* || "$ip" == 219.100.37.* ]] && continue
+                [[ -z "$b64" || ${#b64} -lt 100 ]] && continue
+
+                local cc="${c_short^^}"
+                [[ ${#cc} -ne 2 ]] && cc="XX"
+                [[ ! "$speed" =~ ^[0-9]+$ ]] && speed=0
+
+                echo -e "${speed}\t${cc}\t${b64}" >> "$vg_tmp_dir/candidates.tsv"
+            done <<< "$raw_csv"
+
+            if [[ ! -s "$vg_tmp_dir/candidates.tsv" ]]; then
+                red "[!] 未发现可用的真实家庭宽带节点"
+                rm -rf "$vg_tmp_dir"
+                return 1
+            fi
+
+            sort -t$'\t' -k1,1nr "$vg_tmp_dir/candidates.tsv" > "$vg_tmp_dir/sorted.tsv"
+
+            # 2. 挑选 TCP 节点写入对应国家文件 (每国最多取 15 个最快节点)
+            while IFS=$'\t' read -r speed cc b64; do
+                local ovpn_txt
+                ovpn_txt=$(echo "$b64" | base64 -d 2>/dev/null | tr -d '\r' || true)
+                [[ -z "$ovpn_txt" ]] && continue
+
+                local proto
+                proto=$(echo "$ovpn_txt" | awk '/^[ \t]*proto[ \t]+/{print tolower($2); exit}')
+                [[ "${proto:-tcp}" != "tcp" ]] && continue
+
+                local remote_line
+                remote_line=$(echo "$ovpn_txt" | awk '/^[ \t]*remote[ \t]+/{print $2, $3; exit}')
+                [[ -z "$remote_line" ]] && continue
+
+                local srv=$(echo "$remote_line" | awk '{print $1}')
+                local port=$(echo "$remote_line" | awk '{print $2}')
+                [[ -z "$srv" || -z "$port" ]] && continue
+
+                local cc_file="$vg_tmp_dir/countries/${cc}.txt"
+                if [[ -f "$cc_file" && $(wc -l < "$cc_file") -ge 15 ]]; then
+                    continue
+                fi
+
+                echo "$b64" >> "$cc_file"
+            done < "$vg_tmp_dir/sorted.tsv"
+
+            # 统计提取出的国家列表
+            for f in "$vg_tmp_dir/countries"/*.txt; do
+                [[ -f "$f" ]] || continue
+                available_ccs+=("$(basename "$f" .txt)")
+            done
+
             if [[ ${#available_ccs[@]} -eq 0 ]]; then
-                red "[!] 未解析出可用国家"
-                rm -f "$vpngate_dump_json"
+                red "[!] 未能解析出任何可用的 TCP 家宽节点"
+                rm -rf "$vg_tmp_dir"
                 return 1
             fi
+
+            # 按字母序排序国家代码
+            mapfile -t available_ccs < <(printf '%s\n' "${available_ccs[@]}" | sort)
 
             echo "------------------------------------------------------------"
             echo "  VPN Gate 当前可用家宽国家分类 (共 ${#available_ccs[@]} 个国家/地区):"
@@ -4591,7 +4561,7 @@ with open('$vpngate_dump_json', 'w', encoding='utf-8') as f:
             for cc_item in "${available_ccs[@]}"; do
                 ((ci++))
                 local c_name=$(get_country_name "$cc_item")
-                local c_count=$(python3 -c "import json; d=json.load(open('$vpngate_dump_json')); print(len(d.get('$cc_item', [])))")
+                local c_count=$(wc -l < "$vg_tmp_dir/countries/${cc_item}.txt")
                 green "  [$ci] [$cc_item] ${c_name} (共 ${c_count} 个家宽节点)"
             done
             echo "------------------------------------------------------------"
@@ -4638,8 +4608,6 @@ with open('$vpngate_dump_json', 'w', encoding='utf-8') as f:
                 IFS="$old_ifs"
             fi
 
-            # 去重
-            local -a final_ccs=()
             for cc_it in "${selected_ccs[@]}"; do
                 if ! printf '%s\n' "${final_ccs[@]}" | grep -qx "$cc_it" 2>/dev/null; then
                     final_ccs+=("$cc_it")
@@ -4648,42 +4616,41 @@ with open('$vpngate_dump_json', 'w', encoding='utf-8') as f:
 
             if [[ ${#final_ccs[@]} -eq 0 ]]; then
                 red "[!] 未匹配到有效国家"
-                rm -f "$vpngate_dump_json"
+                rm -rf "$vg_tmp_dir"
                 return 1
             fi
             ;;
 
         2)
             reading "请输入本地 .ovpn 文件或目录的完整绝对路径: " local_path
-            reading "请指定该节点所属的国家代码 (如 JP, KR, US, 默认根据文件名或设为AUTO): " specified_cc
+            reading "请指定该节点所属的国家代码 (如 JP, KR, US, 默认设为CUSTOM): " specified_cc
             specified_cc="${specified_cc^^}"
             [[ -z "$specified_cc" ]] && specified_cc="CUSTOM"
 
-            local tmp_single_nodes=$(mktemp)
+            local tmp_cc_file="$vg_tmp_dir/countries/${specified_cc}.txt"
             local node_idx=1
             if [[ -d "$local_path" ]]; then
                 for f in "$local_path"/*.ovpn; do
                     [[ -f "$f" ]] || continue
-                    local n_name="ovpn-${specified_cc}-${node_idx}"
-                    local p_yaml=$(parse_single_ovpn_to_yaml "$f" "$n_name")
+                    local p_yaml=$(parse_single_ovpn_to_yaml "$f" "ovpn-${specified_cc}-${node_idx}")
                     if [[ -n "$p_yaml" ]]; then
-                        echo "$p_yaml" >> "$tmp_single_nodes"
+                        echo "$p_yaml" >> "$tmp_cc_file.yaml"
                         ((node_idx++))
                     fi
                 done
             elif [[ -f "$local_path" ]]; then
                 local p_yaml=$(parse_single_ovpn_to_yaml "$local_path" "ovpn-${specified_cc}-01")
                 if [[ -n "$p_yaml" ]]; then
-                    echo "$p_yaml" >> "$tmp_single_nodes"
+                    echo "$p_yaml" >> "$tmp_cc_file.yaml"
                 fi
             else
                 red "[!] 文件或路径不存在: $local_path"
-                rm -f "$tmp_single_nodes"
+                rm -rf "$vg_tmp_dir"
                 return 1
             fi
-            if [[ ! -s "$tmp_single_nodes" ]]; then
+            if [[ ! -s "$tmp_cc_file.yaml" ]]; then
                 red "[!] 未解析到有效 OpenVPN 节点"
-                rm -f "$tmp_single_nodes"
+                rm -rf "$vg_tmp_dir"
                 return 1
             fi
             final_ccs=("$specified_cc")
@@ -4701,14 +4668,14 @@ with open('$vpngate_dump_json', 'w', encoding='utf-8') as f:
                 raw_input=$(cat /tmp/ovpn_dec.txt)
                 rm -f /tmp/ovpn_dec.txt
             fi
-            local tmp_single_nodes=$(mktemp)
+            local tmp_cc_file="$vg_tmp_dir/countries/${specified_cc}.txt"
             local p_yaml=$(parse_single_ovpn_to_yaml "$raw_input" "ovpn-${specified_cc}-01")
             if [[ -n "$p_yaml" ]]; then
-                echo "$p_yaml" >> "$tmp_single_nodes"
+                echo "$p_yaml" >> "$tmp_cc_file.yaml"
             fi
-            if [[ ! -s "$tmp_single_nodes" ]]; then
+            if [[ ! -s "$tmp_cc_file.yaml" ]]; then
                 red "[!] 解析失败，请检查 .ovpn 配置格式"
-                rm -f "$tmp_single_nodes"
+                rm -rf "$vg_tmp_dir"
                 return 1
             fi
             final_ccs=("$specified_cc")
@@ -4740,48 +4707,53 @@ with open('$vpngate_dump_json', 'w', encoding='utf-8') as f:
         local proxy_names=()
 
         if [[ "$src_choice" == "1" ]]; then
-            # 从抓取到的 JSON 提取该国前 15 个速度最快的节点生成 YAML
-            python3 -c "
-import json
+            # 纯 Bash 提取该国前 15 个节点生成 YAML
+            local c_source_file="$vg_tmp_dir/countries/${each_cc}.txt"
+            local c_idx=0
+            while IFS= read -r node_b64 || [[ -n "$node_b64" ]]; do
+                ((c_idx++))
+                local node_txt
+                node_txt=$(echo "$node_b64" | base64 -d 2>/dev/null | tr -d '\r' || true)
+                [[ -z "$node_txt" ]] && continue
 
-cc = '$each_cc'
-data = json.load(open('$vpngate_dump_json'))
-nodes = data.get(cc, [])[:15]
+                local srv_port=$(echo "$node_txt" | awk '/^[ \t]*remote[ \t]+/{print $2, $3; exit}')
+                local srv=$(echo "$srv_port" | awk '{print $1}')
+                local port=$(echo "$srv_port" | awk '{print $2}')
+                local cipher=$(echo "$node_txt" | awk '/^[ \t]*cipher[ \t]+/{print $2; exit}')
+                local auth=$(echo "$node_txt" | awk '/^[ \t]*auth[ \t]+/{print $2; exit}')
+                local cur_name="ovpn-${each_cc}-$(printf '%02d' $c_idx)"
+                proxy_names+=("$cur_name")
 
-yaml_lines = []
-p_names = []
+                echo "  - name: \"${cur_name}\"" >> "$parsed_proxies_file"
+                echo "    type: openvpn" >> "$parsed_proxies_file"
+                echo "    server: \"${srv}\"" >> "$parsed_proxies_file"
+                echo "    port: ${port}" >> "$parsed_proxies_file"
+                echo "    proto: tcp" >> "$parsed_proxies_file"
+                echo "    username: \"vpn\"" >> "$parsed_proxies_file"
+                echo "    password: \"vpn\"" >> "$parsed_proxies_file"
+                echo "    cipher: \"${cipher:-AES-128-CBC}\"" >> "$parsed_proxies_file"
+                echo "    auth: \"${auth:-SHA1}\"" >> "$parsed_proxies_file"
+                echo "    remote-dns-resolve: true" >> "$parsed_proxies_file"
 
-def indent(st):
-    return '\n'.join('      ' + l.strip() for l in st.splitlines() if l.strip())
+                local ca_block=$(echo "$node_txt" | sed -n '/<ca>/,/<\/ca>/p' | grep -v '<.*ca>' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -v '^$')
+                local cert_block=$(echo "$node_txt" | sed -n '/<cert>/,/<\/cert>/p' | grep -v '<.*cert>' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -v '^$')
+                local key_block=$(echo "$node_txt" | sed -n '/<key>/,/<\/key>/p' | grep -v '<.*key>' | sed 's/^[ \t]*//;s/[ \t]*$//' | grep -v '^$')
 
-for idx, n in enumerate(nodes, 1):
-    name = f'ovpn-{cc}-{idx:02d}'
-    p_names.append(name)
-    node_str = f'''  - name: \"{name}\"
-    type: openvpn
-    server: \"{n[\"server\"]}\"
-    port: {n[\"port\"]}
-    proto: tcp
-    username: \"vpn\"
-    password: \"vpn\"
-    cipher: \"{n[\"cipher\"]}\"
-    auth: \"{n[\"auth\"]}\"
-    remote-dns-resolve: true'''
-    if n['ca']: node_str += f'''\n    ca: |-\n{indent(n[\"ca\"])}'''
-    if n['cert']: node_str += f'''\n    cert: |-\n{indent(n[\"cert\"])}'''
-    if n['key']: node_str += f'''\n    key: |-\n{indent(n[\"key\"])}'''
-    yaml_lines.append(node_str)
-
-with open('$parsed_proxies_file', 'w', encoding='utf-8') as f:
-    f.write('\n'.join(yaml_lines))
-
-with open('/tmp/current_pnames.txt', 'w', encoding='utf-8') as f:
-    f.write('\n'.join(p_names))
-"
-            mapfile -t proxy_names < /tmp/current_pnames.txt
-            rm -f /tmp/current_pnames.txt
+                if [[ -n "$ca_block" ]]; then
+                    echo "    ca: |-" >> "$parsed_proxies_file"
+                    echo "$ca_block" | sed 's/^/      /' >> "$parsed_proxies_file"
+                fi
+                if [[ -n "$cert_block" ]]; then
+                    echo "    cert: |-" >> "$parsed_proxies_file"
+                    echo "$cert_block" | sed 's/^/      /' >> "$parsed_proxies_file"
+                fi
+                if [[ -n "$key_block" ]]; then
+                    echo "    key: |-" >> "$parsed_proxies_file"
+                    echo "$key_block" | sed 's/^/      /' >> "$parsed_proxies_file"
+                fi
+            done < "$c_source_file"
         else
-            cp -f "$tmp_single_nodes" "$parsed_proxies_file"
+            cp -f "$vg_tmp_dir/countries/${each_cc}.txt.yaml" "$parsed_proxies_file"
             mapfile -t proxy_names < <(grep 'name: "' "$parsed_proxies_file" | sed 's/.*name: "\([^"]*\)".*/\1/')
         fi
 
@@ -4910,7 +4882,7 @@ OB_EOF
         fi
     done
 
-    rm -f "$vpngate_dump_json" /tmp/ovpn_dec.txt "$tmp_single_nodes" 2>/dev/null || true
+    rm -rf "$vg_tmp_dir" 2>/dev/null || true
 
     if [[ $created_count -gt 0 ]]; then
         apply_changes
