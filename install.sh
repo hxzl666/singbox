@@ -4772,9 +4772,11 @@ add_openvpn_egress_group() {
         done
         local out_tag="${group_tag}-out"
 
-        # 分配该国专属的本地 Socks5 转接端口
-        local socks_p=$(get_free_port)
-        yellow "[*] 分配专属用户态内部中转端口: 127.0.0.1:${socks_p}"
+        # 分配该国专属的本地 Socks5 转接端口 (支持自定义或回车自动分配)
+        local default_socks_p=$(get_free_port)
+        local socks_p="0"
+        read_valid_port "  [$group_remark] Mihomo 内部中转端口 [回车自动分配 $default_socks_p]: " "$default_socks_p" socks_p
+        yellow "[*] 已分配专属用户态内部中转端口: 127.0.0.1:${socks_p}"
 
         # 生成 Mihomo 运行配置
         local m_workdir="/etc/s-box/mihomo_${group_tag}"
@@ -4838,13 +4840,22 @@ SVC_EOF
             continue
         fi
 
-        # 端口分配 (按协议自动分配独立入站)
+        # 端口分配 (支持 NAT VPS 用户精确自定义入站端口，回车自动分配空闲端口)
         local hy2_p="0" tuic_p="0" vless_p="0"
         case "$proto_sel" in
-            1) hy2_p=$(get_free_port) ;;
-            2) tuic_p=$(get_free_port) ;;
-            3) vless_p=$(get_free_port) ;;
-            *) hy2_p=$(get_free_port); tuic_p=$(get_free_port) ;;
+            1)
+                read_valid_port "  [$group_remark] Hysteria2 入站端口 [回车自动]: " "$(get_free_port)" hy2_p
+                ;;
+            2)
+                read_valid_port "  [$group_remark] TUIC v5 入站端口 [回车自动]: " "$(get_free_port)" tuic_p
+                ;;
+            3)
+                read_valid_port "  [$group_remark] VLESS-Reality 入站端口 [回车自动]: " "$(get_free_port)" vless_p
+                ;;
+            *)
+                read_valid_port "  [$group_remark] Hysteria2 入站端口 [回车自动]: " "$(get_free_port)" hy2_p
+                read_valid_port "  [$group_remark] TUIC v5 入站端口 [回车自动]: " "$(get_free_port)" tuic_p
+                ;;
         esac
 
         local gdir="${PROXY_GROUPS_DIR}/${group_tag}"
