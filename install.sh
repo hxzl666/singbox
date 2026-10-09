@@ -4339,6 +4339,462 @@ generate_proxy_group_links() {
     blue "============================================================"
 }
 
+
+# ==================== OpenVPN 用户态 (Mihomo) 出站模块 ====================
+
+ensure_mihomo_installed() {
+    if [[ -x /usr/local/bin/mihomo ]] && /usr/local/bin/mihomo -v >/dev/null 2>&1; then
+        return 0
+    fi
+    cyan "[*] 正在安装/更新 Mihomo 内核 (用户态免 TUN OpenVPN 运行环境)..."
+    local arch=$(uname -m)
+    local m_arch=""
+    case "$arch" in
+        x86_64|amd64) m_arch="linux-amd64" ;;
+        aarch64|arm64) m_arch="linux-arm64" ;;
+        armv7*|armhf)  m_arch="linux-armv7" ;;
+        *) red "[!] 不支持的系统架构: $arch"; return 1 ;;
+    esac
+
+    local dl_url="https://github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-${m_arch}-v1.19.30.gz"
+    local tmp_gz="/tmp/mihomo_${m_arch}.gz"
+    rm -f "$tmp_gz" /tmp/mihomo_bin
+
+    if ! curl -fsSL -o "$tmp_gz" "$dl_url" 2>/dev/null; then
+        yellow "[*] 尝试从镜像加速源拉取 Mihomo..."
+        curl -fsSL -o "$tmp_gz" "https://ghfast.top/${dl_url}" 2>/dev/null || \
+        curl -fsSL -o "$tmp_gz" "https://mirror.ghproxy.com/${dl_url}" 2>/dev/null
+    fi
+
+    if [[ ! -s "$tmp_gz" ]]; then
+        red "[!] 下载 Mihomo 失败，请检查网络连接！"
+        return 1
+    fi
+
+    gzip -d -f "$tmp_gz"
+    local raw_bin="${tmp_gz%.gz}"
+    if [[ -f "$raw_bin" ]]; then
+        mv -f "$raw_bin" /usr/local/bin/mihomo
+        chmod +x /usr/local/bin/mihomo
+    fi
+
+    if [[ -x /usr/local/bin/mihomo ]] && /usr/local/bin/mihomo -v >/dev/null 2>&1; then
+        green "[✓] Mihomo 安装就绪: $(/usr/local/bin/mihomo -v | head -1)"
+        return 0
+    else
+        red "[!] Mihomo 二进制执行测试失败！"
+        return 1
+    fi
+}
+
+# 辅助函数: 解析单个 .ovpn 文本并生成 Mihomo proxy YAML 片段
+# 参数: $1=ovpn内容/文件路径 $2=节点名称
+parse_single_ovpn_to_yaml() {
+    local ovpn_source="$1"
+    local node_name="$2"
+    python3 -c "
+import sys, re
+
+src = '''$ovpn_source'''
+if '\n' not in src and len(src) < 500:
+    try:
+        with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+    except Exception:
+        text = src
+else:
+    text = src
+
+proto_m = re.search(r'^[ \\t]*proto[ \\t]+(\\S+)', text, re.M)
+proto = proto_m.group(1).lower() if proto_m else 'tcp'
+
+remote_m = re.search(r'^[ \\t]*remote[ \\t]+(\\S+)[ \\t]+(\\d+)', text, re.M)
+if not remote_m:
+    sys.exit(1)
+
+server = remote_m.group(1)
+port = int(remote_m.group(2))
+
+cipher_m = re.search(r'^[ \\t]*cipher[ \\t]+(\\S+)', text, re.M)
+cipher = cipher_m.group(1) if cipher_m else 'AES-128-CBC'
+
+auth_m = re.search(r'^[ \\t]*auth[ \\t]+(\\S+)', text, re.M)
+auth = auth_m.group(1) if auth_m else 'SHA1'
+
+ca_m = re.search(r'<ca>([\\s\\S]*?)<\/ca>', text)
+cert_m = re.search(r'<cert>([\\s\\S]*?)<\/cert>', text)
+key_m = re.search(r'<key>([\\s\\S]*?)<\/key>', text)
+
+ca = ca_m.group(1).strip() if ca_m else ''
+cert = cert_m.group(1).strip() if cert_m else ''
+key = key_m.group(1).strip() if key_m else ''
+
+def indent(s, spaces=6):
+    return '\n'.join(' ' * spaces + line.strip() for line in s.splitlines() if line.strip())
+
+node = f'''  - name: \"{sys.argv[1]}\"
+    type: openvpn
+    server: \"{server}\"
+    port: {port}
+    proto: {proto}
+    username: \"vpn\"
+    password: \"vpn\"
+    cipher: \"{cipher}\"
+    auth: \"{auth}\"
+    remote-dns-resolve: true'''
+
+if ca:
+    node += f'''\n    ca: |-\n{indent(ca)}'''
+if cert:
+    node += f'''\n    cert: |-\n{indent(cert)}'''
+if key:
+    node += f'''\n    key: |-\n{indent(key)}'''
+
+print(node)
+" "$node_name" 2>/dev/null
+}
+
+add_openvpn_egress_group() {
+    init_proxy_groups_dir
+    echo
+    green "============================================================"
+    green "  添加 OpenVPN 出站节点池 (Mihomo 用户态免 TUN 运行)"
+    green "============================================================"
+    yellow "  特性: 纯用户态运行，无需 tun 虚拟网卡，完全不影响宿主机网络与 SSH"
+    yellow "        支持多 OpenVPN 节点聚合，内置 fallback 自动故障转移切换"
+    yellow "        底层由 Mihomo 托管，上游由 Sing-box 提供 Hy2/TUIC/Reality 入站"
+    green "============================================================"
+    echo
+
+    if ! ensure_mihomo_installed; then
+        red "[!] 环境准备失败，无法继续"
+        return 1
+    fi
+
+    reading "请输入分组备注名称 (如 家宽OpenVPN池、韩国家宽等): " remark
+    [[ -z "$remark" ]] && remark="OpenVPN-Pool-$(date +%s)"
+
+    local group_tag="proxy-$(( $(get_all_proxy_groups | wc -l) + 1 ))"
+    while proxy_group_exists "$group_tag"; do
+        group_tag="proxy-$((RANDOM % 1000 + 1))"
+    done
+    local out_tag="${group_tag}-out"
+
+    echo
+    purple "请选择 OpenVPN 节点来源:"
+    echo "  1. 一键自动抓取 VPN Gate 免费家宽节点池 (按可用速度排序)"
+    echo "  2. 导入本地 .ovpn 配置文件或目录 (支持单文件或多节点目录)"
+    echo "  3. 手动粘贴 .ovpn 配置文本或 Base64"
+    reading "请选择 [1-3, 默认1]: " src_choice
+    [[ -z "$src_choice" ]] && src_choice="1"
+
+    local parsed_proxies_file=$(mktemp)
+    local proxy_names=()
+
+    case "$src_choice" in
+        1)
+            yellow "[*] 正在从 VPN Gate 抓取最新真实家宽节点清单..."
+            python3 -c "
+import urllib.request, base64, re, sys
+
+urls = ['http://www.vpngate.net/api/iphone/', 'https://www.vpngate.net/api/iphone/']
+raw = ''
+for u in urls:
+    try:
+        req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            raw = r.read().decode('utf-8', errors='ignore')
+            if raw: break
+    except Exception:
+        pass
+
+if not raw:
+    sys.exit(1)
+
+servers = []
+for line in raw.splitlines():
+    line = line.strip()
+    if not line or line.startswith('*') or line.startswith('#'): continue
+    parts = line.split(',')
+    if len(parts) >= 15:
+        # 排除官方机房前缀与网段，只留纯家宽
+        if parts[0].startswith('public-vpn') or parts[1].startswith('219.100.37.'):
+            continue
+        try:
+            sp = int(parts[4])
+        except Exception:
+            sp = 0
+        servers.append({
+            'country': parts[6].upper() or 'XX',
+            'speed': sp,
+            'b64': parts[14]
+        })
+
+servers.sort(key=lambda x: x['speed'], reverse=True)
+
+# 挑选前 15 个 TCP 节点
+count = 0
+names = []
+out_yaml = []
+for s in servers:
+    if count >= 15: break
+    try:
+        txt = base64.b64decode(s['b64']).decode('utf-8', errors='ignore')
+    except Exception:
+        continue
+    proto_m = re.search(r'^[ \\t]*proto[ \\t]+(\\S+)', txt, re.M)
+    proto = proto_m.group(1).lower() if proto_m else 'tcp'
+    if proto != 'tcp': continue
+
+    remote_m = re.search(r'^[ \\t]*remote[ \\t]+(\\S+)[ \\t]+(\\d+)', txt, re.M)
+    if not remote_m: continue
+    server, port = remote_m.group(1), int(remote_m.group(2))
+
+    cipher_m = re.search(r'^[ \\t]*cipher[ \\t]+(\\S+)', txt, re.M)
+    cipher = cipher_m.group(1) if cipher_m else 'AES-128-CBC'
+    auth_m = re.search(r'^[ \\t]*auth[ \\t]+(\\S+)', txt, re.M)
+    auth = auth_m.group(1) if auth_m else 'SHA1'
+
+    ca_m = re.search(r'<ca>([\\s\\S]*?)<\/ca>', txt)
+    cert_m = re.search(r'<cert>([\\s\\S]*?)<\/cert>', txt)
+    key_m = re.search(r'<key>([\\s\\S]*?)<\/key>', txt)
+
+    ca = ca_m.group(1).strip() if ca_m else ''
+    cert = cert_m.group(1).strip() if cert_m else ''
+    key = key_m.group(1).strip() if key_m else ''
+
+    def indent(st):
+        return '\n'.join('      ' + l.strip() for l in st.splitlines() if l.strip())
+
+    count += 1
+    n_name = f'ovpn-{s[\"country\"]}-{count:02d}'
+    names.append(n_name)
+    node = f'''  - name: \"{n_name}\"
+    type: openvpn
+    server: \"{server}\"
+    port: {port}
+    proto: tcp
+    username: \"vpn\"
+    password: \"vpn\"
+    cipher: \"{cipher}\"
+    auth: \"{auth}\"
+    remote-dns-resolve: true'''
+    if ca: node += f'''\n    ca: |-\n{indent(ca)}'''
+    if cert: node += f'''\n    cert: |-\n{indent(cert)}'''
+    if key: node += f'''\n    key: |-\n{indent(key)}'''
+    out_yaml.append(node)
+
+if not out_yaml:
+    sys.exit(2)
+
+with open('$parsed_proxies_file', 'w', encoding='utf-8') as f:
+    f.write('\n'.join(out_yaml))
+
+with open('/tmp/ovpn_names.txt', 'w', encoding='utf-8') as f:
+    f.write('\n'.join(names))
+"
+            local ret=$?
+            if [[ $ret -ne 0 || ! -s "$parsed_proxies_file" ]]; then
+                red "[!] 抓取 VPN Gate 节点失败或未发现可用 TCP 节点"
+                rm -f "$parsed_proxies_file" /tmp/ovpn_names.txt
+                return 1
+            fi
+            mapfile -t proxy_names < /tmp/ovpn_names.txt
+            rm -f /tmp/ovpn_names.txt
+            green "[✓] 成功解析 ${#proxy_names[@]} 个真实家宽 OpenVPN 节点！"
+            ;;
+        2)
+            reading "请输入本地 .ovpn 文件或目录的完整绝对路径: " local_path
+            if [[ -d "$local_path" ]]; then
+                local idx=1
+                for f in "$local_path"/*.ovpn; do
+                    [[ -f "$f" ]] || continue
+                    local n_name="ovpn-node-${idx}"
+                    local p_yaml=$(parse_single_ovpn_to_yaml "$f" "$n_name")
+                    if [[ -n "$p_yaml" ]]; then
+                        echo "$p_yaml" >> "$parsed_proxies_file"
+                        proxy_names+=("$n_name")
+                        ((idx++))
+                    fi
+                done
+            elif [[ -f "$local_path" ]]; then
+                local p_yaml=$(parse_single_ovpn_to_yaml "$local_path" "ovpn-node-01")
+                if [[ -n "$p_yaml" ]]; then
+                    echo "$p_yaml" >> "$parsed_proxies_file"
+                    proxy_names+=("ovpn-node-01")
+                fi
+            else
+                red "[!] 文件或路径不存在: $local_path"
+                rm -f "$parsed_proxies_file"
+                return 1
+            fi
+            ;;
+        3)
+            echo "请粘贴 .ovpn 文件内容或 Base64 编码 (输入完成后按回车，再按 Ctrl+D 结束):"
+            local raw_input
+            raw_input=$(cat)
+            if [[ -z "$raw_input" ]]; then
+                red "[!] 输入内容为空"
+                rm -f "$parsed_proxies_file"
+                return 1
+            fi
+            # 尝试检测是否为 base64
+            if echo "$raw_input" | tr -d '\r\n ' | base64 -d >/tmp/ovpn_dec.txt 2>/dev/null && grep -q "remote " /tmp/ovpn_dec.txt; then
+                raw_input=$(cat /tmp/ovpn_dec.txt)
+                rm -f /tmp/ovpn_dec.txt
+            fi
+            local p_yaml=$(parse_single_ovpn_to_yaml "$raw_input" "ovpn-custom-01")
+            if [[ -n "$p_yaml" ]]; then
+                echo "$p_yaml" >> "$parsed_proxies_file"
+                proxy_names+=("ovpn-custom-01")
+            fi
+            ;;
+        *)
+            red "[!] 无效选项"
+            rm -f "$parsed_proxies_file"
+            return 1
+            ;;
+    esac
+
+    if [[ ${#proxy_names[@]} -eq 0 || ! -s "$parsed_proxies_file" ]]; then
+        red "[!] 未能提取出有效的 OpenVPN 节点信息！"
+        rm -f "$parsed_proxies_file"
+        return 1
+    fi
+
+    # 分配本地 SOCKS5 端口
+    local socks_p=$(get_free_port)
+    yellow "[*] 为该 OpenVPN 节点池分配本地转接端口: 127.0.0.1:${socks_p}"
+
+    # 生成 Mihomo 运行配置
+    local m_workdir="/etc/s-box/mihomo_${group_tag}"
+    mkdir -p "$m_workdir"
+    local m_cfg="${m_workdir}/config.yaml"
+
+    {
+        echo "mixed-port: ${socks_p}"
+        echo "allow-lan: false"
+        echo "bind-address: \"127.0.0.1\""
+        echo "mode: rule"
+        echo "log-level: info"
+        echo "ipv6: false"
+        echo ""
+        echo "proxies:"
+        cat "$parsed_proxies_file"
+        echo ""
+        echo "proxy-groups:"
+        echo "  - name: \"ovpn-pool-fallback\""
+        echo "    type: fallback"
+        echo "    url: https://www.gstatic.com/generate_204"
+        echo "    interval: 300"
+        echo "    proxies:"
+        for pn in "${proxy_names[@]}"; do
+            echo "      - \"${pn}\""
+        done
+        echo ""
+        echo "rules:"
+        echo "  - MATCH,ovpn-pool-fallback"
+    } > "$m_cfg"
+
+    rm -f "$parsed_proxies_file"
+
+    # 生成 systemd 守护服务
+    local svc_file="/etc/systemd/system/mihomo-${group_tag}.service"
+    cat > "$svc_file" << SVC_EOF
+[Unit]
+Description=Mihomo Userspace OpenVPN Pool (${group_tag})
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/mihomo -d ${m_workdir}
+Restart=always
+RestartSec=3s
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+
+    systemctl daemon-reload
+    systemctl enable --now "mihomo-${group_tag}.service" >/dev/null 2>&1
+    sleep 2
+
+    if ! systemctl is-active --quiet "mihomo-${group_tag}.service"; then
+        red "[!] Mihomo 实例启动失败，请检查服务日志: journalctl -u mihomo-${group_tag}.service"
+        return 1
+    fi
+    green "[✓] Mihomo 用户态 OpenVPN 守护实例已成功启动并就绪！"
+
+    # 入站协议与端口分配
+    echo
+    purple "请为该节点组选择本地入站协议 (用于外部客户端连接此 OpenVPN 出口):"
+    echo "  1. Hysteria2 入站"
+    echo "  2. TUIC v5 入站"
+    echo "  3. VLESS-Reality 入站"
+    echo "  4. 同时开启 Hy2 与 TUIC"
+    reading "请选择 [1-4, 默认4]: " proto_sel
+    [[ -z "$proto_sel" ]] && proto_sel="4"
+
+    local hy2_p="0" tuic_p="0" vless_p="0"
+    case "$proto_sel" in
+        1)
+            read_valid_port "请输入 Hysteria2 入站端口 [回车自动分配]: " "$(get_free_port)" hy2_p
+            ;;
+        2)
+            read_valid_port "请输入 TUIC v5 入站端口 [回车自动分配]: " "$(get_free_port)" tuic_p
+            ;;
+        3)
+            read_valid_port "请输入 VLESS-Reality 入站端口 [回车自动分配]: " "$(get_free_port)" vless_p
+            ;;
+        *)
+            read_valid_port "请输入 Hysteria2 入站端口 [回车自动分配]: " "$(get_free_port)" hy2_p
+            read_valid_port "请输入 TUIC v5 入站端口 [回车自动分配]: " "$(get_free_port)" tuic_p
+            ;;
+    esac
+
+    local gdir="${PROXY_GROUPS_DIR}/${group_tag}"
+    mkdir -p "$gdir"
+    echo "$remark" > "$gdir/remark.txt"
+    echo "openvpn-userspace" > "$gdir/raw_url.txt"
+    echo "$hy2_p" > "$gdir/hy2_port.txt"
+    echo "$tuic_p" > "$gdir/tuic_port.txt"
+    echo "$vless_p" > "$gdir/vless_port.txt"
+    echo "$socks_p" > "$gdir/mihomo_port.txt"
+    echo "true" > "$gdir/is_openvpn.txt"
+
+    # 构造 Sing-box 标准 socks5 出站 (无缝对接 Mihomo)
+    cat > "$gdir/outbound.json" << OB_EOF
+{
+  "type": "socks",
+  "tag": "${out_tag}",
+  "server": "127.0.0.1",
+  "server_port": ${socks_p},
+  "version": "5"
+}
+OB_EOF
+
+    if sync_proxy_group_to_singbox "$group_tag"; then
+        if ! grep -qx "$group_tag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
+            echo "$group_tag" >> "$PROXY_GROUPS_DIR/groups.txt"
+        fi
+        apply_changes
+        green "============================================================"
+        green " [✓] OpenVPN 用户态节点池 [$remark] 添加并上线成功！"
+        green "============================================================"
+        generate_proxy_group_links "$group_tag"
+    else
+        red "[!] 同步至 Sing-box 失败，正在回滚..."
+        systemctl disable --now "mihomo-${group_tag}.service" >/dev/null 2>&1
+        rm -f "$svc_file"
+        rm -rf "$m_workdir" "$gdir"
+        systemctl daemon-reload
+        return 1
+    fi
+}
+
+
 proxy_egress_menu() {
     auto_migrate_legacy_nodes
     while true; do
@@ -4384,14 +4840,16 @@ proxy_egress_menu() {
         blue   "  5. 重新同步代理配置"
         cyan   "  6. 一键添加 OpenRung 中继 (自动抓取/按国家建组/自愈)"
         green  "  7. 一键添加免费节点池 (按国家分类, 失效自动切换)"
+        cyan   "  8. 添加 OpenVPN 出站节点池 (Mihomo 用户态免TUN, 多节点容灾切换)"
         echo "------------------------------------------------------------"
         red    "  0. 返回主菜单"
         echo "============================================================"
-        reading "请选择 [0-7]: " choice
+        reading "请选择 [0-8]: " choice
         case "$choice" in
             1) add_proxy_egress_group ;;
             6) add_openrung_egress_group ;;
             7) add_freevpn_egress_group ;;
+            8) add_openvpn_egress_group ;;
             2)
                 for t in "${groups[@]}"; do generate_proxy_group_links "$t"; done
                 ;;
@@ -4426,6 +4884,10 @@ proxy_egress_menu() {
                 else
                     reading "请输入要删除的 tag (如 proxy-1): " del_tag
                     if proxy_group_exists "$del_tag" || [[ -d "${PROXY_GROUPS_DIR}/$del_tag" ]] || grep -qx "$del_tag" "$PROXY_GROUPS_DIR/groups.txt" 2>/dev/null; then
+                        systemctl disable --now "mihomo-${del_tag}.service" >/dev/null 2>&1 || true
+                        rm -f "/etc/systemd/system/mihomo-${del_tag}.service"
+                        rm -rf "/etc/s-box/mihomo_${del_tag}"
+                        systemctl daemon-reload >/dev/null 2>&1 || true
                         rm -rf "${PROXY_GROUPS_DIR:?}/$del_tag"
                         sed -i "/^${del_tag}$/d" "$PROXY_GROUPS_DIR/groups.txt"
                         local tmp_j=$(mktemp)
@@ -5934,6 +6396,17 @@ run_cron_check() {
     # OpenRung 中继自愈: 每分钟探测出口IP, 失效自动切换同国备用中继
     openrung_health_check
     freevpn_health_check
+
+    # Mihomo 用户态 OpenVPN 节点池进程守护
+    for _m_svc in /etc/systemd/system/mihomo-proxy-*.service; do
+        [[ -f "$_m_svc" ]] || continue
+        local _ms_name
+        _ms_name=$(basename "$_m_svc" .service)
+        if ! systemctl is-active --quiet "$_ms_name"; then
+            systemctl restart "$_ms_name"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [自愈守护] Mihomo OpenVPN 实例 $_ms_name 未运行，已自动拉起！" >> "$log_file"
+        fi
+    done
 }
 
 # ==================== 8. TCP / UDP / BBR 网络深度调优模块 ====================
