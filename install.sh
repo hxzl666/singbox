@@ -2759,8 +2759,16 @@ apply_changes() {
             return 1
         fi
     fi
+    local _cfg_hash _applied_hash
+    _cfg_hash=$(md5sum /etc/s-box/sb.json 2>/dev/null | awk '{print $1}')
+    _applied_hash=$(cat /etc/s-box/.sb.json.applied 2>/dev/null || true)
+    if [[ -n "$_cfg_hash" && "$_cfg_hash" == "$_applied_hash" ]] && service_is_active sing-box; then
+        log_info "配置未变化，跳过重启 sing-box"
+        return 0
+    fi
     service_restart sing-box
     sleep 1
+    echo "$_cfg_hash" > /etc/s-box/.sb.json.applied
     if ! service_is_active sing-box; then
         pkill -9 -f "/etc/s-box/sing-box" >/dev/null 2>&1 || true
         if command -v fuser >/dev/null 2>&1; then
@@ -3870,6 +3878,18 @@ freevpn_health_check() {
         if [[ $ok -eq 0 && -n "$egress_ip" ]]; then
             echo "$egress_ip" > "$gdir/last_egress_ip.txt"
             echo "$(date '+%Y-%m-%d %H:%M:%S')" > "$gdir/last_check_ok.txt"
+            echo 0 > "$gdir/fail_count.txt"
+            continue
+        fi
+
+        # 连续失败防抖：至少连续 3 次失败才切换，避免慢节点/瞬时抖动导致频繁重启
+        local _fail_n
+        _fail_n=$(cat "$gdir/fail_count.txt" 2>/dev/null || echo 0)
+        [[ "$_fail_n" =~ ^[0-9]+$ ]] || _fail_n=0
+        _fail_n=$((_fail_n + 1))
+        echo "$_fail_n" > "$gdir/fail_count.txt"
+        if (( _fail_n < 3 )); then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [FreeVPN自愈] [$remark] 探测失败 ${_fail_n}/3 次，暂不切换" >> "$monitor_log"
             continue
         fi
 
@@ -4021,6 +4041,7 @@ freevpn_health_check() {
         echo "$new_url" > "$gdir/raw_url.txt"
         echo "$new_out" > "$gdir/outbound.json"
         echo "$next_idx" > "$gdir/active_idx.txt"
+        echo 0 > "$gdir/fail_count.txt"
         echo "$(date +%s)" > "$gdir/check_ts.txt"
         rm -f "$gdir/last_egress_ip.txt"
 
@@ -4164,6 +4185,18 @@ openrung_health_check() {
             echo "$egress_ip" > "$gdir/last_egress_ip.txt"
             echo "$(date '+%Y-%m-%d %H:%M:%S')" > "$gdir/last_check_ok.txt"
             echo "${probe_lat}ms" > "$gdir/last_latency.txt"
+            echo 0 > "$gdir/fail_count.txt"
+            continue
+        fi
+
+        # 连续失败防抖：至少连续 3 次失败才切换，避免慢节点/瞬时抖动导致频繁重启
+        local _fail_n
+        _fail_n=$(cat "$gdir/fail_count.txt" 2>/dev/null || echo 0)
+        [[ "$_fail_n" =~ ^[0-9]+$ ]] || _fail_n=0
+        _fail_n=$((_fail_n + 1))
+        echo "$_fail_n" > "$gdir/fail_count.txt"
+        if (( _fail_n < 3 )); then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - [OpenRung自愈] [$remark] 探测失败 ${_fail_n}/3 次，暂不切换" >> "$monitor_log"
             continue
         fi
 
@@ -4194,6 +4227,7 @@ openrung_health_check() {
         echo "$new_url" > "$gdir/raw_url.txt"
         echo "$new_out" > "$gdir/outbound.json"
         echo "$new_idx" > "$gdir/active_idx.txt"
+        echo 0 > "$gdir/fail_count.txt"
         rm -f "$gdir/last_egress_ip.txt"
 
         if sync_proxy_group_to_singbox "$tag"; then
@@ -4237,6 +4271,10 @@ openrung_probe_egress_ip() {
     local probe_port=$((20000 + RANDOM % 20000))
     local probe_dir
     probe_dir=$(mktemp -d /tmp/or-probe-XXXXXX 2>/dev/null) || return 1
+    if ! pids_ok_for_probe; then
+        rm -rf "$probe_dir" 2>/dev/null || true
+        return 1
+    fi
 
     # 生成探测配置: socks 本地入站 + 该组出站 + direct 兜底
     cat > "$probe_dir/probe.json" <<EOF
@@ -6475,6 +6513,15 @@ view_logs_menu() {
 }
 
 # ==================== Cron 自愈守护任务 ====================
+pids_ok_for_probe() {
+    local _cur _max
+    _cur=$(cat /sys/fs/cgroup/pids.current 2>/dev/null || echo 0)
+    _max=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || echo 0)
+    [[ "$_cur" =~ ^[0-9]+$ && "$_max" =~ ^[0-9]+$ ]] || return 0
+    (( _max <= 0 )) && return 0
+    (( _cur < _max - 12 ))
+}
+
 run_cron_check() {
     local log_file="/etc/s-box/monitor.log"
     if [[ -f "$log_file" && $(wc -c < "$log_file") -gt 51200 ]]; then
@@ -6510,6 +6557,15 @@ run_cron_check() {
 
     ensure_all_psiphon_instances_running
     self_heal_stuck_psiphon_instances
+
+    # pids 压力保护: 容器 pids.max 仅 128，探测会 fork 临时 sing-box/curl，接近上限直接跳过本轮
+    local _pids_cur _pids_max
+    _pids_cur=$(cat /sys/fs/cgroup/pids.current 2>/dev/null || echo 0)
+    _pids_max=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || echo 0)
+    if [[ "$_pids_cur" =~ ^[0-9]+$ && "$_pids_max" =~ ^[0-9]+$ ]] && (( _pids_max > 0 && _pids_cur >= _pids_max - 24 )); then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - [pids守护] pids.current=${_pids_cur}/${_pids_max} 接近上限，跳过本轮自愈探测" >> "$log_file"
+        return 0
+    fi
 
     # OpenRung 中继自愈: 每分钟探测出口IP, 失效自动切换同国备用中继
     openrung_health_check
